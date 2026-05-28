@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "git", "wget", "ffmpeg", "libgl1", "libglib2.0-0", 
     "build-essential", "ninja-build", "cmake", "clang", "llvm"
 ).env({
-    "FORCE_REBUILD_INDEX": "112"  # Incremented to flush Modal cache and apply the sageattention pin
+    "FORCE_REBUILD_INDEX": "115"  # Incremented to flush old Modal cache signatures
 })
 
 # ==============================================================================
@@ -79,7 +79,6 @@ final_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124",
     "python3.12 -m pip install --no-cache-dir diffusers accelerate transformers torchsde numpy==1.26.4 kornia==0.7.3"
 ).run_commands(
-    # FIX: Pinned sageattention to version 1.0.6 to retain the older Triton API used by KJNodes
     "python3.12 -m pip install --no-cache-dir sageattention==1.0.6",
     env={
         "CUDA_HOME": "/usr/local/cuda",
@@ -91,19 +90,24 @@ final_image = build_image.run_commands(
 
 # ==============================================================================
 # PART 5: MODAL APP CONFIGURATION
-# Purpose: Define the Modal App, attach the Volume containing model weights, 
-# and define the deployment specifications (L4 GPU, memory, scaledown).
+# Purpose: Define the renamed Modal App, attach the Volume containing model weights, 
+# and explicitly assign your designated Cloudflare environment credentials.
 # ==============================================================================
-app = modal.App("ltx-2-19b-v20-api")
+# Renamed to provide account footprint variation
+app = modal.App("media-worker")
 
-# UPDATED: Volume pointing to the exact volume name in your new account dashboard
 weights_volume = modal.Volume.from_name("ltx-new-version-20-weights", create_if_missing=False)
 
 @app.cls(
     gpu="L4", 
     image=final_image, 
     volumes={"/mnt/weights": weights_volume},
-    secrets=[modal.Secret.from_name("video-generator-workflow")], 
+    # Injects Cloudflare variables instantly into the cluster framework
+    env={
+        "R2_ACCOUNT_ID": "4d91f4d3d0366568a54ffa32ffcb7bf4",
+        "R2_ACCESS_KEY_ID": "3c33425ba6e5abbd3e63afab14dc8866",
+        "R2_SECRET_ACCESS_KEY": "d65f107bb61093843c6dd980c764443fdf50924a7701078b99f007d3060e25a8"
+    },
     memory=8192, 
     scaledown_window=30,
     timeout=3600 
@@ -143,7 +147,6 @@ class LTXEngine:
         dirs = ["unet", "vae", "clip", "text_encoders", "text_encoder", "checkpoints", "diffusion_models", "gguf", "loras"]
         for d in dirs: os.makedirs(os.path.join(base_models_dir, d), exist_ok=True)
 
-        # Scrapes structural folders from the volume mount point and maps them dynamically
         if os.path.exists("/mnt/weights"):
             for root_dir, _, files in os.walk("/mnt/weights"):
                 for filename in files:
@@ -329,14 +332,14 @@ class LTXVLoadConditioning:
 
     # ==============================================================================
     # PART 9: MAIN FASTAPI ENDPOINT
-    # Purpose: The public inference route. Parses payload, fetches dynamic guide 
-    # images via Cloudflare R2, executes Sub-Graphs sequentially (Text -> Video -> Audio)
-    # uploads the result, and returns the URL.
+    # Purpose: The public inference route. Validates new auth key string, downloads 
+    # guide structures, processes sub-graphs sequentially, and outputs onto R2.
     # ==============================================================================
     @modal.fastapi_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
-        if x_api_key != os.environ.get("API_KEY"): 
-            raise HTTPException(status_code=403, detail="Unauthorized")
+        # UPDATED: Direct string authentication via simplified testing key signature
+        if x_api_key != "testing-modal-workflow-2": 
+            raise HTTPException(status_code=403, detail="Unauthorized Account 2 Pipeline Request")
         
         body = await request.json()
         if isinstance(body, dict):
@@ -567,7 +570,8 @@ class LTXVLoadConditioning:
                     target_key
                 )
 
-                public_path_url = f"https://pub-yourdomain.r2.dev/{target_key}" 
+                # Public R2 routing URL matching your bucket domain profile
+                public_path_url = f"https://pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev/{target_key}" 
                 return {
                     "status": "success",
                     "file_key": target_key,

@@ -28,7 +28,7 @@ base_image = modal.Image.from_registry(
     "git", "wget", "ffmpeg", "libgl1", "libglib2.0-0",
     "build-essential", "ninja-build", "cmake", "clang", "llvm"
 ).env({
-    "FORCE_REBUILD_INDEX": "127"  # Bumped to ensure fresh deployment cache
+    "FORCE_REBUILD_INDEX": "128"  # Bumped to ensure fresh deployment cache
 })
 
 # ==============================================================================
@@ -242,9 +242,6 @@ class LTXEngine:
                 
             await asyncio.sleep(1)
 
-    # -------------------------------------------------------------------------------------------------------------------
-    # MERGE OVERRIDES FIX: Ensures inputs, widgets_values, and properties are correctly synchronized from the n8n payload
-    # -------------------------------------------------------------------------------------------------------------------
     def merge_overrides(self, base_graph, override_graph):
         if not override_graph: 
             return base_graph
@@ -383,19 +380,26 @@ class LTXEngine:
                         if "inputs" not in sg1["243"]: sg1["243"]["inputs"] = {}
                         sg1["243"]["inputs"]["text_encoder"] = target_gemma
                         sg1["243"]["inputs"]["ckpt_name"] = target_connector
-                        sg1["243"]["inputs"]["device"] = "default" 
+                        if "widgets_values" in sg1["243"] and len(sg1["243"]["widgets_values"]) > 1:
+                            sg1["243"]["widgets_values"][0] = target_gemma
+                            sg1["243"]["widgets_values"][1] = target_connector
                         
                     if "112" in sg1: 
                         if "widgets_values" in sg1["112"]:
                             sg1["112"]["widgets_values"][0] = negative_prompt
                         
+                    # EXPLICITLY INJECT FILENAMES TO WIDGETS_VALUES FOR VALIDATION (Save Conditioning)
                     if "242" in sg1: 
                         if "inputs" not in sg1["242"]: sg1["242"]["inputs"] = {}
                         sg1["242"]["inputs"]["filename"] = "(NEGATIVE)conditioning"
+                        if "widgets_values" in sg1["242"]:
+                            sg1["242"]["widgets_values"][0] = "(NEGATIVE)conditioning"
                         
                     if "244" in sg1: 
                         if "inputs" not in sg1["244"]: sg1["244"]["inputs"] = {}
                         sg1["244"]["inputs"]["filename"] = "(POSITIVE)conditioning"
+                        if "widgets_values" in sg1["244"]:
+                            sg1["244"]["widgets_values"][0] = "(POSITIVE)conditioning"
                     
                     # WIDGET ARRAY INJECTION FIX FOR MULTI-PROMPT (Node 246)
                     if "246" in sg1: 
@@ -419,6 +423,19 @@ class LTXEngine:
                             sg2 = json.load(f)
 
                     sg2 = self.merge_overrides(sg2, body.get("subgraph_2_override"))
+
+                    # EXPLICITLY INJECT FILENAMES TO WIDGETS_VALUES FOR VALIDATION (Load Conditioning)
+                    if "245" in sg2: 
+                        if "inputs" not in sg2["245"]: sg2["245"]["inputs"] = {}
+                        sg2["245"]["inputs"]["file_name"] = "(POSITIVE)conditioning.pt"
+                        if "widgets_values" in sg2["245"]:
+                            sg2["245"]["widgets_values"][0] = "(POSITIVE)conditioning.pt"
+                            
+                    if "246" in sg2: 
+                        if "inputs" not in sg2["246"]: sg2["246"]["inputs"] = {}
+                        sg2["246"]["inputs"]["file_name"] = "(NEGATIVE)conditioning.pt"
+                        if "widgets_values" in sg2["246"]:
+                            sg2["246"]["widgets_values"][0] = "(NEGATIVE)conditioning.pt"
 
                     # WIDGET ENFORCEMENT: 384x480 resolution (Node 194)
                     if "194" in sg2 and "widgets_values" in sg2["194"] and len(sg2["194"]["widgets_values"]) > 2:
@@ -459,14 +476,20 @@ class LTXEngine:
                     if "238" in sg2:
                         if "inputs" not in sg2["238"]: sg2["238"]["inputs"] = {}
                         sg2["238"]["inputs"]["unet_name"] = target_unet
+                        if "widgets_values" in sg2["238"]: 
+                            sg2["238"]["widgets_values"][0] = target_unet
                         
                     if "241" in sg2: 
                         if "inputs" not in sg2["241"]: sg2["241"]["inputs"] = {}
                         sg2["241"]["inputs"]["vae_name"] = target_video_vae
+                        if "widgets_values" in sg2["241"]: 
+                            sg2["241"]["widgets_values"][0] = target_video_vae
                         
                     if "248" in sg2: 
                         if "inputs" not in sg2["248"]: sg2["248"]["inputs"] = {}
                         sg2["248"]["inputs"]["lora_name"] = target_detailer_lora
+                        if "widgets_values" in sg2["248"]: 
+                            sg2["248"]["widgets_values"][0] = target_detailer_lora
                         
                     print("🚀 Executing Sub-Graph 2 (Main Video Generation)...")
                     await self.execute_comfy_workflow(session, sg2)
@@ -494,6 +517,19 @@ class LTXEngine:
 
                     sg3 = self.merge_overrides(sg3, body.get("subgraph_3_override"))
 
+                    # EXPLICITLY INJECT FILENAMES TO WIDGETS_VALUES FOR VALIDATION (Load Conditioning)
+                    if "282" in sg3: 
+                        if "inputs" not in sg3["282"]: sg3["282"]["inputs"] = {}
+                        sg3["282"]["inputs"]["file_name"] = "(POSITIVE)conditioning.pt"
+                        if "widgets_values" in sg3["282"]:
+                            sg3["282"]["widgets_values"][0] = "(POSITIVE)conditioning.pt"
+                            
+                    if "283" in sg3: 
+                        if "inputs" not in sg3["283"]: sg3["283"]["inputs"] = {}
+                        sg3["283"]["inputs"]["file_name"] = "(NEGATIVE)conditioning.pt"
+                        if "widgets_values" in sg3["283"]:
+                            sg3["283"]["widgets_values"][0] = "(NEGATIVE)conditioning.pt"
+
                     # WIDGET ENFORCEMENT: ChunkSize=4 for OOM (Node 304)
                     if "304" in sg3 and "widgets_values" in sg3["304"]:
                         sg3["304"]["widgets_values"][0] = 4
@@ -509,18 +545,26 @@ class LTXEngine:
                     if "278" in sg3:
                         if "inputs" not in sg3["278"]: sg3["278"]["inputs"] = {}
                         sg3["278"]["inputs"]["unet_name"] = target_unet
+                        if "widgets_values" in sg3["278"]:
+                            sg3["278"]["widgets_values"][0] = target_unet
                         
                     if "295" in sg3: 
                         if "inputs" not in sg3["295"]: sg3["295"]["inputs"] = {}
                         sg3["295"]["inputs"]["ckpt_name"] = target_audio_vae
+                        if "widgets_values" in sg3["295"]:
+                            sg3["295"]["widgets_values"][0] = target_audio_vae
                         
                     if "296" in sg3: 
                         if "inputs" not in sg3["296"]: sg3["296"]["inputs"] = {}
                         sg3["296"]["inputs"]["vae_name"] = target_video_vae
+                        if "widgets_values" in sg3["296"]:
+                            sg3["296"]["widgets_values"][0] = target_video_vae
                     
                     if "302" in sg3: 
                         if "inputs" not in sg3["302"]: sg3["302"]["inputs"] = {}
                         sg3["302"]["inputs"]["lora_name"] = target_detailer_lora
+                        if "widgets_values" in sg3["302"]:
+                            sg3["302"]["widgets_values"][0] = target_detailer_lora
 
                     print("🚀 Executing Sub-Graph 3 (Audio Generation & Combine Decoders)...")
                     await self.execute_comfy_workflow(session, sg3)

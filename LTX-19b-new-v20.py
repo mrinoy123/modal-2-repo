@@ -58,7 +58,6 @@ torch_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir sageattention==1.0.6"
 )
 
-# Added performance protections (--depth 1 and skipped heavy LFS history assets) to prevent git hangs
 clone_image = torch_image.run_commands(
     "git clone --depth 1 https://github.com/comfyanonymous/ComfyUI /workspace/ComfyUI",
     "GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git /workspace/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite",
@@ -433,14 +432,15 @@ class LTXEngine:
                         sg2["237"]["inputs"]["height"] = 480
                         if "widgets_values" in sg2["237"] and len(sg2["237"]["widgets_values"]) > 5:
                             sg2["237"]["widgets_values"][2] = "4:5"                
-                            sg2["237"]["widgets_values"][4] = 384                 
-                            sg2["237"]["widgets_values"][5] = 480                 
+                            sg2["237"]["widgets_values"][4] = 384                  
+                            sg2["237"]["widgets_values"][5] = 480                  
 
+                    # SET LTXVChunkFeedForward to 2 for SG2 to avoid OOM
                     if "252" in sg2:
                         if "inputs" not in sg2["252"]: sg2["252"]["inputs"] = {}
-                        sg2["252"]["inputs"]["chunk_size"] = 4
+                        sg2["252"]["inputs"]["chunk_size"] = 2
                         if "widgets_values" in sg2["252"]:
-                            sg2["252"]["widgets_values"][0] = 4
+                            sg2["252"]["widgets_values"][0] = 2
 
                     if "235" in sg2:
                         num_imgs = len(image_filenames)
@@ -508,11 +508,12 @@ class LTXEngine:
 
                     sg3 = self.merge_overrides(sg3, body.get("subgraph_3_override"))
 
+                    # SET LTXVChunkFeedForward to 2 for SG3 to avoid OOM
                     if "304" in sg3:
                         if "inputs" not in sg3["304"]: sg3["304"]["inputs"] = {}
-                        sg3["304"]["inputs"]["chunk_size"] = 4
+                        sg3["304"]["inputs"]["chunk_size"] = 2
                         if "widgets_values" in sg3["304"]:
-                            sg3["304"]["widgets_values"][0] = 4
+                            sg3["304"]["widgets_values"][0] = 2
 
                     if "232" in sg3: 
                         if "inputs" not in sg3["232"]: sg3["232"]["inputs"] = {}

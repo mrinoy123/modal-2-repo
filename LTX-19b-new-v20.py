@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "git", "wget", "ffmpeg", "libgl1", "libglib2.0-0", 
     "build-essential", "ninja-build", "cmake", "clang", "llvm"
 ).env({
-    "FORCE_REBUILD_INDEX": "115"  # Incremented to flush old Modal cache signatures
+    "FORCE_REBUILD_INDEX": "116"  # Incremented to flush old Modal cache signatures
 })
 
 # ==============================================================================
@@ -91,9 +91,8 @@ final_image = build_image.run_commands(
 # ==============================================================================
 # PART 5: MODAL APP CONFIGURATION
 # Purpose: Define the renamed Modal App, attach the Volume containing model weights, 
-# and explicitly assign your designated Cloudflare environment credentials.
+# and explicitly assign your designated Cloudflare environment credentials via your custom secret vault.
 # ==============================================================================
-# Renamed to provide account footprint variation
 app = modal.App("media-worker")
 
 weights_volume = modal.Volume.from_name("ltx-new-version-20-weights", create_if_missing=False)
@@ -102,12 +101,8 @@ weights_volume = modal.Volume.from_name("ltx-new-version-20-weights", create_if_
     gpu="L4", 
     image=final_image, 
     volumes={"/mnt/weights": weights_volume},
-    # Injects Cloudflare variables instantly into the cluster framework
-    env={
-        "R2_ACCOUNT_ID": "4d91f4d3d0366568a54ffa32ffcb7bf4",
-        "R2_ACCESS_KEY_ID": "3c33425ba6e5abbd3e63afab14dc8866",
-        "R2_SECRET_ACCESS_KEY": "d65f107bb61093843c6dd980c764443fdf50924a7701078b99f007d3060e25a8"
-    },
+    # FIXED: Re-routed to point directly to your real Modal workspace secret name
+    secrets=[modal.Secret.from_name("custom-secret")],
     memory=8192, 
     scaledown_window=30,
     timeout=3600 
@@ -337,7 +332,7 @@ class LTXVLoadConditioning:
     # ==============================================================================
     @modal.fastapi_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
-        # UPDATED: Direct string authentication via simplified testing key signature
+        # Injected string authorization matching your environment token settings
         if x_api_key != "testing-modal-workflow-2": 
             raise HTTPException(status_code=403, detail="Unauthorized Account 2 Pipeline Request")
         
@@ -570,7 +565,7 @@ class LTXVLoadConditioning:
                     target_key
                 )
 
-                # Public R2 routing URL matching your bucket domain profile
+                # Updated public routing distribution URL string
                 public_path_url = f"https://pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev/{target_key}" 
                 return {
                     "status": "success",

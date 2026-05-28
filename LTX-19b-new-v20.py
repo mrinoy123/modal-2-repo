@@ -174,8 +174,8 @@ class LTXEngine:
         self.process = subprocess.Popen([
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
             "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
-            "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc"
-            
+            "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc",
+            "--normalvram"
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)
         
         self.t = threading.Thread(target=self._log_reader, daemon=True)
@@ -412,12 +412,12 @@ class LTXEngine:
                             sg2["237"]["widgets_values"][4] = 384                 
                             sg2["237"]["widgets_values"][5] = 480                 
 
-                    # SET LTXVChunkFeedForward to 8 for SG2
+                    # SET LTXVChunkFeedForward to 4 for SG2 to avoid OOM
                     if "252" in sg2:
                         if "inputs" not in sg2["252"]: sg2["252"]["inputs"] = {}
-                        sg2["252"]["inputs"]["chunk_size"] = 8
+                        sg2["252"]["inputs"]["chunk_size"] = 4
                         if "widgets_values" in sg2["252"]:
-                            sg2["252"]["widgets_values"][0] = 8
+                            sg2["252"]["widgets_values"][0] = 4
 
                     if "235" in sg2:
                         num_imgs = len(image_filenames)
@@ -477,12 +477,12 @@ class LTXEngine:
 
                     sg3 = self.merge_overrides(sg3, body.get("subgraph_3_override"))
 
-                    # SET LTXVChunkFeedForward to 8 for SG3
+                    # SET LTXVChunkFeedForward to 4 for SG3 to avoid OOM
                     if "304" in sg3:
                         if "inputs" not in sg3["304"]: sg3["304"]["inputs"] = {}
-                        sg3["304"]["inputs"]["chunk_size"] = 8
+                        sg3["304"]["inputs"]["chunk_size"] = 4
                         if "widgets_values" in sg3["304"]:
-                            sg3["304"]["widgets_values"][0] = 8
+                            sg3["304"]["widgets_values"][0] = 4
 
                     if "232" in sg3: 
                         if "inputs" not in sg3["232"]: sg3["232"]["inputs"] = {}

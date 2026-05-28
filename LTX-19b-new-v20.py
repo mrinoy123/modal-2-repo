@@ -95,7 +95,7 @@ final_image = build_image.run_commands(
 # ==============================================================================
 app = modal.App("media-worker")
 
-weights_volume = modal.Volume.from_name("ltx-new-version-20-weights", create_if_missing=False)
+weights_volume = modal.Volume.from_name("ltx-new-version20-weights", create_if_missing=False)
 
 @app.cls(
     gpu="L4", 

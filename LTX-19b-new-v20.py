@@ -76,28 +76,28 @@ deps_image = clone_image.run_commands(
 )
 
 final_image = deps_image.run_commands(
-    # Fix FizzNodes NoneType crash
+    # 🔥 PATCH 1: Fix FizzNodes NoneType crash
     "sed -i 's/final_pooled_output = torch.cat(pooled_out, dim=0)/final_pooled_output = torch.cat([p for p in pooled_out if p is not None], dim=0) if any(p is not None for p in pooled_out) else None/g' /workspace/ComfyUI/custom_nodes/ComfyUI_FizzNodes/BatchFuncs.py",
     
     # =========================================================================================
-    # 🔥 FIX 2: Resolves "list index out of range" crash inside the LTXVideo Looping Sampler
-    # By forcibly intercepting ComfyUI's standard set_conds to retain unparsed raw_conds
+    # 🔥 FIX 2: RESTORED EXACT PATCH FROM YOUR ORIGINAL SCRIPT to safely bypass looping_sampler
+    # missing raw_conds without breaking standard ComfyUI set_conds.
     # =========================================================================================
-    "python3 -c \"filepath = '/workspace/ComfyUI/comfy/samplers.py'; code = open(filepath).read(); code = code.replace('def set_conds(self, positive, negative):', 'def set_conds(self, positive, negative):\\n        self.raw_conds = (positive, negative)'); open(filepath, 'w').write(code)\"",
+    "python3 -c \"filepath = '/workspace/ComfyUI/custom_nodes/ComfyUI-LTXVideo/looping_sampler.py'; code = open(filepath).read(); code = code.replace('positive, negative = guider.raw_conds', 'positive, negative = getattr(guider, \\'raw_conds\\', None) or (getattr(guider, \\'original_conds\\', {}).get(\\'positive\\'), getattr(guider, \\'original_conds\\', {}).get(\\'negative\\'))'); open(filepath, 'w').write(code)\"",
     
-    # Global SageAttention API remap
+    # 🔥 PATCH 3: Global SageAttention API remap
     "echo '' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     "echo 'sageattn_qk_int8_pv_fp16_triton = sageattn' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py"
 )
 
-app = modal.App("ltx-2-19b-v20-api")
-weights_volume = modal.Volume.from_name("ltx-new-version20-weights")
+app = modal.App("media-worker")
+weights_volume = modal.Volume.from_name("ltx-new-version20-weights", create_if_missing=False)
 
 @app.cls(
     gpu="L4", 
     image=final_image, 
     volumes={"/mnt/weights": weights_volume},
-    secrets=[modal.Secret.from_name("custom-secret")],  # <--- RESTORED YOUR CORRECT SECRET NAME
+    secrets=[modal.Secret.from_name("custom-secret")],
     memory=8192, 
     scaledown_window=60,
     timeout=3600 
@@ -276,9 +276,9 @@ class LTXVLoadConditioning:
         env_vars["HF_HUB_OFFLOAD_DIR"] = "/tmp/hf_offload"
         
         self.process = subprocess.Popen([
-            "python", "main.py", "--listen", "127.0.0.1", "--port", "8188",
+            "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
             "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
-            "--bf16-vae", "--disable-xformers", "--fp8_e4m3fn-text-enc"        
+            "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc"
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)
         
         self.t = threading.Thread(target=self._log_reader, daemon=True)
@@ -301,7 +301,6 @@ class LTXVLoadConditioning:
     @modal.fastapi_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
         
-        # <--- RESTORED YOUR CORRECT AUTH STRING --->
         if x_api_key != "testing-modal-workflow-2": 
             raise HTTPException(status_code=403, detail="Unauthorized Account 2 Pipeline Request")
         

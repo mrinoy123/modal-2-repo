@@ -348,7 +348,6 @@ class LTXEngine:
                         img.save(target_dest)
 
                 async with aiohttp.ClientSession() as download_session:
-                    # FIX: Corrected loop variables to (i, url) so 'url' is correctly defined
                     tasks = [download_one(download_session, url, os.path.join(dynamic_guides_dir, f"guide_{i:04d}.png")) for i, url in enumerate(urls_to_download)]
                     await asyncio.gather(*tasks)
                 
@@ -447,13 +446,6 @@ class LTXEngine:
                         if "widgets_values" in sg2["252"]:
                             sg2["252"]["widgets_values"][0] = 4
 
-                    # REVERTED CONFIGURATION: SET CFG Guider to 8 on Sub-graph 2
-                    if "234" in sg2:
-                        if "inputs" not in sg2["234"]: sg2["234"]["inputs"] = {}
-                        sg2["234"]["inputs"]["cfg"] = 8
-                        if "widgets_values" in sg2["234"] and len(sg2["234"]["widgets_values"]) > 0:
-                            sg2["234"]["widgets_values"][0] = 8
-
                     if "235" in sg2:
                         num_imgs = len(image_filenames)
                         if "inputs" not in sg2["235"]: sg2["235"]["inputs"] = {}
@@ -483,14 +475,11 @@ class LTXEngine:
                         if "inputs" not in sg2["248"]: sg2["248"]["inputs"] = {}
                         sg2["248"]["inputs"]["lora_name"] = target_detailer_lora
                         
-                    # REVERTED CONFIGURATION: SET Steps count to 20 on Sub-graph 2
                     if "249" in sg2: 
                         if "inputs" not in sg2["249"]: sg2["249"]["inputs"] = {}
                         sg2["249"]["inputs"]["steps"] = 20
                         sg2["249"]["inputs"]["length"] = requested_length
                         sg2["249"]["inputs"]["max_frames"] = requested_length
-                        if "widgets_values" in sg2["249"] and len(sg2["249"]["widgets_values"]) > 0:
-                            sg2["249"]["widgets_values"][0] = 20
                     
                     if "233" in sg2:
                         if "inputs" not in sg2["233"]: sg2["233"]["inputs"] = {}
@@ -547,6 +536,10 @@ class LTXEngine:
                         if "inputs" not in sg3["283"]: sg3["283"]["inputs"] = {}
                         sg3["283"]["inputs"]["file_name"] = "(NEGATIVE)conditioning.pt"
                         
+                    if "291" in sg3:
+                        if "inputs" not in sg3["291"]: sg3["291"]["inputs"] = {}
+                        sg3["291"]["inputs"]["steps"] = 20
+
                     if "295" in sg3: 
                         if "inputs" not in sg3["295"]: sg3["295"]["inputs"] = {}
                         sg3["295"]["inputs"]["ckpt_name"] = target_audio_vae

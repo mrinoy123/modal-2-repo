@@ -348,7 +348,7 @@ class LTXEngine:
                         img.save(target_dest)
 
                 async with aiohttp.ClientSession() as download_session:
-                    tasks = [download_one(download_session, url, os.path.join(dynamic_guides_dir, f"guide_{i:04d}.png")) for i, url in enumerate(urls_to_download)]
+                    tasks = [download_one(download_session, url, os.path.join(dynamic_guides_dir, f"guide_{i:04d}.png")) for i, enumerate in enumerate(urls_to_download)]
                     await asyncio.gather(*tasks)
                 
                 image_filenames = [os.path.join(dynamic_guides_dir, f"guide_{i:04d}.png") for i in range(len(urls_to_download))]
@@ -446,12 +446,12 @@ class LTXEngine:
                         if "widgets_values" in sg2["252"]:
                             sg2["252"]["widgets_values"][0] = 4
 
-                    # ADDED CONFIGURATION: SET CFG Guider to 1 on Sub-graph 2
+                    # ADDED CONFIGURATION: SET CFG Guider to 8 on Sub-graph 2
                     if "234" in sg2:
                         if "inputs" not in sg2["234"]: sg2["234"]["inputs"] = {}
-                        sg2["234"]["inputs"]["cfg"] = 1
+                        sg2["234"]["inputs"]["cfg"] = 8
                         if "widgets_values" in sg2["234"] and len(sg2["234"]["widgets_values"]) > 0:
-                            sg2["234"]["widgets_values"][0] = 1
+                            sg2["234"]["widgets_values"][0] = 8
 
                     if "235" in sg2:
                         num_imgs = len(image_filenames)
@@ -482,9 +482,10 @@ class LTXEngine:
                         if "inputs" not in sg2["248"]: sg2["248"]["inputs"] = {}
                         sg2["248"]["inputs"]["lora_name"] = target_detailer_lora
                         
+                    # ADDED CONFIGURATION: SET Steps count to 20 on Sub-graph 2
                     if "249" in sg2: 
                         if "inputs" not in sg2["249"]: sg2["249"]["inputs"] = {}
-                        sg2["249"]["inputs"]["steps"] = 12
+                        sg2["249"]["inputs"]["steps"] = 20
                         sg2["249"]["inputs"]["length"] = requested_length
                         sg2["249"]["inputs"]["max_frames"] = requested_length
                     

@@ -22,18 +22,27 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-python-version: '3.12'
+          python-version: '3.12'
 
-      - name: Install Modal
+      - name: Install Modal & Runner Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install modal
+          pip install modal fastapi aiohttp
 
-      - name: Deploy LTX Video API Engine
+      - name: Deploy Selected API Engine
         # Maps the unique Account 2 secrets in GitHub to what Modal expects
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID_2 }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET_2 }}
+          TARGET: ${{ github.event.inputs.target }}
         run: |
-          echo "Deploying LTX-19b-new-v20 Video API to Account 2..."
-          modal deploy LTX-19b-new-v20.py
+          if [ "$TARGET" = "ltx-19b" ]; then
+            echo "Deploying LTX-19b-new-v20 Video API to Account 2..."
+            modal deploy LTX-19b-new-v20.py
+          elif [ "$TARGET" = "sonic-1vpsync" ]; then
+            echo "Deploying sonic-1vpsync Video API to Account 2..."
+            modal deploy sonic-1vpsync.py
+          else
+            echo "Error: Unknown deployment target '$TARGET'"
+            exit 1
+          fi

@@ -42,10 +42,11 @@ build_image = base_image.env({
 
 # =========================================================================================
 # 🔥 FIX 1: Install Exact Torch Stack FIRST (Prevents deployment freezing from cu13 bloat)
+# Added torchsde explicitly because our 'sed' command removes anything with the word "torch"
 # =========================================================================================
 torch_image = build_image.run_commands(
     "pip install --no-cache-dir torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cu124",
-    "pip install --no-cache-dir numpy==1.26.4 kornia==0.7.3 sageattention==1.0.6 diffusers accelerate transformers"
+    "pip install --no-cache-dir numpy==1.26.4 kornia==0.7.3 sageattention==1.0.6 diffusers accelerate transformers torchsde"
 )
 
 # Clone ComfyUI and install required custom nodes
@@ -90,8 +91,8 @@ final_image = deps_image.run_commands(
     "echo 'sageattn_qk_int8_pv_fp16_triton = sageattn' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py"
 )
 
-app = modal.App("media-worker")
-weights_volume = modal.Volume.from_name("ltx-new-version20-weights", create_if_missing=False)
+app = modal.App("ltx-2-19b-v20-api")
+weights_volume = modal.Volume.from_name("ltx-new-version20-weights")
 
 @app.cls(
     gpu="L4", 
@@ -276,9 +277,9 @@ class LTXVLoadConditioning:
         env_vars["HF_HUB_OFFLOAD_DIR"] = "/tmp/hf_offload"
         
         self.process = subprocess.Popen([
-            "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
+            "python", "main.py", "--listen", "127.0.0.1", "--port", "8188",
             "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
-            "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc"
+            "--bf16-vae", "--disable-xformers", "--fp8_e4m3fn-text-enc"        
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)
         
         self.t = threading.Thread(target=self._log_reader, daemon=True)

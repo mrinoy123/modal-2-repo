@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "git", "wget", "ffmpeg", "libgl1", "libglib2.0-0", 
     "build-essential", "ninja-build", "cmake", "clang", "llvm"
 ).env({
-    "FORCE_REBUILD_INDEX": "118"  # Bumped to 118 to inject the SageAttention API alias patch
+    "FORCE_REBUILD_INDEX": "119"  # Bumped to 119 to inject the SageAttention API alias patch
 })
 
 # ==============================================================================
@@ -49,6 +49,7 @@ build_image = base_image.env({
     "python3.12 -m pip install --no-cache-dir fastapi aiohttp boto3 triton>=3.1.0 ninja setuptools>=70.0.0 wheel pip>=24.0",
     "python3.12 -m pip install --no-cache-dir pandas numexpr pytz python-dateutil scipy matplotlib colorama librosa soundfile decord imageio scikit-image numba einops bitsandbytes"
 )
+
 
 # ==============================================================================
 # PART 4: COMFYUI & CUSTOM NODES CLONING + DEPENDENCY ISOLATION
@@ -80,7 +81,8 @@ final_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir diffusers accelerate transformers torchsde numpy==1.26.4 kornia==0.7.3"
 ).run_commands(
     "python3.12 -m pip install --no-cache-dir sageattention==1.0.6",
-    # INJECTED FIX: Creates a direct alias in the library so KJNodes finds the exact expected import name
+    # INJECTED FIX: Inserts a clean newline before appending the alias to prevent syntax colliding on the last line
+    "echo '' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     "echo 'sageattn_qk_int8_pv_fp16_triton = sageattn' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     env={
         "CUDA_HOME": "/usr/local/cuda",
@@ -89,6 +91,7 @@ final_image = build_image.run_commands(
         "TORCH_CUDA_ARCH_LIST": "8.9"
     }
 )
+
 
 # ==============================================================================
 # PART 5: MODAL APP CONFIGURATION

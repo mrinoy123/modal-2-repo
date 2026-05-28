@@ -30,8 +30,8 @@ jobs:
       - name: 🚀 Deploy LTX-19b New v20 Engine
         if: github.event.inputs.target == 'ltx-19b'
         env:
-          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
-          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID_2 }}        # 👈 Updated to match your screenshot
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET_2 }}  # 👈 Updated to match your screenshot
         run: |
           echo "Deploying LTX-19b-new-v20 Video API to Account 2..."
           modal deploy LTX-19b-new-v20.py
@@ -39,8 +39,8 @@ jobs:
       - name: 🗣️ Deploy Sonic Lip-Sync Engine
         if: github.event.inputs.target == 'sonic-lypsync'
         env:
-          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
-          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID_2 }}        # 👈 Updated to match your screenshot
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET_2 }}  # 👈 Updated to match your screenshot
         run: |
           echo "Deploying Sonic Lip-Sync API to Account 2..."
           modal deploy sonic-lypsync-deploy.py

@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "git", "wget", "ffmpeg", "libgl1", "libglib2.0-0", 
     "build-essential", "ninja-build", "cmake", "clang", "llvm"
 ).env({
-    "FORCE_REBUILD_INDEX": "117"  # Bumped to 117 to flush cache and install new SageAttention API
+    "FORCE_REBUILD_INDEX": "118"  # Bumped to 118 to inject the SageAttention API alias patch
 })
 
 # ==============================================================================
@@ -54,7 +54,7 @@ build_image = base_image.env({
 # PART 4: COMFYUI & CUSTOM NODES CLONING + DEPENDENCY ISOLATION
 # Purpose: Clone the main ComfyUI repository along with all necessary custom 
 # nodes. Purges open-ended torch dependencies to prevent environment overriding,
-# then locks the exact PyTorch + cu124 stack.
+# then locks the exact PyTorch + cu124 stack, and injects SageAttention alias.
 # ==============================================================================
 final_image = build_image.run_commands(
     "git clone https://github.com/comfyanonymous/ComfyUI /workspace/ComfyUI",
@@ -79,8 +79,9 @@ final_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124",
     "python3.12 -m pip install --no-cache-dir diffusers accelerate transformers torchsde numpy==1.26.4 kornia==0.7.3"
 ).run_commands(
-    # FIXED: Unpinned SageAttention to allow the latest v2.0+ API to install
-    "python3.12 -m pip install --no-cache-dir sageattention",
+    "python3.12 -m pip install --no-cache-dir sageattention==1.0.6",
+    # INJECTED FIX: Creates a direct alias in the library so KJNodes finds the exact expected import name
+    "echo 'sageattn_qk_int8_pv_fp16_triton = sageattn' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     env={
         "CUDA_HOME": "/usr/local/cuda",
         "PATH": "/usr/local/cuda/bin:" + os.environ.get("PATH", ""),

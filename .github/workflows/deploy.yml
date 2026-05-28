@@ -10,37 +10,30 @@ on:
         type: choice
         options:
           - ltx-19b
-          - sonic-lypsync
+          - sonic-1vpsync
 
 jobs:
-  deploy-modal:
+  deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: 🛰️ Checkout Repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 🐍 Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-python-version: '3.12'
 
-      - name: 📦 Install Modal & Dependencies
-        run: pip install modal fastapi
+      - name: Install Modal
+        run: |
+          python -m pip install --upgrade pip
+          pip install modal
 
-      - name: 🚀 Deploy LTX-19b New v20 Engine
-        if: github.event.inputs.target == 'ltx-19b'
+      - name: Deploy LTX Video API Engine
+        # Maps the unique Account 2 secrets in GitHub to what Modal expects
         env:
-          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID_2 }}        # 👈 Updated to match your screenshot
-          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET_2 }}  # 👈 Updated to match your screenshot
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID_2 }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET_2 }}
         run: |
           echo "Deploying LTX-19b-new-v20 Video API to Account 2..."
           modal deploy LTX-19b-new-v20.py
-
-      - name: 🗣️ Deploy Sonic Lip-Sync Engine
-        if: github.event.inputs.target == 'sonic-lypsync'
-        env:
-          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID_2 }}        # 👈 Updated to match your screenshot
-          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET_2 }}  # 👈 Updated to match your screenshot
-        run: |
-          echo "Deploying Sonic Lip-Sync API to Account 2..."
-          modal deploy sonic-lypsync-deploy.py

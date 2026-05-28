@@ -1,7 +1,5 @@
 # ==============================================================================
 # PART 1: IMPORTS & ENVIRONMENT SETUP
-# Purpose: Import required libraries for Modal serverless execution, async 
-# processing, HTTP server handling, and system-level operations.
 # ==============================================================================
 import modal
 import subprocess
@@ -19,8 +17,6 @@ from typing import Optional
 
 # ==============================================================================
 # PART 2: BASE IMAGE & OS CONFIGURATION
-# Purpose: Initialize the foundation Docker image using Ubuntu 24.04 and 
-# CUDA 12.5.1. Installs core OS-level dependencies (git, compilers, ffmpeg).
 # ==============================================================================
 base_image = modal.Image.from_registry(
     "nvidia/cuda:12.5.1-devel-ubuntu24.04", 
@@ -29,13 +25,11 @@ base_image = modal.Image.from_registry(
     "git", "wget", "ffmpeg", "libgl1", "libglib2.0-0", 
     "build-essential", "ninja-build", "cmake", "clang", "llvm"
 ).env({
-    "FORCE_REBUILD_INDEX": "119"  # Bumped to 119 to inject the SageAttention API alias patch
+    "FORCE_REBUILD_INDEX": "120"  # Bumped to force the new ComfyUI Core Patch
 })
 
 # ==============================================================================
 # PART 3: CORE PYTHON DEPENDENCIES & ENVIRONMENT VARIABLES
-# Purpose: Lock CUDA compiler variables globally and install foundational 
-# Python packages like standard math, data manipulation, and web libraries.
 # ==============================================================================
 build_image = base_image.env({
     "CUDA_HOME": "/usr/local/cuda",
@@ -85,10 +79,21 @@ deps_image = clone_image.run_commands(
     r"find /workspace/ComfyUI/custom_nodes -name 'requirements.txt' -exec python3.12 -m pip install --no-cache-dir -r {} \;"
 )
 
-# 4. Inject Alias mapping for KJNodes into SageAttention
+# 4. Inject Patches to bypass Core crashes
 final_image = deps_image.run_commands(
+    # 🔥 PATCH 1: Fix FizzNodes NoneType crash
+    "sed -i 's/final_pooled_output = torch.cat(pooled_out, dim=0)/final_pooled_output = torch.cat([p for p in pooled_out if p is not None], dim=0) if any(p is not None for p in pooled_out) else None/g' /workspace/ComfyUI/custom_nodes/ComfyUI_FizzNodes/BatchFuncs.py",
+    
+    # 🔥 PATCH 2: Safely bypass LTXVideo looping_sampler missing raw_conds
+    "python3 -c \"filepath = '/workspace/ComfyUI/custom_nodes/ComfyUI-LTXVideo/looping_sampler.py'; code = open(filepath).read(); code = code.replace('positive, negative = guider.raw_conds', 'positive, negative = getattr(guider, \\'raw_conds\\', None) or (getattr(guider, \\'original_conds\\', {}).get(\\'positive\\'), getattr(guider, \\'original_conds\\', {}).get(\\'negative\\'))'); open(filepath, 'w').write(code)\"",
+    
+    # 🔥 PATCH 3: Global SageAttention API remap
     "echo '' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     "echo 'sageattn_qk_int8_pv_fp16_triton = sageattn' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
+
+    # 🔥 PATCH 4: FORCE RESOLVE "IndexError: list index out of range" CAUSED BY DenoLTXSequencer
+    "python3 -c \"filepath = '/workspace/ComfyUI/comfy/sampler_helpers.py'; code = open(filepath).read(); code = code.replace('temp = c[1].copy()', 'temp = c[1].copy() if len(c) > 1 else {}'); open(filepath, 'w').write(code)\"",
+    
     env={
         "CUDA_HOME": "/usr/local/cuda",
         "PATH": "/usr/local/cuda/bin:" + os.environ.get("PATH", ""),
@@ -115,9 +120,6 @@ weights_volume = modal.Volume.from_name("ltx-new-version20-weights", create_if_m
 )
 class LTXEngine:
     
-    # ==============================================================================
-    # PART 6: HELPER METHODS (LOGGING & RAM OPTIMIZATION)
-    # ==============================================================================
     def _log_reader(self):
         for line in iter(self.process.stdout.readline, ""):
             if line: print(f"[ComfyUI] {line.strip()}")
@@ -132,9 +134,6 @@ class LTXEngine:
                 except Exception: pass
             await asyncio.sleep(10)
 
-    # ==============================================================================
-    # PART 7: SERVER INITIALIZATION (@modal.enter)
-    # ==============================================================================
     @modal.enter()
     def start_comfy(self):
         import boto3
@@ -263,9 +262,6 @@ class LTXVLoadConditioning:
             except Exception: time.sleep(2)
         os._exit(1)
 
-    # ==============================================================================
-    # PART 8: INFERENCE EXECUTION & MEMORY CLEARING UTILITIES
-    # ==============================================================================
     async def clear_comfy_memory(self, session):
         try:
             async with session.post("http://127.0.0.1:8188/free", json={"unload_models": True, "free_memory": True}) as r:
@@ -325,9 +321,6 @@ class LTXVLoadConditioning:
                 base_graph[node_id] = node_data
         return base_graph
 
-    # ==============================================================================
-    # PART 9: MAIN FASTAPI ENDPOINT (For usage with n8n HTTP Request node)
-    # ==============================================================================
     @modal.fastapi_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
         if x_api_key != "testing-modal-workflow-2": 
@@ -423,7 +416,7 @@ class LTXVLoadConditioning:
                 tasks = [download_one(download_session, url, os.path.join(dynamic_guides_dir, f"guide_{i}.png")) for i, url in enumerate(urls_to_download)]
                 await asyncio.gather(*tasks)
             
-            # [FIX 2]: Map directly to Absolute Path
+            # Map directly to Absolute Path
             image_filenames = [os.path.join(dynamic_guides_dir, f"guide_{i}.png") for i in range(len(urls_to_download))]
 
         out_dir = "/workspace/ComfyUI/output"
@@ -445,7 +438,6 @@ class LTXVLoadConditioning:
                     with open("comfyui-ltx-20-subgraph-1(api).json", "r") as f:
                         sg1 = json.load(f)
                 
-                # N8N Override support!
                 sg1 = self.merge_overrides(sg1, body.get("subgraph_1_override"))
 
                 if "243" in sg1:
@@ -477,7 +469,6 @@ class LTXVLoadConditioning:
                     with open("comfyui-ltx-20-subgraph-2(api).json", "r") as f:
                         sg2 = json.load(f)
 
-                # N8N Override support!
                 sg2 = self.merge_overrides(sg2, body.get("subgraph_2_override"))
 
                 if "194" in sg2:
@@ -495,7 +486,7 @@ class LTXVLoadConditioning:
                     sg2["237"]["inputs"]["image_paths"] = "\n".join(image_filenames) 
                 
                 # ======================================================================================
-                # [FIX 1]: Dynamically inject the missing "frame_0" keys to prevent DenoLTX IndexError
+                # [FIX 1]: Dynamically inject the missing "frame_0" keys to sync images correctly
                 # ======================================================================================
                 if "235" in sg2:
                     num_imgs = len(image_filenames)
@@ -536,7 +527,6 @@ class LTXVLoadConditioning:
                     with open("comfyui-ltx-20-Subgraph-3(api).json", "r") as f:
                         sg3 = json.load(f)
 
-                # N8N Override support!
                 sg3 = self.merge_overrides(sg3, body.get("subgraph_3_override"))
 
                 if "232" in sg3:

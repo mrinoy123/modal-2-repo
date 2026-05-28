@@ -242,6 +242,9 @@ class LTXEngine:
                 
             await asyncio.sleep(1)
 
+    # -------------------------------------------------------------------------------------------------------------------
+    # MERGE OVERRIDES FIX: Ensures inputs, widgets_values, and properties are correctly synchronized from the n8n payload
+    # -------------------------------------------------------------------------------------------------------------------
     def merge_overrides(self, base_graph, override_graph):
         if not override_graph: 
             return base_graph
@@ -254,8 +257,10 @@ class LTXEngine:
             if node_id in base_graph:
                 if "inputs" in node_data and "inputs" in base_graph[node_id]:
                     base_graph[node_id]["inputs"].update(node_data["inputs"])
-                else: 
-                    base_graph[node_id].update(node_data)
+                if "widgets_values" in node_data:
+                    base_graph[node_id]["widgets_values"] = node_data["widgets_values"]
+                if "properties" in node_data and "properties" in base_graph[node_id]:
+                    base_graph[node_id]["properties"].update(node_data["properties"])
             else: 
                 base_graph[node_id] = node_data
         return base_graph
@@ -381,8 +386,8 @@ class LTXEngine:
                         sg1["243"]["inputs"]["device"] = "default" 
                         
                     if "112" in sg1: 
-                        if "inputs" not in sg1["112"]: sg1["112"]["inputs"] = {}
-                        sg1["112"]["inputs"]["text"] = negative_prompt
+                        if "widgets_values" in sg1["112"]:
+                            sg1["112"]["widgets_values"][0] = negative_prompt
                         
                     if "242" in sg1: 
                         if "inputs" not in sg1["242"]: sg1["242"]["inputs"] = {}
@@ -392,13 +397,12 @@ class LTXEngine:
                         if "inputs" not in sg1["244"]: sg1["244"]["inputs"] = {}
                         sg1["244"]["inputs"]["filename"] = "(POSITIVE)conditioning"
                     
+                    # WIDGET ARRAY INJECTION FIX FOR MULTI-PROMPT (Node 246)
                     if "246" in sg1: 
-                        if "inputs" not in sg1["246"]: sg1["246"]["inputs"] = {}
-                        sg1["246"]["inputs"]["prompts"] = prompts_timeline_str
-                        sg1["246"]["inputs"]["text"] = prompts_timeline_str
-                        sg1["246"]["inputs"]["max_frames"] = requested_length
-                        sg1["246"]["inputs"]["length"] = requested_length
-                        sg1["246"]["widgets_values"] = [prompts_timeline_str]
+                        if "widgets_values" in sg1["246"]:
+                            sg1["246"]["widgets_values"][0] = prompts_timeline_str
+                        else:
+                            sg1["246"]["widgets_values"] = [prompts_timeline_str]
 
                     print("🚀 Executing Sub-Graph 1 (Text Conditioning)...")
                     await self.execute_comfy_workflow(session, sg1)
@@ -416,76 +420,54 @@ class LTXEngine:
 
                     sg2 = self.merge_overrides(sg2, body.get("subgraph_2_override"))
 
-                    # ENFORCED RESOLUTION TO 384x480
-                    if "194" in sg2:
-                        if "inputs" not in sg2["194"]: sg2["194"]["inputs"] = {}
-                        sg2["194"]["inputs"]["width"] = 384
-                        sg2["194"]["inputs"]["height"] = 480
-                        sg2["194"]["inputs"]["length"] = requested_length
-                        if "widgets_values" in sg2["194"] and len(sg2["194"]["widgets_values"]) > 2:
-                            sg2["194"]["widgets_values"][0] = 384                 
-                            sg2["194"]["widgets_values"][1] = 480                 
-                            sg2["194"]["widgets_values"][2] = requested_length    
+                    # WIDGET ENFORCEMENT: 384x480 resolution (Node 194)
+                    if "194" in sg2 and "widgets_values" in sg2["194"] and len(sg2["194"]["widgets_values"]) > 2:
+                        sg2["194"]["widgets_values"][0] = 384                 
+                        sg2["194"]["widgets_values"][1] = 480                 
+                        sg2["194"]["widgets_values"][2] = requested_length    
 
-                    # ENFORCED RESOLUTION TO 384x480
-                    if "237" in sg2: 
-                        if "inputs" not in sg2["237"]: sg2["237"]["inputs"] = {}
-                        sg2["237"]["inputs"]["directory"] = dynamic_guides_dir
-                        sg2["237"]["inputs"]["aspect_ratio"] = "4:5"
-                        sg2["237"]["inputs"]["width"] = 384
-                        sg2["237"]["inputs"]["height"] = 480
-                        if "widgets_values" in sg2["237"] and len(sg2["237"]["widgets_values"]) > 5:
+                    # WIDGET ENFORCEMENT: Image directory & aspect ratio (Node 237)
+                    if "237" in sg2 and "widgets_values" in sg2["237"]:
+                        sg2["237"]["widgets_values"][0] = dynamic_guides_dir
+                        if len(sg2["237"]["widgets_values"]) > 5:
                             sg2["237"]["widgets_values"][2] = "4:5"                
                             sg2["237"]["widgets_values"][4] = 384                  
                             sg2["237"]["widgets_values"][5] = 480                  
 
-                    # SET LTXVChunkFeedForward to 4 for SG2 to avoid OOM
-                    if "252" in sg2:
-                        if "inputs" not in sg2["252"]: sg2["252"]["inputs"] = {}
-                        sg2["252"]["inputs"]["chunk_size"] = 4
-                        if "widgets_values" in sg2["252"]:
-                            sg2["252"]["widgets_values"][0] = 4
+                    # WIDGET ENFORCEMENT: ChunkSize=4 for OOM (Node 252)
+                    if "252" in sg2 and "widgets_values" in sg2["252"]:
+                        sg2["252"]["widgets_values"][0] = 4
 
+                    # PROPERTIES ENFORCEMENT: Deno Sequencer keyframes (Node 235)
                     if "235" in sg2:
                         num_imgs = len(image_filenames)
-                        if "inputs" not in sg2["235"]: sg2["235"]["inputs"] = {}
-                        sg2["235"]["inputs"]["num_images"] = num_imgs
+                        if "properties" not in sg2["235"]: sg2["235"]["properties"] = {}
+                        sg2["235"]["properties"]["num_images"] = num_imgs
                         for i in range(num_imgs):
-                            if f"frame_{i}" not in sg2["235"]["inputs"]:
-                                sg2["235"]["inputs"][f"frame_{i}"] = 0 if num_imgs == 1 else int(i * (requested_length - 1) / (num_imgs - 1))
+                            frame_val = 0 if num_imgs == 1 else int(i * (requested_length - 1) / (num_imgs - 1))
+                            sg2["235"]["properties"][f"insert_frame_{i+1}"] = frame_val
+                            sg2["235"]["properties"][f"strength_{i+1}"] = 1.0
+
+                    # WIDGET ENFORCEMENT: 12 Steps exactly for Video Generation (Node 249)
+                    if "249" in sg2 and "widgets_values" in sg2["249"]:
+                        sg2["249"]["widgets_values"][0] = 12
+
+                    # WIDGET ENFORCEMENT: Looping Sampler Length (Node 233)
+                    if "233" in sg2 and "widgets_values" in sg2["233"]:
+                        sg2["233"]["widgets_values"][0] = requested_length
 
                     if "238" in sg2:
                         if "inputs" not in sg2["238"]: sg2["238"]["inputs"] = {}
                         sg2["238"]["inputs"]["unet_name"] = target_unet
-                        sg2["238"]["inputs"]["weight_dtype"] = "fp8_e4m3fn" 
                         
                     if "241" in sg2: 
                         if "inputs" not in sg2["241"]: sg2["241"]["inputs"] = {}
                         sg2["241"]["inputs"]["vae_name"] = target_video_vae
                         
-                    if "245" in sg2: 
-                        if "inputs" not in sg2["245"]: sg2["245"]["inputs"] = {}
-                        sg2["245"]["inputs"]["file_name"] = "(POSITIVE)conditioning.pt"
-                        
-                    if "246" in sg2: 
-                        if "inputs" not in sg2["246"]: sg2["246"]["inputs"] = {}
-                        sg2["246"]["inputs"]["file_name"] = "(NEGATIVE)conditioning.pt"
-                        
                     if "248" in sg2: 
                         if "inputs" not in sg2["248"]: sg2["248"]["inputs"] = {}
                         sg2["248"]["inputs"]["lora_name"] = target_detailer_lora
                         
-                    if "249" in sg2: 
-                        if "inputs" not in sg2["249"]: sg2["249"]["inputs"] = {}
-                        sg2["249"]["inputs"]["steps"] = 12
-                        sg2["249"]["inputs"]["length"] = requested_length
-                        sg2["249"]["inputs"]["max_frames"] = requested_length
-                    
-                    if "233" in sg2:
-                        if "inputs" not in sg2["233"]: sg2["233"]["inputs"] = {}
-                        sg2["233"]["inputs"]["length"] = requested_length
-                        sg2["233"]["inputs"]["frames"] = requested_length
-
                     print("🚀 Executing Sub-Graph 2 (Main Video Generation)...")
                     await self.execute_comfy_workflow(session, sg2)
                     await self.clear_comfy_memory(session)
@@ -512,12 +494,13 @@ class LTXEngine:
 
                     sg3 = self.merge_overrides(sg3, body.get("subgraph_3_override"))
 
-                    # SET LTXVChunkFeedForward to 4 for SG3 to avoid OOM
-                    if "304" in sg3:
-                        if "inputs" not in sg3["304"]: sg3["304"]["inputs"] = {}
-                        sg3["304"]["inputs"]["chunk_size"] = 4
-                        if "widgets_values" in sg3["304"]:
-                            sg3["304"]["widgets_values"][0] = 4
+                    # WIDGET ENFORCEMENT: ChunkSize=4 for OOM (Node 304)
+                    if "304" in sg3 and "widgets_values" in sg3["304"]:
+                        sg3["304"]["widgets_values"][0] = 4
+
+                    # WIDGET ENFORCEMENT: 20 Steps exactly for Audio Generation (Node 291)
+                    if "291" in sg3 and "widgets_values" in sg3["291"]:
+                        sg3["291"]["widgets_values"][0] = 20
 
                     if "232" in sg3: 
                         if "inputs" not in sg3["232"]: sg3["232"]["inputs"] = {}
@@ -526,15 +509,6 @@ class LTXEngine:
                     if "278" in sg3:
                         if "inputs" not in sg3["278"]: sg3["278"]["inputs"] = {}
                         sg3["278"]["inputs"]["unet_name"] = target_unet
-                        sg3["278"]["inputs"]["weight_dtype"] = "fp8_e4m3fn" 
-                        
-                    if "282" in sg3: 
-                        if "inputs" not in sg3["282"]: sg3["282"]["inputs"] = {}
-                        sg3["282"]["inputs"]["file_name"] = "(POSITIVE)conditioning.pt"
-                        
-                    if "283" in sg3: 
-                        if "inputs" not in sg3["283"]: sg3["283"]["inputs"] = {}
-                        sg3["283"]["inputs"]["file_name"] = "(NEGATIVE)conditioning.pt"
                         
                     if "295" in sg3: 
                         if "inputs" not in sg3["295"]: sg3["295"]["inputs"] = {}
@@ -544,15 +518,6 @@ class LTXEngine:
                         if "inputs" not in sg3["296"]: sg3["296"]["inputs"] = {}
                         sg3["296"]["inputs"]["vae_name"] = target_video_vae
                     
-                    if "290" in sg3: 
-                        if "inputs" not in sg3["290"]: sg3["290"]["inputs"] = {}
-                        sg3["290"]["inputs"]["frames_number"] = requested_length
-                    
-                    if "298" in sg3:
-                        if "inputs" not in sg3["298"]: sg3["298"]["inputs"] = {}
-                        sg3["298"]["inputs"]["format"] = "video/h264-mp4"
-                        sg3["298"]["inputs"]["frame_rate"] = 24
-                        
                     if "302" in sg3: 
                         if "inputs" not in sg3["302"]: sg3["302"]["inputs"] = {}
                         sg3["302"]["inputs"]["lora_name"] = target_detailer_lora

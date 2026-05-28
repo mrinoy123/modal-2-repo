@@ -28,7 +28,7 @@ base_image = modal.Image.from_registry(
     "git", "wget", "ffmpeg", "libgl1", "libglib2.0-0",
     "build-essential", "ninja-build", "cmake", "clang", "llvm"
 ).env({
-    "FORCE_REBUILD_INDEX": "131"  # Bumped to ensure fresh deployment cache and clean dependencies
+    "FORCE_REBUILD_INDEX": "130"  # Bumped to ensure fresh deployment cache
 })
 
 # ==============================================================================
@@ -171,8 +171,7 @@ class LTXEngine:
         env_vars = os.environ.copy()
         env_vars["TORCH_NUM_THREADS"] = "1"
         env_vars["OMP_NUM_THREADS"] = "1"
-        # RESTORED: Added max_split_size_mb:64 to prevent VRAM fragmentation when chunk_size = 4
-        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
+        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
         env_vars["CUDA_MODULE_LOADING"] = "LAZY" 
         env_vars["MALLOC_TRIM_THRESHOLD_"] = "65536" 
         env_vars["HF_HUB_OFFLOAD_DIR"] = "/tmp/hf_offload"
@@ -478,8 +477,9 @@ class LTXEngine:
                         
                     if "249" in sg2: 
                         if "inputs" not in sg2["249"]: sg2["249"]["inputs"] = {}
-                        sg2["249"]["inputs"]["steps"] = 20
-                        # FIXED: Removed `max_frames` & `length` overrides here to preserve correct Sigma Noise curve.
+                        sg2["249"]["inputs"]["steps"] = 12
+                        sg2["249"]["inputs"]["length"] = requested_length
+                        sg2["249"]["inputs"]["max_frames"] = requested_length
                     
                     if "233" in sg2:
                         if "inputs" not in sg2["233"]: sg2["233"]["inputs"] = {}
@@ -536,10 +536,6 @@ class LTXEngine:
                         if "inputs" not in sg3["283"]: sg3["283"]["inputs"] = {}
                         sg3["283"]["inputs"]["file_name"] = "(NEGATIVE)conditioning.pt"
                         
-                    if "291" in sg3:
-                        if "inputs" not in sg3["291"]: sg3["291"]["inputs"] = {}
-                        sg3["291"]["inputs"]["steps"] = 20
-
                     if "295" in sg3: 
                         if "inputs" not in sg3["295"]: sg3["295"]["inputs"] = {}
                         sg3["295"]["inputs"]["ckpt_name"] = target_audio_vae
@@ -555,7 +551,7 @@ class LTXEngine:
                     if "298" in sg3:
                         if "inputs" not in sg3["298"]: sg3["298"]["inputs"] = {}
                         sg3["298"]["inputs"]["format"] = "video/h264-mp4"
-                        sg3["298"]["inputs"]["frame_rate"] = 12
+                        sg3["298"]["inputs"]["frame_rate"] = 24
                         
                     if "302" in sg3: 
                         if "inputs" not in sg3["302"]: sg3["302"]["inputs"] = {}
@@ -591,12 +587,12 @@ class LTXEngine:
 
                     public_path_url = f"https://pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev/{target_key}" 
                     
-                    return json.dumps({
+                    return {
                         "status": "success",
                         "file_key": target_key,
                         "public_url": public_path_url,
                         "filename": saved_filename
-                    })
+                    }
 
             finally:
                 ram_task.cancel()

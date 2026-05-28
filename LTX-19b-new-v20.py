@@ -319,6 +319,7 @@ class LTXEngine:
             if not urls_to_download:
                 fallback_path = os.path.join(dynamic_guides_dir, "guide_0000.png")
                 from PIL import Image
+                # ENFORCED RESOLUTION TO 384x480
                 img = Image.new('RGB', (384, 480), color='black')
                 img.save(fallback_path)
                 image_filenames = [fallback_path] 
@@ -342,6 +343,7 @@ class LTXEngine:
                     
                     if not os.path.exists(target_dest):
                         from PIL import Image
+                        # ENFORCED RESOLUTION TO 384x480
                         img = Image.new('RGB', (384, 480), color='black')
                         img.save(target_dest)
 
@@ -414,6 +416,7 @@ class LTXEngine:
 
                     sg2 = self.merge_overrides(sg2, body.get("subgraph_2_override"))
 
+                    # ENFORCED RESOLUTION TO 384x480
                     if "194" in sg2:
                         if "inputs" not in sg2["194"]: sg2["194"]["inputs"] = {}
                         sg2["194"]["inputs"]["width"] = 384
@@ -424,6 +427,7 @@ class LTXEngine:
                             sg2["194"]["widgets_values"][1] = 480                 
                             sg2["194"]["widgets_values"][2] = requested_length    
 
+                    # ENFORCED RESOLUTION TO 384x480
                     if "237" in sg2: 
                         if "inputs" not in sg2["237"]: sg2["237"]["inputs"] = {}
                         sg2["237"]["inputs"]["directory"] = dynamic_guides_dir
@@ -435,12 +439,12 @@ class LTXEngine:
                             sg2["237"]["widgets_values"][4] = 384                  
                             sg2["237"]["widgets_values"][5] = 480                  
 
-                    # SET LTXVChunkFeedForward to 2 for SG2 to avoid OOM
+                    # SET LTXVChunkFeedForward to 4 for SG2 to avoid OOM
                     if "252" in sg2:
                         if "inputs" not in sg2["252"]: sg2["252"]["inputs"] = {}
-                        sg2["252"]["inputs"]["chunk_size"] = 2
+                        sg2["252"]["inputs"]["chunk_size"] = 4
                         if "widgets_values" in sg2["252"]:
-                            sg2["252"]["widgets_values"][0] = 2
+                            sg2["252"]["widgets_values"][0] = 4
 
                     if "235" in sg2:
                         num_imgs = len(image_filenames)
@@ -508,12 +512,12 @@ class LTXEngine:
 
                     sg3 = self.merge_overrides(sg3, body.get("subgraph_3_override"))
 
-                    # SET LTXVChunkFeedForward to 2 for SG3 to avoid OOM
+                    # SET LTXVChunkFeedForward to 4 for SG3 to avoid OOM
                     if "304" in sg3:
                         if "inputs" not in sg3["304"]: sg3["304"]["inputs"] = {}
-                        sg3["304"]["inputs"]["chunk_size"] = 2
+                        sg3["304"]["inputs"]["chunk_size"] = 4
                         if "widgets_values" in sg3["304"]:
-                            sg3["304"]["widgets_values"][0] = 2
+                            sg3["304"]["widgets_values"][0] = 4
 
                     if "232" in sg3: 
                         if "inputs" not in sg3["232"]: sg3["232"]["inputs"] = {}

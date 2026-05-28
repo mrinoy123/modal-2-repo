@@ -165,15 +165,17 @@ class LTXEngine:
         env_vars = os.environ.copy()
         env_vars["TORCH_NUM_THREADS"] = "1"
         env_vars["OMP_NUM_THREADS"] = "1"
-        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
+        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
         env_vars["CUDA_MODULE_LOADING"] = "LAZY" 
         env_vars["MALLOC_TRIM_THRESHOLD_"] = "65536" 
         env_vars["HF_HUB_OFFLOAD_DIR"] = "/tmp/hf_offload"
         
+        # Explicitly added --normalvram to strictly prevent ComfyUI from falling back to lowvram
         self.process = subprocess.Popen([
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
             "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
-            "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc"
+            "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc",
+            "--normalvram"
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)
         
         self.t = threading.Thread(target=self._log_reader, daemon=True)
@@ -291,7 +293,6 @@ class LTXEngine:
                 elif isinstance(incoming_image_urls, str) and incoming_image_urls.strip():
                     urls_to_download = [u.strip() for u in incoming_image_urls.split(",") if u.strip()]
 
-            # Force Zero-Padded nomenclature so `LoadImageListFromDirectory` parses sequence alphabetically
             image_filenames = []
             if not urls_to_download:
                 fallback_path = os.path.join(dynamic_guides_dir, "guide_0000.png")
@@ -320,7 +321,6 @@ class LTXEngine:
                         img.save(target_dest)
 
                 async with aiohttp.ClientSession() as download_session:
-                    # Formats numbering as 0000, 0001, etc. for flawless sequence loading in Deno node
                     tasks = [download_one(download_session, url, os.path.join(dynamic_guides_dir, f"guide_{i:04d}.png")) for i, url in enumerate(urls_to_download)]
                     await asyncio.gather(*tasks)
                 
@@ -371,19 +371,23 @@ class LTXEngine:
 
                     sg2 = self.merge_overrides(sg2, body.get("subgraph_2_override"))
 
-                    if "194" in sg2: sg2["194"]["inputs"]["length"] = requested_length
-                    if "238" in sg2:
-                        sg2["238"]["inputs"]["unet_name"] = target_unet
-                        sg2["238"]["inputs"]["weight_dtype"] = "fp8_e4m3fn" 
-                    if "241" in sg2: sg2["241"]["inputs"]["vae_name"] = target_video_vae
-                    if "245" in sg2: sg2["245"]["inputs"]["file_name"] = "(POSITIVE)conditioning.pt"
-                    if "246" in sg2: sg2["246"]["inputs"]["file_name"] = "(NEGATIVE)conditioning.pt"
-                    
-                    # Fix: Push the actual target directory variable into Node 237
+                    # --- RESOLUTION FIXES FOR SG2 (Strictly 384x480 at 4:5 Aspect Ratio) ---
+                    if "194" in sg2:
+                        # EmptyLTXVLatentVideo Widget Format: [width, height, frames, batch_size]
+                        if "widgets_values" in sg2["194"] and len(sg2["194"]["widgets_values"]) > 2:
+                            sg2["194"]["widgets_values"][0] = 384                 # Width
+                            sg2["194"]["widgets_values"][1] = 480                 # Height
+                            sg2["194"]["widgets_values"][2] = requested_length    # Frames
+
                     if "237" in sg2: 
                         sg2["237"]["inputs"]["directory"] = dynamic_guides_dir
-                    
-                    # Fix: Properly map dynamic image quantities evenly to available target loop sequence positions
+                        # DenoMultiImageLoader Widget list indexes: 
+                        # [2] = Ratio string, [4] = Width, [5] = Height
+                        if "widgets_values" in sg2["237"] and len(sg2["237"]["widgets_values"]) > 5:
+                            sg2["237"]["widgets_values"][2] = "4:5"               # Ensure correct crop ratio math
+                            sg2["237"]["widgets_values"][4] = 384                 # Width
+                            sg2["237"]["widgets_values"][5] = 480                 # Height
+
                     if "235" in sg2:
                         num_imgs = len(image_filenames)
                         sg2["235"]["inputs"]["num_images"] = num_imgs
@@ -391,6 +395,12 @@ class LTXEngine:
                             if f"frame_{i}" not in sg2["235"]["inputs"]:
                                 sg2["235"]["inputs"][f"frame_{i}"] = 0 if num_imgs == 1 else int(i * (requested_length - 1) / (num_imgs - 1))
 
+                    if "238" in sg2:
+                        sg2["238"]["inputs"]["unet_name"] = target_unet
+                        sg2["238"]["inputs"]["weight_dtype"] = "fp8_e4m3fn" 
+                    if "241" in sg2: sg2["241"]["inputs"]["vae_name"] = target_video_vae
+                    if "245" in sg2: sg2["245"]["inputs"]["file_name"] = "(POSITIVE)conditioning.pt"
+                    if "246" in sg2: sg2["246"]["inputs"]["file_name"] = "(NEGATIVE)conditioning.pt"
                     if "248" in sg2: sg2["248"]["inputs"]["lora_name"] = target_detailer_lora
                     if "249" in sg2: sg2["249"]["inputs"]["steps"] = 12
 
@@ -428,12 +438,9 @@ class LTXEngine:
                     if "295" in sg3: sg3["295"]["inputs"]["ckpt_name"] = target_audio_vae
                     if "296" in sg3: sg3["296"]["inputs"]["vae_name"] = target_video_vae
                     
-                    # Fix: To map exactly to audio timing, pass exact generated length down to aligner
                     if "290" in sg3: 
                         sg3["290"]["inputs"]["frames_number"] = requested_length
                     
-                    # Fix: Hard-forcing VideoCombine node to 24fps without frame interpolation node simply 
-                    # speeds up playback x2. Setting FPS specifically to 12fps maintains absolute 1:1 sync natively.
                     if "298" in sg3:
                         sg3["298"]["inputs"]["format"] = "video/h264-mp4"
                         sg3["298"]["inputs"]["frame_rate"] = 12

@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "git", "wget", "ffmpeg", "libgl1", "libglib2.0-0", 
     "build-essential", "ninja-build", "cmake", "clang", "llvm"
 ).env({
-    "FORCE_REBUILD_INDEX": "116"  # Incremented to flush old Modal cache signatures
+    "FORCE_REBUILD_INDEX": "117"  # Bumped to 117 to flush cache and install new SageAttention API
 })
 
 # ==============================================================================
@@ -54,7 +54,7 @@ build_image = base_image.env({
 # PART 4: COMFYUI & CUSTOM NODES CLONING + DEPENDENCY ISOLATION
 # Purpose: Clone the main ComfyUI repository along with all necessary custom 
 # nodes. Purges open-ended torch dependencies to prevent environment overriding,
-# then locks the exact PyTorch + cu124 stack, and pins sageattention==1.0.6.
+# then locks the exact PyTorch + cu124 stack.
 # ==============================================================================
 final_image = build_image.run_commands(
     "git clone https://github.com/comfyanonymous/ComfyUI /workspace/ComfyUI",
@@ -79,7 +79,8 @@ final_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124",
     "python3.12 -m pip install --no-cache-dir diffusers accelerate transformers torchsde numpy==1.26.4 kornia==0.7.3"
 ).run_commands(
-    "python3.12 -m pip install --no-cache-dir sageattention==1.0.6",
+    # FIXED: Unpinned SageAttention to allow the latest v2.0+ API to install
+    "python3.12 -m pip install --no-cache-dir sageattention",
     env={
         "CUDA_HOME": "/usr/local/cuda",
         "PATH": "/usr/local/cuda/bin:" + os.environ.get("PATH", ""),
@@ -95,13 +96,12 @@ final_image = build_image.run_commands(
 # ==============================================================================
 app = modal.App("media-worker")
 
-weights_volume = modal.Volume.from_name("ltx-new-version20-weights", create_if_missing=False)
+weights_volume = modal.Volume.from_name("ltx-new-version-20-weights", create_if_missing=False)
 
 @app.cls(
     gpu="L4", 
     image=final_image, 
     volumes={"/mnt/weights": weights_volume},
-    # FIXED: Re-routed to point directly to your real Modal workspace secret name
     secrets=[modal.Secret.from_name("custom-secret")],
     memory=8192, 
     scaledown_window=30,

@@ -174,8 +174,8 @@ class LTXEngine:
         self.process = subprocess.Popen([
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
             "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
-            "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc"
-            
+            "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc",
+            "--normalvram"
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)
         
         self.t = threading.Thread(target=self._log_reader, daemon=True)
@@ -201,10 +201,13 @@ class LTXEngine:
         import torch
         gc.collect()
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
         try:
             ctypes.CDLL("libc.so.6").malloc_trim(0)
         except Exception:
             pass
+        # Critical delay to allow OS to physically free up the VRAM before the next chunk processes
+        await asyncio.sleep(2)
 
     async def execute_comfy_workflow(self, session, workflow_json):
         async with session.post("http://127.0.0.1:8188/prompt", json={"prompt": workflow_json}) as r:
@@ -346,14 +349,28 @@ class LTXEngine:
                     sg1 = self.merge_overrides(sg1, body.get("subgraph_1_override"))
 
                     if "243" in sg1:
+                        if "inputs" not in sg1["243"]: sg1["243"]["inputs"] = {}
                         sg1["243"]["inputs"]["text_encoder"] = target_gemma
                         sg1["243"]["inputs"]["ckpt_name"] = target_connector
                         sg1["243"]["inputs"]["device"] = "default" 
-                    if "112" in sg1: sg1["112"]["inputs"]["text"] = negative_prompt
-                    if "242" in sg1: sg1["242"]["inputs"]["filename"] = "(NEGATIVE)conditioning"
-                    if "244" in sg1: sg1["244"]["inputs"]["filename"] = "(POSITIVE)conditioning"
+                        
+                    if "112" in sg1: 
+                        if "inputs" not in sg1["112"]: sg1["112"]["inputs"] = {}
+                        sg1["112"]["inputs"]["text"] = negative_prompt
+                        
+                    if "242" in sg1: 
+                        if "inputs" not in sg1["242"]: sg1["242"]["inputs"] = {}
+                        sg1["242"]["inputs"]["filename"] = "(NEGATIVE)conditioning"
+                        
+                    if "244" in sg1: 
+                        if "inputs" not in sg1["244"]: sg1["244"]["inputs"] = {}
+                        sg1["244"]["inputs"]["filename"] = "(POSITIVE)conditioning"
                     
+                    # Fix: Make sure Multi-Prompt accurately applies to the `inputs` API directly.
                     if "246" in sg1: 
+                        if "inputs" not in sg1["246"]: sg1["246"]["inputs"] = {}
+                        sg1["246"]["inputs"]["prompts"] = prompts_timeline_str
+                        sg1["246"]["inputs"]["text"] = prompts_timeline_str
                         sg1["246"]["widgets_values"] = [prompts_timeline_str]
 
                     print("🚀 Executing Sub-Graph 1 (Text Conditioning)...")
@@ -373,6 +390,10 @@ class LTXEngine:
 
                     # --- RESOLUTION FIXES FOR SG2 (Strictly 384x480 at 4:5 Aspect Ratio) ---
                     if "194" in sg2:
+                        if "inputs" not in sg2["194"]: sg2["194"]["inputs"] = {}
+                        sg2["194"]["inputs"]["width"] = 384
+                        sg2["194"]["inputs"]["height"] = 480
+                        sg2["194"]["inputs"]["length"] = requested_length
                         # EmptyLTXVLatentVideo Widget Format: [width, height, frames, batch_size]
                         if "widgets_values" in sg2["194"] and len(sg2["194"]["widgets_values"]) > 2:
                             sg2["194"]["widgets_values"][0] = 384                 # Width
@@ -380,29 +401,56 @@ class LTXEngine:
                             sg2["194"]["widgets_values"][2] = requested_length    # Frames
 
                     if "237" in sg2: 
+                        if "inputs" not in sg2["237"]: sg2["237"]["inputs"] = {}
                         sg2["237"]["inputs"]["directory"] = dynamic_guides_dir
-                        # DenoMultiImageLoader Widget list indexes: 
-                        # [2] = Ratio string, [4] = Width, [5] = Height
+                        sg2["237"]["inputs"]["aspect_ratio"] = "4:5"
+                        sg2["237"]["inputs"]["width"] = 384
+                        sg2["237"]["inputs"]["height"] = 480
+                        # DenoMultiImageLoader Widget list indexes: [2] = Ratio string, [4] = Width, [5] = Height
                         if "widgets_values" in sg2["237"] and len(sg2["237"]["widgets_values"]) > 5:
-                            sg2["237"]["widgets_values"][2] = "4:5"               # Ensure correct crop ratio math
-                            sg2["237"]["widgets_values"][4] = 384                 # Width
-                            sg2["237"]["widgets_values"][5] = 480                 # Height
+                            sg2["237"]["widgets_values"][2] = "4:5"               
+                            sg2["237"]["widgets_values"][4] = 384                 
+                            sg2["237"]["widgets_values"][5] = 480                 
+
+                    # SET LTXVChunkFeedForward to 8 for SG2
+                    if "252" in sg2:
+                        if "inputs" not in sg2["252"]: sg2["252"]["inputs"] = {}
+                        sg2["252"]["inputs"]["chunk_size"] = 8
+                        if "widgets_values" in sg2["252"]:
+                            sg2["252"]["widgets_values"][0] = 8
 
                     if "235" in sg2:
                         num_imgs = len(image_filenames)
+                        if "inputs" not in sg2["235"]: sg2["235"]["inputs"] = {}
                         sg2["235"]["inputs"]["num_images"] = num_imgs
                         for i in range(num_imgs):
                             if f"frame_{i}" not in sg2["235"]["inputs"]:
                                 sg2["235"]["inputs"][f"frame_{i}"] = 0 if num_imgs == 1 else int(i * (requested_length - 1) / (num_imgs - 1))
 
                     if "238" in sg2:
+                        if "inputs" not in sg2["238"]: sg2["238"]["inputs"] = {}
                         sg2["238"]["inputs"]["unet_name"] = target_unet
                         sg2["238"]["inputs"]["weight_dtype"] = "fp8_e4m3fn" 
-                    if "241" in sg2: sg2["241"]["inputs"]["vae_name"] = target_video_vae
-                    if "245" in sg2: sg2["245"]["inputs"]["file_name"] = "(POSITIVE)conditioning.pt"
-                    if "246" in sg2: sg2["246"]["inputs"]["file_name"] = "(NEGATIVE)conditioning.pt"
-                    if "248" in sg2: sg2["248"]["inputs"]["lora_name"] = target_detailer_lora
-                    if "249" in sg2: sg2["249"]["inputs"]["steps"] = 12
+                        
+                    if "241" in sg2: 
+                        if "inputs" not in sg2["241"]: sg2["241"]["inputs"] = {}
+                        sg2["241"]["inputs"]["vae_name"] = target_video_vae
+                        
+                    if "245" in sg2: 
+                        if "inputs" not in sg2["245"]: sg2["245"]["inputs"] = {}
+                        sg2["245"]["inputs"]["file_name"] = "(POSITIVE)conditioning.pt"
+                        
+                    if "246" in sg2: 
+                        if "inputs" not in sg2["246"]: sg2["246"]["inputs"] = {}
+                        sg2["246"]["inputs"]["file_name"] = "(NEGATIVE)conditioning.pt"
+                        
+                    if "248" in sg2: 
+                        if "inputs" not in sg2["248"]: sg2["248"]["inputs"] = {}
+                        sg2["248"]["inputs"]["lora_name"] = target_detailer_lora
+                        
+                    if "249" in sg2: 
+                        if "inputs" not in sg2["249"]: sg2["249"]["inputs"] = {}
+                        sg2["249"]["inputs"]["steps"] = 12
 
                     print("🚀 Executing Sub-Graph 2 (Main Video Generation)...")
                     await self.execute_comfy_workflow(session, sg2)
@@ -429,23 +477,51 @@ class LTXEngine:
 
                     sg3 = self.merge_overrides(sg3, body.get("subgraph_3_override"))
 
-                    if "232" in sg3: sg3["232"]["inputs"]["latent"] = "video_latent_output.latent"
+                    # SET LTXVChunkFeedForward to 8 for SG3
+                    if "304" in sg3:
+                        if "inputs" not in sg3["304"]: sg3["304"]["inputs"] = {}
+                        sg3["304"]["inputs"]["chunk_size"] = 8
+                        if "widgets_values" in sg3["304"]:
+                            sg3["304"]["widgets_values"][0] = 8
+
+                    if "232" in sg3: 
+                        if "inputs" not in sg3["232"]: sg3["232"]["inputs"] = {}
+                        sg3["232"]["inputs"]["latent"] = "video_latent_output.latent"
+                        
                     if "278" in sg3:
+                        if "inputs" not in sg3["278"]: sg3["278"]["inputs"] = {}
                         sg3["278"]["inputs"]["unet_name"] = target_unet
                         sg3["278"]["inputs"]["weight_dtype"] = "fp8_e4m3fn" 
-                    if "282" in sg3: sg3["282"]["inputs"]["file_name"] = "(POSITIVE)conditioning.pt"
-                    if "283" in sg3: sg3["283"]["inputs"]["file_name"] = "(NEGATIVE)conditioning.pt"
-                    if "295" in sg3: sg3["295"]["inputs"]["ckpt_name"] = target_audio_vae
-                    if "296" in sg3: sg3["296"]["inputs"]["vae_name"] = target_video_vae
+                        
+                    if "282" in sg3: 
+                        if "inputs" not in sg3["282"]: sg3["282"]["inputs"] = {}
+                        sg3["282"]["inputs"]["file_name"] = "(POSITIVE)conditioning.pt"
+                        
+                    if "283" in sg3: 
+                        if "inputs" not in sg3["283"]: sg3["283"]["inputs"] = {}
+                        sg3["283"]["inputs"]["file_name"] = "(NEGATIVE)conditioning.pt"
+                        
+                    if "295" in sg3: 
+                        if "inputs" not in sg3["295"]: sg3["295"]["inputs"] = {}
+                        sg3["295"]["inputs"]["ckpt_name"] = target_audio_vae
+                        
+                    if "296" in sg3: 
+                        if "inputs" not in sg3["296"]: sg3["296"]["inputs"] = {}
+                        sg3["296"]["inputs"]["vae_name"] = target_video_vae
                     
                     if "290" in sg3: 
+                        if "inputs" not in sg3["290"]: sg3["290"]["inputs"] = {}
                         sg3["290"]["inputs"]["frames_number"] = requested_length
                     
+                    # REVERT FPS to 24 for SG3
                     if "298" in sg3:
+                        if "inputs" not in sg3["298"]: sg3["298"]["inputs"] = {}
                         sg3["298"]["inputs"]["format"] = "video/h264-mp4"
-                        sg3["298"]["inputs"]["frame_rate"] = 12
+                        sg3["298"]["inputs"]["frame_rate"] = 24
                         
-                    if "302" in sg3: sg3["302"]["inputs"]["lora_name"] = target_detailer_lora
+                    if "302" in sg3: 
+                        if "inputs" not in sg3["302"]: sg3["302"]["inputs"] = {}
+                        sg3["302"]["inputs"]["lora_name"] = target_detailer_lora
 
                     print("🚀 Executing Sub-Graph 3 (Audio Generation & Combine Decoders)...")
                     await self.execute_comfy_workflow(session, sg3)

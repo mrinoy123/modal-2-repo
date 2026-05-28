@@ -1,5 +1,6 @@
 # ==============================================================================
 # PART 1: IMPORTS & ENVIRONMENT SETUP
+# Purpose: Load all necessary standard libraries, networking utilities, and Modal types.
 # ==============================================================================
 import modal
 import subprocess
@@ -18,6 +19,7 @@ from typing import Optional
 
 # ==============================================================================
 # PART 2: BASE IMAGE & OS CONFIGURATION
+# Purpose: Establish the foundational Ubuntu/CUDA image and install system packages.
 # ==============================================================================
 base_image = modal.Image.from_registry(
     "nvidia/cuda:12.5.1-devel-ubuntu24.04", 
@@ -26,11 +28,12 @@ base_image = modal.Image.from_registry(
     "git", "wget", "ffmpeg", "libgl1", "libglib2.0-0", 
     "build-essential", "ninja-build", "cmake", "clang", "llvm"
 ).env({
-    "FORCE_REBUILD_INDEX": "123"  # Bumped to flush cache for dynamic R2 routing logic
+    "FORCE_REBUILD_INDEX": "126"  # Bumped to flush cache for Deno directory optimizations
 })
 
 # ==============================================================================
 # PART 3: CORE PYTHON DEPENDENCIES & ENVIRONMENT VARIABLES
+# Purpose: Inject optimal compiler paths and install PyTorch/Triton basics.
 # ==============================================================================
 build_image = base_image.env({
     "CUDA_HOME": "/usr/local/cuda",
@@ -47,6 +50,7 @@ build_image = base_image.env({
 
 # ==============================================================================
 # PART 4: COMFYUI & CUSTOM NODES CLONING + DEPENDENCY ISOLATION
+# Purpose: Clone strictly required node repos. Unnecessary extensions have been purged.
 # ==============================================================================
 torch_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124",
@@ -62,9 +66,6 @@ clone_image = torch_image.run_commands(
     "git clone https://github.com/yolain/ComfyUI-Easy-Use.git /workspace/ComfyUI/custom_nodes/ComfyUI-Easy-Use",
     "git clone https://github.com/Deno2026/comfyui-deno-custom-nodes.git /workspace/ComfyUI/custom_nodes/comfyui-deno-custom-nodes",
     "git clone https://github.com/cubiq/ComfyUI_essentials.git /workspace/ComfyUI/custom_nodes/ComfyUI_essentials",
-    "git clone https://github.com/FizzleDorf/ComfyUI_FizzNodes.git /workspace/ComfyUI/custom_nodes/ComfyUI_FizzNodes",
-    "git clone https://github.com/SquirrelRat/MultiString-Prompts.git /workspace/ComfyUI/custom_nodes/MultiString-Prompts",
-    "git clone https://github.com/pythongosssss/ComfyUI-Custom-Scripts.git /workspace/ComfyUI/custom_nodes/ComfyUI-Custom-Scripts",
     "git clone https://github.com/IvanRybakov/comfyui-node-int-to-string-convertor.git /workspace/ComfyUI/custom_nodes/comfyui-node-int-to-string-convertor",
     "git clone https://github.com/siraxe/ComfyUI-LTX-FDG.git /workspace/ComfyUI/custom_nodes/ComfyUI-LTX-FDG"
 )
@@ -77,7 +78,6 @@ deps_image = clone_image.run_commands(
 )
 
 final_image = deps_image.run_commands(
-    "sed -i 's/final_pooled_output = torch.cat(pooled_out, dim=0)/final_pooled_output = torch.cat([p for p in pooled_out if p is not None], dim=0) if any(p is not None for p in pooled_out) else None/g' /workspace/ComfyUI/custom_nodes/ComfyUI_FizzNodes/BatchFuncs.py",
     "python3 -c \"filepath = '/workspace/ComfyUI/custom_nodes/ComfyUI-LTXVideo/looping_sampler.py'; code = open(filepath).read(); code = code.replace('positive, negative = guider.raw_conds', 'positive, negative = getattr(guider, \\'raw_conds\\', None) or (getattr(guider, \\'original_conds\\', {}).get(\\'positive\\'), getattr(guider, \\'original_conds\\', {}).get(\\'negative\\'))'); open(filepath, 'w').write(code)\"",
     "echo '' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     "echo 'sageattn_qk_int8_pv_fp16_triton = sageattn' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
@@ -91,10 +91,10 @@ final_image = deps_image.run_commands(
 )
 
 # ==============================================================================
-# PART 5: MODAL APP CONFIGURATION
+# PART 5: MODAL APP CONFIGURATION & CLOUD VOLUMES
+# Purpose: Tie the environment to Modal architecture with auto-scaling limits.
 # ==============================================================================
 app = modal.App("media-worker")
-
 weights_volume = modal.Volume.from_name("ltx-new-version20-weights", create_if_missing=False)
 
 @app.cls(
@@ -113,7 +113,6 @@ class LTXEngine:
             if line: print(f"[ComfyUI] {line.strip()}")
 
     async def _ram_squeezer(self):
-        # Reduced aggression: only clears system page cache, protects PyTorch internal memory
         while True:
             try:
                 with open('/proc/sys/vm/drop_caches', 'w') as f:
@@ -193,7 +192,7 @@ class LTXEngine:
         try:
             async with session.post("http://127.0.0.1:8188/free", json={"unload_models": True, "free_memory": True}) as r:
                 await r.read()
-        except Exception as e:
+        except Exception:
             pass
         
         import gc
@@ -245,7 +244,8 @@ class LTXEngine:
         return base_graph
 
     # ==============================================================================
-    # PART 9: MAIN FASTAPI ENDPOINT (Now using Streaming Response to bypass timeouts)
+    # PART 6: MAIN FASTAPI ENDPOINT & PIPELINE EXECUTION
+    # Purpose: Receive n8n payload, format inputs, map node logics and run the graphs.
     # ==============================================================================
     @modal.fastapi_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
@@ -257,26 +257,22 @@ class LTXEngine:
             if "json" in body: body = body["json"]
             elif "body" in body: body = body["body"]
 
-        # ==========================================================================
-        # PIPELINE FUNCTION: Contains ALL original processing, decoupled from network
-        # ==========================================================================
         async def process_pipeline():
             incoming_image_urls = body.get("image_url")
             requested_length = int(body.get("length", 73))
             prompts_dict = body.get("prompts", {})
             negative_prompt = body.get("negative", "worst quality, blurry, low resolution, artifacts, watermarks")
-            # Extract dynamic date folder sent by n8n, fallback to current UTC date if missing
             date_folder = body.get("date_folder", time.strftime('%Y-%m-%d'))
 
             if isinstance(prompts_dict, dict):
                 try:
                     sorted_keys = sorted(prompts_dict.keys(), key=lambda x: int(x) if str(x).isdigit() else 0)
                     prompts_list = [str(prompts_dict[k]).strip() for k in sorted_keys if str(prompts_dict[k]).strip()]
-                    prompts_timeline_str = "|".join(prompts_list)
+                    prompts_timeline_str = "\n".join(prompts_list)
                 except Exception:
-                    prompts_timeline_str = "|".join([str(v).strip() for v in prompts_dict.values()])
+                    prompts_timeline_str = "\n".join([str(v).strip() for v in prompts_dict.values()])
             else:
-                prompts_timeline_str = str(prompts_dict)
+                prompts_timeline_str = str(prompts_dict).replace("\\n", "\n")
 
             target_unet = "ltx-2-19b-distilled-fp8.safetensors"
             target_gemma = "gemma-3-12b-it-FP8.safetensors"
@@ -295,9 +291,10 @@ class LTXEngine:
                 elif isinstance(incoming_image_urls, str) and incoming_image_urls.strip():
                     urls_to_download = [u.strip() for u in incoming_image_urls.split(",") if u.strip()]
 
+            # Force Zero-Padded nomenclature so `LoadImageListFromDirectory` parses sequence alphabetically
             image_filenames = []
             if not urls_to_download:
-                fallback_path = os.path.join(dynamic_guides_dir, "guide_0.png")
+                fallback_path = os.path.join(dynamic_guides_dir, "guide_0000.png")
                 from PIL import Image
                 img = Image.new('RGB', (384, 480), color='black')
                 img.save(fallback_path)
@@ -305,7 +302,6 @@ class LTXEngine:
             else:
                 async def download_one(session, url_str, target_dest):
                     from urllib.parse import urlparse
-                    import botocore.exceptions
                     try:
                         parsed = urlparse(url_str)
                         if "r2.cloudflarestorage.com" in url_str or "pub-" in url_str or parsed.netloc == "" or not parsed.scheme:
@@ -324,10 +320,11 @@ class LTXEngine:
                         img.save(target_dest)
 
                 async with aiohttp.ClientSession() as download_session:
-                    tasks = [download_one(download_session, url, os.path.join(dynamic_guides_dir, f"guide_{i}.png")) for i, url in enumerate(urls_to_download)]
+                    # Formats numbering as 0000, 0001, etc. for flawless sequence loading in Deno node
+                    tasks = [download_one(download_session, url, os.path.join(dynamic_guides_dir, f"guide_{i:04d}.png")) for i, url in enumerate(urls_to_download)]
                     await asyncio.gather(*tasks)
                 
-                image_filenames = [os.path.join(dynamic_guides_dir, f"guide_{i}.png") for i in range(len(urls_to_download))]
+                image_filenames = [os.path.join(dynamic_guides_dir, f"guide_{i:04d}.png") for i in range(len(urls_to_download))]
 
             out_dir = "/workspace/ComfyUI/output"
             if os.path.exists(out_dir): shutil.rmtree(out_dir)
@@ -338,7 +335,7 @@ class LTXEngine:
             try:
                 async with aiohttp.ClientSession() as session:
                     # ==============================================================================
-                    # SUB-GRAPH 1
+                    # SUB-GRAPH 1: MULTI-PROMPT INJECTION
                     # ==============================================================================
                     sg1_raw = body.get("subgraph_1")
                     if sg1_raw:
@@ -352,17 +349,19 @@ class LTXEngine:
                         sg1["243"]["inputs"]["text_encoder"] = target_gemma
                         sg1["243"]["inputs"]["ckpt_name"] = target_connector
                         sg1["243"]["inputs"]["device"] = "default" 
-                    if "246" in sg1: sg1["246"]["inputs"]["prompts"] = prompts_timeline_str
                     if "112" in sg1: sg1["112"]["inputs"]["text"] = negative_prompt
                     if "242" in sg1: sg1["242"]["inputs"]["filename"] = "(NEGATIVE)conditioning"
                     if "244" in sg1: sg1["244"]["inputs"]["filename"] = "(POSITIVE)conditioning"
+                    
+                    if "246" in sg1: 
+                        sg1["246"]["widgets_values"] = [prompts_timeline_str]
 
                     print("🚀 Executing Sub-Graph 1 (Text Conditioning)...")
                     await self.execute_comfy_workflow(session, sg1)
                     await self.clear_comfy_memory(session)
 
                     # ==============================================================================
-                    # SUB-GRAPH 2
+                    # SUB-GRAPH 2: DISTILLED SETTINGS & DIRECTORY IMAGE LOADING
                     # ==============================================================================
                     sg2_raw = body.get("subgraph_2")
                     if sg2_raw:
@@ -379,8 +378,12 @@ class LTXEngine:
                     if "241" in sg2: sg2["241"]["inputs"]["vae_name"] = target_video_vae
                     if "245" in sg2: sg2["245"]["inputs"]["file_name"] = "(POSITIVE)conditioning.pt"
                     if "246" in sg2: sg2["246"]["inputs"]["file_name"] = "(NEGATIVE)conditioning.pt"
-                    if "237" in sg2: sg2["237"]["inputs"]["image_paths"] = "\n".join(image_filenames) 
                     
+                    # Fix: Push the actual target directory variable into Node 237
+                    if "237" in sg2: 
+                        sg2["237"]["inputs"]["directory"] = dynamic_guides_dir
+                    
+                    # Fix: Properly map dynamic image quantities evenly to available target loop sequence positions
                     if "235" in sg2:
                         num_imgs = len(image_filenames)
                         sg2["235"]["inputs"]["num_images"] = num_imgs
@@ -389,6 +392,7 @@ class LTXEngine:
                                 sg2["235"]["inputs"][f"frame_{i}"] = 0 if num_imgs == 1 else int(i * (requested_length - 1) / (num_imgs - 1))
 
                     if "248" in sg2: sg2["248"]["inputs"]["lora_name"] = target_detailer_lora
+                    if "249" in sg2: sg2["249"]["inputs"]["steps"] = 12
 
                     print("🚀 Executing Sub-Graph 2 (Main Video Generation)...")
                     await self.execute_comfy_workflow(session, sg2)
@@ -405,7 +409,7 @@ class LTXEngine:
                         shutil.copy(os.path.join(out_dir, latest_latent), "/workspace/ComfyUI/input/video_latent_output.latent")
 
                     # ==============================================================================
-                    # SUB-GRAPH 3
+                    # SUB-GRAPH 3: AUDIO DECODING & SYNCHRONIZED VHS COMBINE
                     # ==============================================================================
                     sg3_raw = body.get("subgraph_3")
                     if sg3_raw:
@@ -424,11 +428,16 @@ class LTXEngine:
                     if "295" in sg3: sg3["295"]["inputs"]["ckpt_name"] = target_audio_vae
                     if "296" in sg3: sg3["296"]["inputs"]["vae_name"] = target_video_vae
                     
-                    if "290" in sg3: sg3["290"]["inputs"]["frames_number"] = (requested_length * 2) - 1 
+                    # Fix: To map exactly to audio timing, pass exact generated length down to aligner
+                    if "290" in sg3: 
+                        sg3["290"]["inputs"]["frames_number"] = requested_length
                     
+                    # Fix: Hard-forcing VideoCombine node to 24fps without frame interpolation node simply 
+                    # speeds up playback x2. Setting FPS specifically to 12fps maintains absolute 1:1 sync natively.
                     if "298" in sg3:
                         sg3["298"]["inputs"]["format"] = "video/h264-mp4"
-                        sg3["298"]["inputs"]["frame_rate"] = 24
+                        sg3["298"]["inputs"]["frame_rate"] = 12
+                        
                     if "302" in sg3: sg3["302"]["inputs"]["lora_name"] = target_detailer_lora
 
                     print("🚀 Executing Sub-Graph 3 (Audio Generation & Combine Decoders)...")
@@ -448,11 +457,9 @@ class LTXEngine:
                     target_video_file = output_files[-1]
                     saved_filename = os.path.basename(target_video_file)
 
-                    # Dynamic key construction utilizing the date folder generated by n8n
                     target_key = f"{date_folder}/generated clips/{int(time.time())}_{saved_filename}"
                     print(f"📤 Uploading compiled video containing audio track to R2: {target_key}")
                     
-                    # Fix: Correct positional arguments for Boto3's upload_file
                     await asyncio.get_event_loop().run_in_executor(
                         None, 
                         self.s3.upload_file, 
@@ -474,7 +481,7 @@ class LTXEngine:
                 ram_task.cancel()
 
         # ==========================================================================
-        # GENERATOR FUNCTION: Feeds blank spaces to keep connection perfectly alive
+        # PART 7: STREAM RESPONSE TO BYPASS CLOUD TIMEOUTS
         # ==========================================================================
         async def stream_response():
             task = asyncio.create_task(process_pipeline())
@@ -492,5 +499,4 @@ class LTXEngine:
             except Exception as e:
                 yield json.dumps({"status": "error", "detail": str(e)}).encode("utf-8")
 
-        # Returns the stream to N8N, N8N's JSON parser seamlessly handles the padding spaces
         return StreamingResponse(stream_response(), media_type="application/json")

@@ -277,349 +277,350 @@ class LTXEngine:
             elif "body" in body: 
                 body = body["body"]
 
-        incoming_image_urls = body.get("image_url")
-        requested_length = int(body.get("length", 73))
-        prompts_dict = body.get("prompts", {})
-        negative_prompt = body.get("negative", "worst quality, blurry, low resolution, artifacts, watermarks")
-        date_folder = body.get("date_folder", time.strftime('%Y-%m-%d'))
+        # ----------------------------------------------------------------------
+        # WRAP PIPELINE IN ASYNC FUNCTION FOR BACKGROUND EXECUTION
+        # ----------------------------------------------------------------------
+        async def process_pipeline():
+            incoming_image_urls = body.get("image_url")
+            requested_length = int(body.get("length", 73))
+            prompts_dict = body.get("prompts", {})
+            negative_prompt = body.get("negative", "worst quality, blurry, low resolution, artifacts, watermarks")
+            date_folder = body.get("date_folder", time.strftime('%Y-%m-%d'))
 
-        if isinstance(prompts_dict, dict):
-            try:
-                sorted_keys = sorted(prompts_dict.keys(), key=lambda x: int(x) if str(x).isdigit() else 0)
-                prompts_list = [str(prompts_dict[k]).strip() for k in sorted_keys if str(prompts_dict[k]).strip()]
-                prompts_timeline_str = "\n".join(prompts_list)
-            except Exception:
-                prompts_timeline_str = "\n".join([str(v).strip() for v in prompts_dict.values()])
-        else:
-            prompts_timeline_str = str(prompts_dict).replace("\\n", "\n")
-
-        target_unet = "ltx-2-19b-distilled-fp8.safetensors"
-        target_gemma = "gemma-3-12b-it-FP8.safetensors"
-        target_connector = "ltx-2-19b-embeddings_connector_dev_bf16.safetensors"
-        target_video_vae = "ltx-2-19b-dev_video_vae.safetensors"
-        target_audio_vae = "ltx-2-19b-dev_audio_vae.safetensors"
-        target_detailer_lora = "ltx-2-19b-ic-lora-detailer.safetensors"
-
-        dynamic_guides_dir = "/workspace/ComfyUI/input/dynamic_guides"
-        if os.path.exists(dynamic_guides_dir): 
-            shutil.rmtree(dynamic_guides_dir)
-        os.makedirs(dynamic_guides_dir, exist_ok=True)
-
-        urls_to_download = []
-        if incoming_image_urls:
-            if isinstance(incoming_image_urls, list): 
-                urls_to_download = [str(u).strip() for u in incoming_image_urls if str(u).strip()]
-            elif isinstance(incoming_image_urls, str) and incoming_image_urls.strip():
-                urls_to_download = [u.strip() for u in incoming_image_urls.split(",") if u.strip()]
-
-        image_filenames = []
-        if not urls_to_download:
-            fallback_path = os.path.join(dynamic_guides_dir, "guide_0000.png")
-            from PIL import Image
-            img = Image.new('RGB', (384, 480), color='black')
-            img.save(fallback_path)
-            image_filenames = [fallback_path] 
-        else:
-            async def download_one(session, url_str, target_dest):
-                from urllib.parse import urlparse
+            if isinstance(prompts_dict, dict):
                 try:
-                    parsed = urlparse(url_str)
-                    if "r2.cloudflarestorage.com" in url_str or "pub-" in url_str or parsed.netloc == "" or not parsed.scheme:
-                        file_key = parsed.path.lstrip('/')
-                        while "//" in file_key: 
-                            file_key = file_key.replace("//", "/")
-                        await asyncio.get_event_loop().run_in_executor(None, self.s3.download_file, "video-asset-files-storage-workflow", file_key, target_dest)
+                    sorted_keys = sorted(prompts_dict.keys(), key=lambda x: int(x) if str(x).isdigit() else 0)
+                    prompts_list = [str(prompts_dict[k]).strip() for k in sorted_keys if str(prompts_dict[k]).strip()]
+                    prompts_timeline_str = "\n".join(prompts_list)
+                except Exception:
+                    prompts_timeline_str = "\n".join([str(v).strip() for v in prompts_dict.values()])
+            else:
+                prompts_timeline_str = str(prompts_dict).replace("\\n", "\n")
+
+            target_unet = "ltx-2-19b-distilled-fp8.safetensors"
+            target_gemma = "gemma-3-12b-it-FP8.safetensors"
+            target_connector = "ltx-2-19b-embeddings_connector_dev_bf16.safetensors"
+            target_video_vae = "ltx-2-19b-dev_video_vae.safetensors"
+            target_audio_vae = "ltx-2-19b-dev_audio_vae.safetensors"
+            target_detailer_lora = "ltx-2-19b-ic-lora-detailer.safetensors"
+
+            dynamic_guides_dir = "/workspace/ComfyUI/input/dynamic_guides"
+            if os.path.exists(dynamic_guides_dir): 
+                shutil.rmtree(dynamic_guides_dir)
+            os.makedirs(dynamic_guides_dir, exist_ok=True)
+
+            urls_to_download = []
+            if incoming_image_urls:
+                if isinstance(incoming_image_urls, list): 
+                    urls_to_download = [str(u).strip() for u in incoming_image_urls if str(u).strip()]
+                elif isinstance(incoming_image_urls, str) and incoming_image_urls.strip():
+                    urls_to_download = [u.strip() for u in incoming_image_urls.split(",") if u.strip()]
+
+            image_filenames = []
+            if not urls_to_download:
+                fallback_path = os.path.join(dynamic_guides_dir, "guide_0000.png")
+                from PIL import Image
+                img = Image.new('RGB', (384, 480), color='black')
+                img.save(fallback_path)
+                image_filenames = [fallback_path] 
+            else:
+                async def download_one(session, url_str, target_dest):
+                    from urllib.parse import urlparse
+                    try:
+                        parsed = urlparse(url_str)
+                        if "r2.cloudflarestorage.com" in url_str or "pub-" in url_str or parsed.netloc == "" or not parsed.scheme:
+                            file_key = parsed.path.lstrip('/')
+                            while "//" in file_key: 
+                                file_key = file_key.replace("//", "/")
+                            await asyncio.get_event_loop().run_in_executor(None, self.s3.download_file, "video-asset-files-storage-workflow", file_key, target_dest)
+                        else:
+                            async with session.get(url_str, timeout=120) as r:
+                                if r.status == 200:
+                                    with open(target_dest, "wb") as f: 
+                                        f.write(await r.read())
+                    except Exception: 
+                        pass
+                    
+                    if not os.path.exists(target_dest):
+                        from PIL import Image
+                        img = Image.new('RGB', (384, 480), color='black')
+                        img.save(target_dest)
+
+                async with aiohttp.ClientSession() as download_session:
+                    tasks = [download_one(download_session, url, os.path.join(dynamic_guides_dir, f"guide_{i:04d}.png")) for i, url in enumerate(urls_to_download)]
+                    await asyncio.gather(*tasks)
+                
+                image_filenames = [os.path.join(dynamic_guides_dir, f"guide_{i:04d}.png") for i in range(len(urls_to_download))]
+
+            out_dir = "/workspace/ComfyUI/output"
+            if os.path.exists(out_dir): 
+                shutil.rmtree(out_dir)
+            os.makedirs(out_dir)
+
+            ram_task = asyncio.create_task(self._ram_squeezer())
+
+            try:
+                async with aiohttp.ClientSession() as session:
+                    # ==============================================================================
+                    # SUB-GRAPH 1: MULTI-PROMPT INJECTION
+                    # ==============================================================================
+                    sg1_raw = body.get("subgraph_1")
+                    if sg1_raw:
+                        sg1 = json.loads(sg1_raw) if isinstance(sg1_raw, str) else sg1_raw
                     else:
-                        async with session.get(url_str, timeout=120) as r:
-                            if r.status == 200:
-                                with open(target_dest, "wb") as f: 
-                                    f.write(await r.read())
-                except Exception: 
-                    pass
-                
-                if not os.path.exists(target_dest):
-                    from PIL import Image
-                    img = Image.new('RGB', (384, 480), color='black')
-                    img.save(target_dest)
+                        with open("comfyui-ltx-20-subgraph-1(api).json", "r") as f: 
+                            sg1 = json.load(f)
+                    
+                    sg1 = self.merge_overrides(sg1, body.get("subgraph_1_override"))
 
-            async with aiohttp.ClientSession() as download_session:
-                tasks = [download_one(download_session, url, os.path.join(dynamic_guides_dir, f"guide_{i:04d}.png")) for i, url in enumerate(urls_to_download)]
-                await asyncio.gather(*tasks)
+                    if "243" in sg1:
+                        if "inputs" not in sg1["243"]: sg1["243"]["inputs"] = {}
+                        sg1["243"]["inputs"]["text_encoder"] = target_gemma
+                        sg1["243"]["inputs"]["ckpt_name"] = target_connector
+                        sg1["243"]["inputs"]["device"] = "default" 
+                        
+                    if "112" in sg1: 
+                        if "inputs" not in sg1["112"]: sg1["112"]["inputs"] = {}
+                        sg1["112"]["inputs"]["text"] = negative_prompt
+                        
+                    if "242" in sg1: 
+                        if "inputs" not in sg1["242"]: sg1["242"]["inputs"] = {}
+                        sg1["242"]["inputs"]["filename"] = "(NEGATIVE)conditioning"
+                        
+                    if "244" in sg1: 
+                        if "inputs" not in sg1["244"]: sg1["244"]["inputs"] = {}
+                        sg1["244"]["inputs"]["filename"] = "(POSITIVE)conditioning"
+                    
+                    if "246" in sg1: 
+                        if "inputs" not in sg1["246"]: sg1["246"]["inputs"] = {}
+                        sg1["246"]["inputs"]["prompts"] = prompts_timeline_str
+                        sg1["246"]["inputs"]["text"] = prompts_timeline_str
+                        sg1["246"]["inputs"]["max_frames"] = requested_length
+                        sg1["246"]["inputs"]["length"] = requested_length
+                        sg1["246"]["widgets_values"] = [prompts_timeline_str]
+
+                    print("🚀 Executing Sub-Graph 1 (Text Conditioning)...")
+                    await self.execute_comfy_workflow(session, sg1)
+                    await self.clear_comfy_memory(session)
+
+                    # ==============================================================================
+                    # SUB-GRAPH 2: DISTILLED SETTINGS & DIRECTORY IMAGE LOADING
+                    # ==============================================================================
+                    sg2_raw = body.get("subgraph_2")
+                    if sg2_raw:
+                        sg2 = json.loads(sg2_raw) if isinstance(sg2_raw, str) else sg2_raw
+                    else:
+                        with open("comfyui-ltx-20-subgraph-2(api).json", "r") as f: 
+                            sg2 = json.load(f)
+
+                    sg2 = self.merge_overrides(sg2, body.get("subgraph_2_override"))
+
+                    if "194" in sg2:
+                        if "inputs" not in sg2["194"]: sg2["194"]["inputs"] = {}
+                        sg2["194"]["inputs"]["width"] = 384
+                        sg2["194"]["inputs"]["height"] = 480
+                        sg2["194"]["inputs"]["length"] = requested_length
+                        if "widgets_values" in sg2["194"] and len(sg2["194"]["widgets_values"]) > 2:
+                            sg2["194"]["widgets_values"][0] = 384                 
+                            sg2["194"]["widgets_values"][1] = 480                 
+                            sg2["194"]["widgets_values"][2] = requested_length    
+
+                    if "237" in sg2: 
+                        if "inputs" not in sg2["237"]: sg2["237"]["inputs"] = {}
+                        sg2["237"]["inputs"]["directory"] = dynamic_guides_dir
+                        sg2["237"]["inputs"]["aspect_ratio"] = "4:5"
+                        sg2["237"]["inputs"]["width"] = 384
+                        sg2["237"]["inputs"]["height"] = 480
+                        if "widgets_values" in sg2["237"] and len(sg2["237"]["widgets_values"]) > 5:
+                            sg2["237"]["widgets_values"][2] = "4:5"                
+                            sg2["237"]["widgets_values"][4] = 384                 
+                            sg2["237"]["widgets_values"][5] = 480                 
+
+                    if "252" in sg2:
+                        if "inputs" not in sg2["252"]: sg2["252"]["inputs"] = {}
+                        sg2["252"]["inputs"]["chunk_size"] = 4
+                        if "widgets_values" in sg2["252"]:
+                            sg2["252"]["widgets_values"][0] = 4
+
+                    if "235" in sg2:
+                        num_imgs = len(image_filenames)
+                        if "inputs" not in sg2["235"]: sg2["235"]["inputs"] = {}
+                        sg2["235"]["inputs"]["num_images"] = num_imgs
+                        for i in range(num_imgs):
+                            if f"frame_{i}" not in sg2["235"]["inputs"]:
+                                sg2["235"]["inputs"][f"frame_{i}"] = 0 if num_imgs == 1 else int(i * (requested_length - 1) / (num_imgs - 1))
+
+                    if "238" in sg2:
+                        if "inputs" not in sg2["238"]: sg2["238"]["inputs"] = {}
+                        sg2["238"]["inputs"]["unet_name"] = target_unet
+                        sg2["238"]["inputs"]["weight_dtype"] = "fp8_e4m3fn" 
+                        
+                    if "241" in sg2: 
+                        if "inputs" not in sg2["241"]: sg2["241"]["inputs"] = {}
+                        sg2["241"]["inputs"]["vae_name"] = target_video_vae
+                        
+                    if "245" in sg2: 
+                        if "inputs" not in sg2["245"]: sg2["245"]["inputs"] = {}
+                        sg2["245"]["inputs"]["file_name"] = "(POSITIVE)conditioning.pt"
+                        
+                    if "246" in sg2: 
+                        if "inputs" not in sg2["246"]: sg2["246"]["inputs"] = {}
+                        sg2["246"]["inputs"]["file_name"] = "(NEGATIVE)conditioning.pt"
+                        
+                    if "248" in sg2: 
+                        if "inputs" not in sg2["248"]: sg2["248"]["inputs"] = {}
+                        sg2["248"]["inputs"]["lora_name"] = target_detailer_lora
+                        
+                    if "249" in sg2: 
+                        if "inputs" not in sg2["249"]: sg2["249"]["inputs"] = {}
+                        sg2["249"]["inputs"]["steps"] = 12
+                        sg2["249"]["inputs"]["length"] = requested_length
+                        sg2["249"]["inputs"]["max_frames"] = requested_length
+                    
+                    if "233" in sg2:
+                        if "inputs" not in sg2["233"]: sg2["233"]["inputs"] = {}
+                        sg2["233"]["inputs"]["length"] = requested_length
+                        sg2["233"]["inputs"]["frames"] = requested_length
+
+                    print("🚀 Executing Sub-Graph 2 (Main Video Generation)...")
+                    await self.execute_comfy_workflow(session, sg2)
+                    await self.clear_comfy_memory(session)
+
+                    # ==============================================================================
+                    # COPY LATENT FOR SUBGRAPH 3
+                    # ==============================================================================
+                    generated_latents = [f for f in os.listdir(out_dir) if f.startswith("video_latent_output") and f.endswith(".latent")]
+                    if generated_latents:
+                        os.makedirs("/workspace/ComfyUI/input", exist_ok=True)
+                        generated_latents.sort(key=lambda x: os.path.getmtime(os.path.join(out_dir, x)))
+                        latest_latent = generated_latents[-1]
+                        shutil.copy(os.path.join(out_dir, latest_latent), "/workspace/ComfyUI/input/video_latent_output.latent")
+
+                    # ==============================================================================
+                    # SUB-GRAPH 3: AUDIO DECODING & SYNCHRONIZED VHS COMBINE
+                    # ==============================================================================
+                    sg3_raw = body.get("subgraph_3")
+                    if sg3_raw:
+                        sg3 = json.loads(sg3_raw) if isinstance(sg3_raw, str) else sg3_raw
+                    else:
+                        with open("comfyui-ltx-20-Subgraph-3(api).json", "r") as f: 
+                            sg3 = json.load(f)
+
+                    sg3 = self.merge_overrides(sg3, body.get("subgraph_3_override"))
+
+                    if "304" in sg3:
+                        if "inputs" not in sg3["304"]: sg3["304"]["inputs"] = {}
+                        sg3["304"]["inputs"]["chunk_size"] = 4
+                        if "widgets_values" in sg3["304"]:
+                            sg3["304"]["widgets_values"][0] = 4
+
+                    if "232" in sg3: 
+                        if "inputs" not in sg3["232"]: sg3["232"]["inputs"] = {}
+                        sg3["232"]["inputs"]["latent"] = "video_latent_output.latent"
+                        
+                    if "278" in sg3:
+                        if "inputs" not in sg3["278"]: sg3["278"]["inputs"] = {}
+                        sg3["278"]["inputs"]["unet_name"] = target_unet
+                        sg3["278"]["inputs"]["weight_dtype"] = "fp8_e4m3fn" 
+                        
+                    if "282" in sg3: 
+                        if "inputs" not in sg3["282"]: sg3["282"]["inputs"] = {}
+                        sg3["282"]["inputs"]["file_name"] = "(POSITIVE)conditioning.pt"
+                        
+                    if "283" in sg3: 
+                        if "inputs" not in sg3["283"]: sg3["283"]["inputs"] = {}
+                        sg3["283"]["inputs"]["file_name"] = "(NEGATIVE)conditioning.pt"
+                        
+                    if "295" in sg3: 
+                        if "inputs" not in sg3["295"]: sg3["295"]["inputs"] = {}
+                        sg3["295"]["inputs"]["ckpt_name"] = target_audio_vae
+                        
+                    if "296" in sg3: 
+                        if "inputs" not in sg3["296"]: sg3["296"]["inputs"] = {}
+                        sg3["296"]["inputs"]["vae_name"] = target_video_vae
+                    
+                    if "290" in sg3: 
+                        if "inputs" not in sg3["290"]: sg3["290"]["inputs"] = {}
+                        sg3["290"]["inputs"]["frames_number"] = requested_length
+                    
+                    if "298" in sg3:
+                        if "inputs" not in sg3["298"]: sg3["298"]["inputs"] = {}
+                        sg3["298"]["inputs"]["format"] = "video/h264-mp4"
+                        sg3["298"]["inputs"]["frame_rate"] = 24
+                        
+                    if "302" in sg3: 
+                        if "inputs" not in sg3["302"]: sg3["302"]["inputs"] = {}
+                        sg3["302"]["inputs"]["lora_name"] = target_detailer_lora
+
+                    print("🚀 Executing Sub-Graph 3 (Audio Generation & Combine Decoders)...")
+                    await self.execute_comfy_workflow(session, sg3)
+                    await self.clear_comfy_memory(session)
+
+                    output_files = []
+                    for root_p, _, filenames in os.walk(out_dir):
+                        for name in filenames:
+                            if name.endswith((".mp4", ".gif", ".webm")):
+                                output_files.append(os.path.join(root_p, name))
+
+                    if not output_files:
+                        raise Exception("Inference finished but no combined output media files were detected in ComfyUI workspace.")
+                    
+                    output_files.sort(key=os.path.getmtime)
+                    target_video_file = output_files[-1]
+                    saved_filename = os.path.basename(target_video_file)
+
+                    target_key = f"{date_folder}/generated clips/{int(time.time())}_{saved_filename}"
+                    print(f"📤 Uploading compiled video containing audio track to R2: {target_key}")
+                    
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, 
+                        self.s3.upload_file, 
+                        target_video_file,                      # 1st param: Local file path
+                        "video-asset-files-storage-workflow",   # 2nd param: Bucket name
+                        target_key                              # 3rd param: S3 object key
+                    )
+
+                    public_path_url = f"https://pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev/{target_key}" 
+                    
+                    return {
+                        "status": "success",
+                        "file_key": target_key,
+                        "public_url": public_path_url,
+                        "filename": saved_filename
+                    }
+
+            finally:
+                ram_task.cancel()
+
+        # ==========================================================================
+        # PART 7: STREAM RESPONSE TO BYPASS CLOUD TIMEOUTS
+        # Purpose: Keep FastAPI connection alive while GPU processes graph chunks.
+        # ==========================================================================
+        async def stream_response():
+            # Start the heavy GPU task in the background
+            task = asyncio.create_task(process_pipeline())
             
-            image_filenames = [os.path.join(dynamic_guides_dir, f"guide_{i:04d}.png") for i in range(len(urls_to_download))]
-
-        out_dir = "/workspace/ComfyUI/output"
-        if os.path.exists(out_dir): 
-            shutil.rmtree(out_dir)
-        os.makedirs(out_dir)
-
-        ram_task = asyncio.create_task(self._ram_squeezer())
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                # ==============================================================================
-                # SUB-GRAPH 1: MULTI-PROMPT INJECTION
-                # ==============================================================================
-                sg1_raw = body.get("subgraph_1")
-                if sg1_raw:
-                    sg1 = json.loads(sg1_raw) if isinstance(sg1_raw, str) else sg1_raw
-                else:
-                    with open("comfyui-ltx-20-subgraph-1(api).json", "r") as f: 
-                        sg1 = json.load(f)
-                
-                sg1 = self.merge_overrides(sg1, body.get("subgraph_1_override"))
-
-                if "243" in sg1:
-                    if "inputs" not in sg1["243"]: sg1["243"]["inputs"] = {}
-                    sg1["243"]["inputs"]["text_encoder"] = target_gemma
-                    sg1["243"]["inputs"]["ckpt_name"] = target_connector
-                    sg1["243"]["inputs"]["device"] = "default" 
-                    
-                if "112" in sg1: 
-                    if "inputs" not in sg1["112"]: sg1["112"]["inputs"] = {}
-                    sg1["112"]["inputs"]["text"] = negative_prompt
-                    
-                if "242" in sg1: 
-                    if "inputs" not in sg1["242"]: sg1["242"]["inputs"] = {}
-                    sg1["242"]["inputs"]["filename"] = "(NEGATIVE)conditioning"
-                    
-                if "244" in sg1: 
-                    if "inputs" not in sg1["244"]: sg1["244"]["inputs"] = {}
-                    sg1["244"]["inputs"]["filename"] = "(POSITIVE)conditioning"
-                
-                if "246" in sg1: 
-                    if "inputs" not in sg1["246"]: sg1["246"]["inputs"] = {}
-                    sg1["246"]["inputs"]["prompts"] = prompts_timeline_str
-                    sg1["246"]["inputs"]["text"] = prompts_timeline_str
-                    sg1["246"]["inputs"]["max_frames"] = requested_length
-                    sg1["246"]["inputs"]["length"] = requested_length
-                    sg1["246"]["widgets_values"] = [prompts_timeline_str]
-
-                print("🚀 Executing Sub-Graph 1 (Text Conditioning)...")
-                await self.execute_comfy_workflow(session, sg1)
-                await self.clear_comfy_memory(session)
-
-                # ==============================================================================
-                # SUB-GRAPH 2: DISTILLED SETTINGS & DIRECTORY IMAGE LOADING
-                # ==============================================================================
-                sg2_raw = body.get("subgraph_2")
-                if sg2_raw:
-                    sg2 = json.loads(sg2_raw) if isinstance(sg2_raw, str) else sg2_raw
-                else:
-                    with open("comfyui-ltx-20-subgraph-2(api).json", "r") as f: 
-                        sg2 = json.load(f)
-
-                sg2 = self.merge_overrides(sg2, body.get("subgraph_2_override"))
-
-                if "194" in sg2:
-                    if "inputs" not in sg2["194"]: sg2["194"]["inputs"] = {}
-                    sg2["194"]["inputs"]["width"] = 384
-                    sg2["194"]["inputs"]["height"] = 480
-                    sg2["194"]["inputs"]["length"] = requested_length
-                    if "widgets_values" in sg2["194"] and len(sg2["194"]["widgets_values"]) > 2:
-                        sg2["194"]["widgets_values"][0] = 384                 
-                        sg2["194"]["widgets_values"][1] = 480                 
-                        sg2["194"]["widgets_values"][2] = requested_length    
-
-                if "237" in sg2: 
-                    if "inputs" not in sg2["237"]: sg2["237"]["inputs"] = {}
-                    sg2["237"]["inputs"]["directory"] = dynamic_guides_dir
-                    sg2["237"]["inputs"]["aspect_ratio"] = "4:5"
-                    sg2["237"]["inputs"]["width"] = 384
-                    sg2["237"]["inputs"]["height"] = 480
-                    if "widgets_values" in sg2["237"] and len(sg2["237"]["widgets_values"]) > 5:
-                        sg2["237"]["widgets_values"][2] = "4:5"                
-                        sg2["237"]["widgets_values"][4] = 384                 
-                        sg2["237"]["widgets_values"][5] = 480                 
-
-                if "252" in sg2:
-                    if "inputs" not in sg2["252"]: sg2["252"]["inputs"] = {}
-                    sg2["252"]["inputs"]["chunk_size"] = 4
-                    if "widgets_values" in sg2["252"]:
-                        sg2["252"]["widgets_values"][0] = 4
-
-                if "235" in sg2:
-                    num_imgs = len(image_filenames)
-                    if "inputs" not in sg2["235"]: sg2["235"]["inputs"] = {}
-                    sg2["235"]["inputs"]["num_images"] = num_imgs
-                    for i in range(num_imgs):
-                        if f"frame_{i}" not in sg2["235"]["inputs"]:
-                            sg2["235"]["inputs"][f"frame_{i}"] = 0 if num_imgs == 1 else int(i * (requested_length - 1) / (num_imgs - 1))
-
-                if "238" in sg2:
-                    if "inputs" not in sg2["238"]: sg2["238"]["inputs"] = {}
-                    sg2["238"]["inputs"]["unet_name"] = target_unet
-                    sg2["238"]["inputs"]["weight_dtype"] = "fp8_e4m3fn" 
-                    
-                if "241" in sg2: 
-                    if "inputs" not in sg2["241"]: sg2["241"]["inputs"] = {}
-                    sg2["241"]["inputs"]["vae_name"] = target_video_vae
-                    
-                if "245" in sg2: 
-                    if "inputs" not in sg2["245"]: sg2["245"]["inputs"] = {}
-                    sg2["245"]["inputs"]["file_name"] = "(POSITIVE)conditioning.pt"
-                    
-                if "246" in sg2: 
-                    if "inputs" not in sg2["246"]: sg2["246"]["inputs"] = {}
-                    sg2["246"]["inputs"]["file_name"] = "(NEGATIVE)conditioning.pt"
-                    
-                if "248" in sg2: 
-                    if "inputs" not in sg2["248"]: sg2["248"]["inputs"] = {}
-                    sg2["248"]["inputs"]["lora_name"] = target_detailer_lora
-                    
-                if "249" in sg2: 
-                    if "inputs" not in sg2["249"]: sg2["249"]["inputs"] = {}
-                    sg2["249"]["inputs"]["steps"] = 12
-                    sg2["249"]["inputs"]["length"] = requested_length
-                    sg2["249"]["inputs"]["max_frames"] = requested_length
-                
-                if "233" in sg2:
-                    if "inputs" not in sg2["233"]: sg2["233"]["inputs"] = {}
-                    sg2["233"]["inputs"]["length"] = requested_length
-                    sg2["233"]["inputs"]["frames"] = requested_length
-
-                print("🚀 Executing Sub-Graph 2 (Main Video Generation)...")
-                await self.execute_comfy_workflow(session, sg2)
-                await self.clear_comfy_memory(session)
-
-                # ==============================================================================
-                # COPY LATENT FOR SUBGRAPH 3
-                # ==============================================================================
-                generated_latents = [f for f in os.listdir(out_dir) if f.startswith("video_latent_output") and f.endswith(".latent")]
-                if generated_latents:
-                    os.makedirs("/workspace/ComfyUI/input", exist_ok=True)
-                    generated_latents.sort(key=lambda x: os.path.getmtime(os.path.join(out_dir, x)))
-                    latest_latent = generated_latents[-1]
-                    shutil.copy(os.path.join(out_dir, latest_latent), "/workspace/ComfyUI/input/video_latent_output.latent")
-
-                # ==============================================================================
-                # SUB-GRAPH 3: AUDIO DECODING & SYNCHRONIZED VHS COMBINE
-                # ==============================================================================
-                sg3_raw = body.get("subgraph_3")
-                if sg3_raw:
-                    sg3 = json.loads(sg3_raw) if isinstance(sg3_raw, str) else sg3_raw
-                else:
-                    with open("comfyui-ltx-20-Subgraph-3(api).json", "r") as f: 
-                        sg3 = json.load(f)
-
-                sg3 = self.merge_overrides(sg3, body.get("subgraph_3_override"))
-
-                if "304" in sg3:
-                    if "inputs" not in sg3["304"]: sg3["304"]["inputs"] = {}
-                    sg3["304"]["inputs"]["chunk_size"] = 4
-                    if "widgets_values" in sg3["304"]:
-                        sg3["304"]["widgets_values"][0] = 4
-
-                if "232" in sg3: 
-                    if "inputs" not in sg3["232"]: sg3["232"]["inputs"] = {}
-                    sg3["232"]["inputs"]["latent"] = "video_latent_output.latent"
-                    
-                if "278" in sg3:
-                    if "inputs" not in sg3["278"]: sg3["278"]["inputs"] = {}
-                    sg3["278"]["inputs"]["unet_name"] = target_unet
-                    sg3["278"]["inputs"]["weight_dtype"] = "fp8_e4m3fn" 
-                    
-                if "282" in sg3: 
-                    if "inputs" not in sg3["282"]: sg3["282"]["inputs"] = {}
-                    sg3["282"]["inputs"]["file_name"] = "(POSITIVE)conditioning.pt"
-                    
-                if "283" in sg3: 
-                    if "inputs" not in sg3["283"]: sg3["283"]["inputs"] = {}
-                    sg3["283"]["inputs"]["file_name"] = "(NEGATIVE)conditioning.pt"
-                    
-                if "295" in sg3: 
-                    if "inputs" not in sg3["295"]: sg3["295"]["inputs"] = {}
-                    sg3["295"]["inputs"]["ckpt_name"] = target_audio_vae
-                    
-                if "296" in sg3: 
-                    if "inputs" not in sg3["296"]: sg3["296"]["inputs"] = {}
-                    sg3["296"]["inputs"]["vae_name"] = target_video_vae
-                
-                if "290" in sg3: 
-                    if "inputs" not in sg3["290"]: sg3["290"]["inputs"] = {}
-                    sg3["290"]["inputs"]["frames_number"] = requested_length
-                
-                if "298" in sg3:
-                    if "inputs" not in sg3["298"]: sg3["298"]["inputs"] = {}
-                    sg3["298"]["inputs"]["format"] = "video/h264-mp4"
-                    sg3["298"]["inputs"]["frame_rate"] = 24
-                    
-                if "302" in sg3: 
-                    if "inputs" not in sg3["302"]: sg3["302"]["inputs"] = {}
-                    sg3["302"]["inputs"]["lora_name"] = target_detailer_lora
-
-                print("🚀 Executing Sub-Graph 3 (Audio Generation & Combine Decoders)...")
-                await self.execute_comfy_workflow(session, sg3)
-                await self.clear_comfy_memory(session)
-
-                output_files = []
-                for root_p, _, filenames in os.walk(out_dir):
-                    for name in filenames:
-                        if name.endswith((".mp4", ".gif", ".webm")):
-                            output_files.append(os.path.join(root_p, name))
-
-                if not output_files:
-                    raise Exception("Inference finished but no combined output media files were detected in ComfyUI workspace.")
-                
-                output_files.sort(key=os.path.getmtime)
-                target_video_file = output_files[-1]
-                saved_filename = os.path.basename(target_video_file)
-
-                target_key = f"{date_folder}/generated clips/{int(time.time())}_{saved_filename}"
-                print(f"📤 Uploading compiled video containing audio track to R2: {target_key}")
-                
-                await asyncio.get_event_loop().run_in_executor(
-                    None, 
-                    self.s3.upload_file, 
-                    target_video_file,                      # 1st param: Local file path
-                    "video-asset-files-storage-workflow",   # 2nd param: Bucket name
-                    target_key                              # 3rd param: S3 object key
-                )
-
-                public_path_url = f"https://pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev/{target_key}" 
-                
-                return {
-                    "status": "success",
-                    "file_key": target_key,
-                    "public_url": public_path_url,
-                    "filename": saved_filename
-                }
-
-        finally:
-            ram_task.cancel()
-
-
-
-
-# ==========================================================================
-# PART 7: STREAM RESPONSE TO BYPASS CLOUD TIMEOUTS
-# Purpose: Keep FastAPI connection alive while GPU processes graph chunks.
-# ==========================================================================
-async def stream_response():
-    # Start the heavy GPU task in the background
-    task = asyncio.create_task(process_pipeline())
-    
-    # Keep-alive loop: sends a space character every 10 seconds until done
-    while not task.done():
-        yield b" "  # Send whitespace character to prevent proxy/LB timeout drop
-        done, pending = await asyncio.wait([task], timeout=10.0)
-        if task in done: 
-            break
-    
-    try:
-        result = task.result()
-        # FIX: Ensure result is serialized to JSON string if it's a dict/list
-        if isinstance(result, (dict, list)):
-            yield json.dumps(result).encode("utf-8")
-        else:
-            yield str(result).encode("utf-8")
+            # Keep-alive loop: sends a space character every 10 seconds until done
+            while not task.done():
+                yield b" "  # Send whitespace character to prevent proxy/LB timeout drop
+                done, pending = await asyncio.wait([task], timeout=10.0)
+                if task in done: 
+                    break
             
-    except HTTPException as e:
-        yield json.dumps({"status": "error", "detail": e.detail}).encode("utf-8")
-    except Exception as e:
-        yield json.dumps({"status": "error", "detail": str(e)}).encode("utf-8")
+            try:
+                result = task.result()
+                # FIX: Ensure result is serialized to JSON string if it's a dict/list
+                if isinstance(result, (dict, list)):
+                    yield json.dumps(result).encode("utf-8")
+                else:
+                    yield str(result).encode("utf-8")
+                    
+            except HTTPException as e:
+                yield json.dumps({"status": "error", "detail": e.detail}).encode("utf-8")
+            except Exception as e:
+                yield json.dumps({"status": "error", "detail": str(e)}).encode("utf-8")
 
-# RECOMMENDED: Use "text/plain" or "application/x-ndjson" if client stream-parses.
-# If the client reads the whole response at once, "application/json" is fine 
-# because standard JSON parsers ignore leading whitespace.
-return StreamingResponse(stream_response(), media_type="application/json")
+        # RECOMMENDED: Use "text/plain" or "application/x-ndjson" if client stream-parses.
+        # If the client reads the whole response at once, "application/json" is fine 
+        # because standard JSON parsers ignore leading whitespace.
+        return StreamingResponse(stream_response(), media_type="application/json")

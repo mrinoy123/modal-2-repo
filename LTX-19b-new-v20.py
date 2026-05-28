@@ -25,7 +25,7 @@ base_image = modal.Image.from_registry(
     "git", "wget", "ffmpeg", "libgl1", "libglib2.0-0", 
     "build-essential", "ninja-build", "cmake", "clang", "llvm"
 ).env({
-    "FORCE_REBUILD_INDEX": "120"  # Bumped to force the new ComfyUI Core Patch
+    "FORCE_REBUILD_INDEX": "121"  # Bumped to force the new Recursive Flattening Patch
 })
 
 # ==============================================================================
@@ -91,8 +91,8 @@ final_image = deps_image.run_commands(
     "echo '' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     "echo 'sageattn_qk_int8_pv_fp16_triton = sageattn' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
 
-    # 🔥 PATCH 4: FORCE RESOLVE "IndexError: list index out of range" CAUSED BY DenoLTXSequencer
-    "python3 -c \"filepath = '/workspace/ComfyUI/comfy/sampler_helpers.py'; code = open(filepath).read(); code = code.replace('temp = c[1].copy()', 'temp = c[1].copy() if len(c) > 1 else {}'); open(filepath, 'w').write(code)\"",
+    # 🔥 PATCH 4: FORCE RESOLVE Nested Conditioning Arrays from DenoLTXSequencer
+    "python3 -c \"filepath = '/workspace/ComfyUI/comfy/sampler_helpers.py'; code = open(filepath).read(); replacement = 'def convert_cond(cond):\\n    def flatten(x):\\n        res = []\\n        for c in x:\\n            if isinstance(c, list) and len(c) > 0 and isinstance(c[0], list): res.extend(flatten(c))\\n            else: res.append(c)\\n        return res\\n    if isinstance(cond, list): cond = flatten(cond)\\n'; code = code.replace('def convert_cond(cond):', replacement); open(filepath, 'w').write(code)\"",
     
     env={
         "CUDA_HOME": "/usr/local/cuda",

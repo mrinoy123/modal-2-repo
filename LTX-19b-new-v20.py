@@ -446,6 +446,13 @@ class LTXEngine:
                         if "widgets_values" in sg2["252"]:
                             sg2["252"]["widgets_values"][0] = 4
 
+                    # ADDED CONFIGURATION: SET CFG Guider to 1 on Sub-graph 2
+                    if "234" in sg2:
+                        if "inputs" not in sg2["234"]: sg2["234"]["inputs"] = {}
+                        sg2["234"]["inputs"]["cfg"] = 1
+                        if "widgets_values" in sg2["234"] and len(sg2["234"]["widgets_values"]) > 0:
+                            sg2["234"]["widgets_values"][0] = 1
+
                     if "235" in sg2:
                         num_imgs = len(image_filenames)
                         if "inputs" not in sg2["235"]: sg2["235"]["inputs"] = {}

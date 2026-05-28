@@ -50,14 +50,21 @@ build_image = base_image.env({
     "python3.12 -m pip install --no-cache-dir pandas numexpr pytz python-dateutil scipy matplotlib colorama librosa soundfile decord imageio scikit-image numba einops bitsandbytes"
 )
 
-
 # ==============================================================================
 # PART 4: COMFYUI & CUSTOM NODES CLONING + DEPENDENCY ISOLATION
-# Purpose: Clone the main ComfyUI repository along with all necessary custom 
-# nodes. Purges open-ended torch dependencies to prevent environment overriding,
-# then locks the exact PyTorch + cu124 stack, and injects SageAttention alias.
+# FIX APPLIED: Installed specific cu124 PyTorch stack BEFORE executing any 
+# requirements.txt files. This stops pip from downloading massive cu13 bloat.
 # ==============================================================================
-final_image = build_image.run_commands(
+
+# 1. Install Exact Torch & SageAttention First
+torch_image = build_image.run_commands(
+    "python3.12 -m pip install --no-cache-dir torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124",
+    "python3.12 -m pip install --no-cache-dir diffusers accelerate transformers torchsde numpy==1.26.4 kornia==0.7.3",
+    "python3.12 -m pip install --no-cache-dir sageattention==1.0.6"
+)
+
+# 2. Clone Repositories
+clone_image = torch_image.run_commands(
     "git clone https://github.com/comfyanonymous/ComfyUI /workspace/ComfyUI",
     "git clone https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git /workspace/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite",
     "git clone https://github.com/Lightricks/ComfyUI-LTXVideo.git /workspace/ComfyUI/custom_nodes/ComfyUI-LTXVideo",
@@ -70,18 +77,19 @@ final_image = build_image.run_commands(
     "git clone https://github.com/pythongosssss/ComfyUI-Custom-Scripts.git /workspace/ComfyUI/custom_nodes/ComfyUI-Custom-Scripts",
     "git clone https://github.com/IvanRybakov/comfyui-node-int-to-string-convertor.git /workspace/ComfyUI/custom_nodes/comfyui-node-int-to-string-convertor",
     "git clone https://github.com/siraxe/ComfyUI-LTX-FDG.git /workspace/ComfyUI/custom_nodes/ComfyUI-LTX-FDG"
-).run_commands(
+)
+
+# 3. Strip torch identifiers from node requirements, and install the rest.
+# Pip will now see Torch is already fulfilled by cu124.
+deps_image = clone_image.run_commands(
     "sed -i '/torch/d' /workspace/ComfyUI/requirements.txt",
-    "python3.12 -m pip install --no-cache-dir -r /workspace/ComfyUI/requirements.txt",
     r"find /workspace/ComfyUI/custom_nodes -name 'requirements.txt' -exec sed -i '/torch/d' {} \;",
+    "python3.12 -m pip install --no-cache-dir -r /workspace/ComfyUI/requirements.txt",
     r"find /workspace/ComfyUI/custom_nodes -name 'requirements.txt' -exec python3.12 -m pip install --no-cache-dir -r {} \;"
-).run_commands(
-    "python3.12 -m pip uninstall -y torch torchvision torchaudio numpy kornia sageattention torchsde",
-    "python3.12 -m pip install --no-cache-dir torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124",
-    "python3.12 -m pip install --no-cache-dir diffusers accelerate transformers torchsde numpy==1.26.4 kornia==0.7.3"
-).run_commands(
-    "python3.12 -m pip install --no-cache-dir sageattention==1.0.6",
-    # INJECTED FIX: Inserts a clean newline before appending the alias to prevent syntax colliding on the last line
+)
+
+# 4. Inject Alias mapping for KJNodes into SageAttention
+final_image = deps_image.run_commands(
     "echo '' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     "echo 'sageattn_qk_int8_pv_fp16_triton = sageattn' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     env={
@@ -95,8 +103,6 @@ final_image = build_image.run_commands(
 
 # ==============================================================================
 # PART 5: MODAL APP CONFIGURATION
-# Purpose: Define the renamed Modal App, attach the Volume containing model weights, 
-# and explicitly assign your designated Cloudflare environment credentials via your custom secret vault.
 # ==============================================================================
 app = modal.App("media-worker")
 
@@ -115,8 +121,6 @@ class LTXEngine:
     
     # ==============================================================================
     # PART 6: HELPER METHODS (LOGGING & RAM OPTIMIZATION)
-    # Purpose: Stream ComfyUI terminal logs to Modal and continuously squeeze RAM 
-    # using cache dropping to prevent out-of-memory errors on large workflows.
     # ==============================================================================
     def _log_reader(self):
         for line in iter(self.process.stdout.readline, ""):
@@ -134,8 +138,6 @@ class LTXEngine:
 
     # ==============================================================================
     # PART 7: SERVER INITIALIZATION (@modal.enter)
-    # Purpose: Symlinks model weights into ComfyUI directories, sets up AWS S3/R2 
-    # clients, hot-patches LTX nodes for stable saving, and launches the server.
     # ==============================================================================
     @modal.enter()
     def start_comfy(self):
@@ -267,8 +269,6 @@ class LTXVLoadConditioning:
 
     # ==============================================================================
     # PART 8: INFERENCE EXECUTION & MEMORY CLEARING UTILITIES
-    # Purpose: Handlers to free VRAM between graphs, poll workflow execution status,
-    # and merge dynamic payload overrides into base graph JSONs.
     # ==============================================================================
     async def clear_comfy_memory(self, session):
         try:
@@ -330,13 +330,10 @@ class LTXVLoadConditioning:
         return base_graph
 
     # ==============================================================================
-    # PART 9: MAIN FASTAPI ENDPOINT
-    # Purpose: The public inference route. Validates new auth key string, downloads 
-    # guide structures, processes sub-graphs sequentially, and outputs onto R2.
+    # PART 9: MAIN FASTAPI ENDPOINT (For usage with n8n HTTP Request node)
     # ==============================================================================
     @modal.fastapi_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
-        # Injected string authorization matching your environment token settings
         if x_api_key != "testing-modal-workflow-2": 
             raise HTTPException(status_code=403, detail="Unauthorized Account 2 Pipeline Request")
         
@@ -438,7 +435,7 @@ class LTXVLoadConditioning:
             async with aiohttp.ClientSession() as session:
                 
                 # ==============================================================================
-                # SUB-GRAPH 1: TEXT ENCODING & CONDITIONING
+                # SUB-GRAPH 1
                 # ==============================================================================
                 sg1_raw = body.get("subgraph_1")
                 if sg1_raw:
@@ -447,22 +444,19 @@ class LTXVLoadConditioning:
                     with open("comfyui-ltx-20-subgraph-1(api).json", "r") as f:
                         sg1 = json.load(f)
                 
+                # N8N Override support!
                 sg1 = self.merge_overrides(sg1, body.get("subgraph_1_override"))
 
                 if "243" in sg1:
                     sg1["243"]["inputs"]["text_encoder"] = target_gemma
                     sg1["243"]["inputs"]["ckpt_name"] = target_connector
                     sg1["243"]["inputs"]["device"] = "default" 
-                    
                 if "246" in sg1:
                     sg1["246"]["inputs"]["prompts"] = prompts_timeline_str
-                    
                 if "112" in sg1:
                     sg1["112"]["inputs"]["text"] = negative_prompt
-                    
                 if "242" in sg1:
                     sg1["242"]["inputs"]["filename"] = "(NEGATIVE)conditioning"
-                    
                 if "244" in sg1:
                     sg1["244"]["inputs"]["filename"] = "(POSITIVE)conditioning"
 
@@ -473,7 +467,7 @@ class LTXVLoadConditioning:
                 await self.clear_comfy_memory(session)
 
                 # ==============================================================================
-                # SUB-GRAPH 2: MAIN LATENT VIDEO INFERENCE
+                # SUB-GRAPH 2
                 # ==============================================================================
                 sg2_raw = body.get("subgraph_2")
                 if sg2_raw:
@@ -482,6 +476,7 @@ class LTXVLoadConditioning:
                     with open("comfyui-ltx-20-subgraph-2(api).json", "r") as f:
                         sg2 = json.load(f)
 
+                # N8N Override support!
                 sg2 = self.merge_overrides(sg2, body.get("subgraph_2_override"))
 
                 if "194" in sg2:
@@ -509,7 +504,7 @@ class LTXVLoadConditioning:
                 await self.clear_comfy_memory(session)
 
                 # ==============================================================================
-                # SUB-GRAPH 3: AUDIO CO-GENERATION & DECODING
+                # SUB-GRAPH 3
                 # ==============================================================================
                 sg3_raw = body.get("subgraph_3")
                 if sg3_raw:
@@ -518,6 +513,7 @@ class LTXVLoadConditioning:
                     with open("comfyui-ltx-20-Subgraph-3(api).json", "r") as f:
                         sg3 = json.load(f)
 
+                # N8N Override support!
                 sg3 = self.merge_overrides(sg3, body.get("subgraph_3_override"))
 
                 if "232" in sg3:
@@ -569,7 +565,6 @@ class LTXVLoadConditioning:
                     target_key
                 )
 
-                # Updated public routing distribution URL string
                 public_path_url = f"https://pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev/{target_key}" 
                 return {
                     "status": "success",

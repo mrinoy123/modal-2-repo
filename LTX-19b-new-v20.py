@@ -28,7 +28,7 @@ base_image = modal.Image.from_registry(
     "git", "wget", "ffmpeg", "libgl1", "libglib2.0-0",
     "build-essential", "ninja-build", "cmake", "clang", "llvm"
 ).env({
-    "FORCE_REBUILD_INDEX": "130"  # Bumped to ensure fresh deployment cache
+    "FORCE_REBUILD_INDEX": "150"  # Bumped to ensure fresh deployment cache
 })
 
 # ==============================================================================

@@ -472,9 +472,9 @@ class LTXEngine:
                         if "inputs" not in sg2["246"]: sg2["246"]["inputs"] = {}
                         sg2["246"]["inputs"]["file_name"] = "(NEGATIVE)conditioning.pt"
                         
-                    if "248" in sg2: 
-                        if "inputs" not in sg2["248"]: sg2["248"]["inputs"] = {}
-                        sg2["248"]["inputs"]["lora_name"] = target_detailer_lora
+                    if "255" in sg2: 
+                        if "inputs" not in sg2["255"]: sg2["255"]["inputs"] = {}
+                        sg2["255"]["inputs"]["lora_name"] = target_detailer_lora
                         
                     if "249" in sg2: 
                         if "inputs" not in sg2["249"]: sg2["249"]["inputs"] = {}

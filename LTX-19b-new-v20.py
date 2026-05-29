@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "git", "wget", "ffmpeg", "libgl1", "libglib2.0-0",
     "build-essential", "ninja-build", "cmake", "clang", "llvm"
 ).env({
-    "FORCE_REBUILD_INDEX": "137"  # Bumped to ensure fresh deployment cache pulling fixes
+    "FORCE_REBUILD_INDEX": "139"  # Bumped to ensure fresh deployment cache pulling fixes
 })
 
 # ==============================================================================
@@ -552,17 +552,35 @@ class LTXVLoadConditioning:
                         sg2["243"]["inputs"]["noise_seed"] = random_seed
 
                     # ==============================================================================
-                    # OOM FIX LOGIC: Force tighter looping sampler math chunks to fit 49 frames in 24GB
+                    # OOM FIX LOGIC: Force tighter parameters to block User's JSON memory spikes
                     # ==============================================================================
                     if "312" in sg2:
                         if "inputs" not in sg2["312"]: sg2["312"]["inputs"] = {}
                         sg2["312"]["inputs"]["temporal_tile_size"] = 32
                         sg2["312"]["inputs"]["temporal_overlap"] = 8
+                        # FIX: Block Spatial Tiling overhead in Looping Sampler
+                        sg2["312"]["inputs"]["horizontal_tiles"] = 1
+                        sg2["312"]["inputs"]["vertical_tiles"] = 1
 
                     if "252" in sg2:
                         if "inputs" not in sg2["252"]: sg2["252"]["inputs"] = {}
-                        # OOM FIX: Boost feedforward optimizations to fit large batch sizes
-                        sg2["252"]["inputs"]["chunks"] = 8
+                        # Block Feedforward overhead
+                        sg2["252"]["inputs"]["chunks"] = 4
+                        
+                    if "313" in sg2:
+                        if "inputs" not in sg2["313"]: sg2["313"]["inputs"] = {}
+                        # FIX: Block APG (Adaptive Prompt Guidance) which doubles memory pass
+                        sg2["313"]["inputs"]["apply_apg"] = False
+                        
+                    if "315" in sg2:
+                        if "inputs" not in sg2["315"]: sg2["315"]["inputs"] = {}
+                        # Sync preset with the Distilled target unet
+                        sg2["315"]["inputs"]["preset"] = "13b Distilled"
+                        
+                    if "317" in sg2:
+                        if "inputs" not in sg2["317"]: sg2["317"]["inputs"] = {}
+                        # FIX: Prevent infinite overlapping loops (Overlap must be < Tile Size)
+                        sg2["317"]["inputs"]["tile_overlap"] = 64
 
                     if "311" in sg2:
                         if "inputs" not in sg2["311"]: sg2["311"]["inputs"] = {}
@@ -598,7 +616,7 @@ class LTXVLoadConditioning:
                     if "313" in sg3:
                         if "inputs" not in sg3["313"]: sg3["313"]["inputs"] = {}
                         # OOM FIX: Match feedforward chunk optimizations
-                        sg3["313"]["inputs"]["chunks"] = 8
+                        sg3["313"]["inputs"]["chunks"] = 4
 
                     if "232" in sg3: 
                         if "inputs" not in sg3["232"]: sg3["232"]["inputs"] = {}
@@ -647,6 +665,7 @@ class LTXVLoadConditioning:
                         # OOM FIX: Tighten VAE Decode spatial/temporal tile overlaps
                         sg3["307"]["inputs"]["temporal_tile_length"] = 16
                         sg3["307"]["inputs"]["spatial_tiles"] = 4
+                        sg3["307"]["inputs"]["temporal_overlap"] = 4
 
                     if "407" in sg3:
                         if "inputs" not in sg3["407"]: sg3["407"]["inputs"] = {}

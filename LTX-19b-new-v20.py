@@ -246,11 +246,11 @@ class LTXVLoadConditioning:
         env_vars = os.environ.copy()
         env_vars["TORCH_NUM_THREADS"] = "1"
         env_vars["OMP_NUM_THREADS"] = "1"
-        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        # OOM FIX: Garbage collection threshold and split sizing actively prevents PyTorch memory fragmentation on the L4 GPU
+        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:128"
         env_vars["CUDA_MODULE_LOADING"] = "LAZY" 
         env_vars["MALLOC_TRIM_THRESHOLD_"] = "65536" 
         env_vars["HF_HUB_OFFLOAD_DIR"] = "/tmp/hf_offload"
-        # FIX: Ignore Python deprecation and syntax warnings globally 
         env_vars["PYTHONWARNINGS"] = "ignore"
         
         self.process = subprocess.Popen([
@@ -551,9 +551,18 @@ class LTXVLoadConditioning:
                         if "inputs" not in sg2["243"]: sg2["243"]["inputs"] = {}
                         sg2["243"]["inputs"]["noise_seed"] = random_seed
 
+                    # ==============================================================================
+                    # OOM FIX LOGIC: Force tighter looping sampler math chunks to fit 49 frames in 24GB
+                    # ==============================================================================
+                    if "312" in sg2:
+                        if "inputs" not in sg2["312"]: sg2["312"]["inputs"] = {}
+                        sg2["312"]["inputs"]["temporal_tile_size"] = 32
+                        sg2["312"]["inputs"]["temporal_overlap"] = 8
+
                     if "252" in sg2:
                         if "inputs" not in sg2["252"]: sg2["252"]["inputs"] = {}
-                        sg2["252"]["inputs"]["chunks"] = 4
+                        # OOM FIX: Boost feedforward optimizations to fit large batch sizes
+                        sg2["252"]["inputs"]["chunks"] = 8
 
                     if "311" in sg2:
                         if "inputs" not in sg2["311"]: sg2["311"]["inputs"] = {}
@@ -588,7 +597,8 @@ class LTXVLoadConditioning:
 
                     if "313" in sg3:
                         if "inputs" not in sg3["313"]: sg3["313"]["inputs"] = {}
-                        sg3["313"]["inputs"]["chunks"] = 4
+                        # OOM FIX: Match feedforward chunk optimizations
+                        sg3["313"]["inputs"]["chunks"] = 8
 
                     if "232" in sg3: 
                         if "inputs" not in sg3["232"]: sg3["232"]["inputs"] = {}
@@ -631,6 +641,12 @@ class LTXVLoadConditioning:
                         if "inputs" not in sg3["315"]: sg3["315"]["inputs"] = {}
                         # CHANGED: Reverted to 12 STEPS
                         sg3["315"]["inputs"]["steps"] = 12
+
+                    if "307" in sg3:
+                        if "inputs" not in sg3["307"]: sg3["307"]["inputs"] = {}
+                        # OOM FIX: Tighten VAE Decode spatial/temporal tile overlaps
+                        sg3["307"]["inputs"]["temporal_tile_length"] = 16
+                        sg3["307"]["inputs"]["spatial_tiles"] = 4
 
                     if "407" in sg3:
                         if "inputs" not in sg3["407"]: sg3["407"]["inputs"] = {}

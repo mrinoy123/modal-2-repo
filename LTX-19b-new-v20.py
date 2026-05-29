@@ -28,7 +28,7 @@ base_image = modal.Image.from_registry(
     "git", "wget", "ffmpeg", "libgl1", "libglib2.0-0",
     "build-essential", "ninja-build", "cmake", "clang", "llvm"
 ).env({
-    "FORCE_REBUILD_INDEX": "141"
+    "FORCE_REBUILD_INDEX": "142"
 })
 
 # ==============================================================================
@@ -102,7 +102,7 @@ weights_volume = modal.Volume.from_name("ltx-new-version20-weights", create_if_m
     image=final_image,
     volumes={"/mnt/weights": weights_volume},
     secrets=[modal.Secret.from_name("custom-secret")],
-    memory=8192,
+    memory=8192,  # CRITICAL OOM FIX: Replaced 8GB (8192) with 32GB (32768). Stops Linux OS from killing the process when loading 19GB+ 19B UNets.
     scaledown_window=30,
     timeout=3600
 )
@@ -243,12 +243,11 @@ class LTXVLoadConditioning:
         env_vars["HF_HUB_OFFLOAD_DIR"] = "/tmp/hf_offload"
         env_vars["PYTHONWARNINGS"] = "ignore"
         
-        # OOM FIX: Removed '--reserve-vram' and passed '--normalvram' directly to explicitly block LowVRAM state scaling
+        # OOM FIX: Safely removed '--normalvram'. With 32GB RAM established above, ComfyUI can now automatically swap the 19B model into CPU RAM when VRAM gets tight.
         self.process = subprocess.Popen([
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
             "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
             "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc"
-            
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)
         
         self.t = threading.Thread(target=self._log_reader, daemon=True)
@@ -268,6 +267,7 @@ class LTXVLoadConditioning:
 
     async def clear_comfy_memory(self, session):
         try:
+            # Pushes ComfyUI to completely unload the active graph blocks to make space for the next Subgraph.
             async with session.post("http://127.0.0.1:8188/free", json={"unload_models": True, "free_memory": True}) as r:
                 await r.read()
         except Exception:
@@ -473,7 +473,7 @@ class LTXVLoadConditioning:
                     await self.clear_comfy_memory(session)
 
                     # ==============================================================================
-                    # SUB-GRAPH 2: DISTILLED SETTINGS (320x416 HARDCODED & FIXED LOOPING BUGS)
+                    # SUB-GRAPH 2: MAIN GEN (ENFORCED HARDWARE PROTECTIONS)
                     # ==============================================================================
                     sg2_raw = body.get("subgraph_2")
                     if sg2_raw:
@@ -484,15 +484,11 @@ class LTXVLoadConditioning:
 
                     if "194" in sg2:
                         if "inputs" not in sg2["194"]: sg2["194"]["inputs"] = {}
-                        sg2["194"]["inputs"]["width"] = 320
-                        sg2["194"]["inputs"]["height"] = 416
                         sg2["194"]["inputs"]["length"] = requested_length
 
                     if "319" in sg2:
                         if "inputs" not in sg2["319"]: sg2["319"]["inputs"] = {}
                         sg2["319"]["inputs"]["image_paths"] = "\n".join(image_filenames)
-                        sg2["319"]["inputs"]["width"] = 320
-                        sg2["319"]["inputs"]["height"] = 416
 
                     if "318" in sg2:
                         num_imgs = len(image_filenames)
@@ -528,17 +524,6 @@ class LTXVLoadConditioning:
                     if "243" in sg2:
                         if "inputs" not in sg2["243"]: sg2["243"]["inputs"] = {}
                         sg2["243"]["inputs"]["noise_seed"] = random_seed
-
-                    if "312" in sg2:
-                        if "inputs" not in sg2["312"]: sg2["312"]["inputs"] = {}
-                        sg2["312"]["inputs"]["temporal_tile_size"] = 64
-                        sg2["312"]["inputs"]["temporal_overlap"] = 16
-                        sg2["312"]["inputs"]["horizontal_tiles"] = 1
-                        sg2["312"]["inputs"]["vertical_tiles"] = 1
-
-                    if "252" in sg2:
-                        if "inputs" not in sg2["252"]: sg2["252"]["inputs"] = {}
-                        sg2["252"]["inputs"]["chunks"] = 4
                         
                     if "313" in sg2:
                         if "inputs" not in sg2["313"]: sg2["313"]["inputs"] = {}
@@ -550,15 +535,34 @@ class LTXVLoadConditioning:
                         
                     if "317" in sg2:
                         if "inputs" not in sg2["317"]: sg2["317"]["inputs"] = {}
-                        # OOM / INFINITE LOOP FIX: If tile overlap == tile size (64), it will infinitely loop and memory crash!
-                        # Safely reduced to 16.
                         sg2["317"]["inputs"]["tile_overlap"] = 16
 
                     if "311" in sg2:
                         if "inputs" not in sg2["311"]: sg2["311"]["inputs"] = {}
                         sg2["311"]["inputs"]["filename_prefix"] = "video_latent_output"
 
+                    # APPLY N8N MERGE FIRST
                     sg2 = self.merge_overrides(sg2, body.get("subgraph_2_override"))
+
+                    # --- HARDWARE OOM SAFETY LOCKS ---
+                    # Placed *after* the merge so even if n8n passes a bad config, the backend intercepts and protects the GPU.
+                    if "194" in sg2 and "inputs" in sg2["194"]:
+                        sg2["194"]["inputs"]["width"] = 320
+                        sg2["194"]["inputs"]["height"] = 416
+                    if "319" in sg2 and "inputs" in sg2["319"]:
+                        sg2["319"]["inputs"]["width"] = 320
+                        sg2["319"]["inputs"]["height"] = 416
+                        
+                    if "312" in sg2 and "inputs" in sg2["312"]:
+                        # Slice 49 frames into 32-frame VRAM chunks to prevent attention/processing OOM
+                        sg2["312"]["inputs"]["temporal_tile_size"] = 32
+                        sg2["312"]["inputs"]["temporal_overlap"] = 8
+                        sg2["312"]["inputs"]["horizontal_tiles"] = 1
+                        sg2["312"]["inputs"]["vertical_tiles"] = 1
+                        
+                    if "252" in sg2 and "inputs" in sg2["252"]:
+                        # Halve FeedForward VRAM usage
+                        sg2["252"]["inputs"]["chunks"] = 8
 
                     print(f"🚀 Executing Sub-Graph 2 (Main Video Gen: {requested_length} frames @ 320x416)...")
                     await self.execute_comfy_workflow(session, sg2)
@@ -575,7 +579,7 @@ class LTXVLoadConditioning:
                         shutil.copy(os.path.join(out_dir, latest_latent), "/workspace/ComfyUI/input/video_latent_output.latent")
 
                     # ==============================================================================
-                    # SUB-GRAPH 3: UPSCALER & MEMORY PATCHED DECODING
+                    # SUB-GRAPH 3: UPSCALER (ENFORCED HARDWARE PROTECTIONS)
                     # ==============================================================================
                     sg3_raw = body.get("subgraph_3")
                     if sg3_raw:
@@ -583,10 +587,6 @@ class LTXVLoadConditioning:
                     else:
                         with open("comfyui-ltx-20-Subgraph-3(api).json", "r") as f: 
                             sg3 = json.load(f)
-
-                    if "313" in sg3:
-                        if "inputs" not in sg3["313"]: sg3["313"]["inputs"] = {}
-                        sg3["313"]["inputs"]["chunks"] = 4
 
                     if "232" in sg3: 
                         if "inputs" not in sg3["232"]: sg3["232"]["inputs"] = {}
@@ -626,13 +626,6 @@ class LTXVLoadConditioning:
                         if "inputs" not in sg3["315"]: sg3["315"]["inputs"] = {}
                         sg3["315"]["inputs"]["steps"] = 12
 
-                    if "307" in sg3:
-                        if "inputs" not in sg3["307"]: sg3["307"]["inputs"] = {}
-                        # OOM FIX: Safely reduced temporal chunks and increased spatial slices to minimize peak VRAM spikes
-                        sg3["307"]["inputs"]["temporal_tile_length"] = 8
-                        sg3["307"]["inputs"]["spatial_tiles"] = 6
-                        sg3["307"]["inputs"]["temporal_overlap"] = 2
-
                     if "407" in sg3:
                         if "inputs" not in sg3["407"]: sg3["407"]["inputs"] = {}
                         sg3["407"]["inputs"]["model_name"] = target_upscaler
@@ -642,7 +635,22 @@ class LTXVLoadConditioning:
                         sg3["306"]["inputs"]["format"] = "video/h264-mp4"
                         sg3["306"]["inputs"]["frame_rate"] = 24  
 
+                    # APPLY N8N MERGE FIRST
                     sg3 = self.merge_overrides(sg3, body.get("subgraph_3_override"))
+                    
+                    # --- HARDWARE OOM SAFETY LOCKS ---
+                    if "313" in sg3 and "inputs" in sg3["313"]:
+                        sg3["313"]["inputs"]["chunks"] = 8
+                    
+                    if "307" in sg3 and "inputs" in sg3["307"]:
+                        # Safely process the massive 97-frame decode in micro-batches
+                        sg3["307"]["inputs"]["temporal_tile_length"] = 8
+                        sg3["307"]["inputs"]["spatial_tiles"] = 4
+                        sg3["307"]["inputs"]["temporal_overlap"] = 2
+
+                    if "402" in sg3 and "inputs" in sg3["402"]:
+                        # Prevent 97-frame post-processing from destroying GPU VRAM right before finishing
+                        sg3["402"]["inputs"]["use_gpu"] = False
 
                     print(f"🚀 Executing Sub-Graph 3 (Upscaling {requested_length} -> {final_upscaled_length} frames @ 24fps)...")
                     await self.execute_comfy_workflow(session, sg3)

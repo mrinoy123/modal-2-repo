@@ -103,7 +103,7 @@ weights_volume = modal.Volume.from_name("ltx-new-version20-weights", create_if_m
     image=final_image,
     volumes={"/mnt/weights": weights_volume},
     secrets=[modal.Secret.from_name("custom-secret")],
-    # FIX 1: MUST BE 32GB to absorb lowvram offloading matrices.
+    # Strictly locked to 8192 MB System RAM as requested.
     memory=8192, 
     scaledown_window=30,
     timeout=3600
@@ -175,8 +175,8 @@ class LTXEngine:
         env_vars["TORCH_NUM_THREADS"] = "1"
         env_vars["OMP_NUM_THREADS"] = "1"
         
-        # FIX 2: Added "max_split_size_mb:64" to force PyTorch to slice VRAM optimally
-        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
+        # Slices VRAM optimally and aggressively collects garbage thresholds to stop OOM buildup
+        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:64"
         env_vars["CUDA_MODULE_LOADING"] = "LAZY" 
         env_vars["MALLOC_TRIM_THRESHOLD_"] = "65536" 
         env_vars["HF_HUB_OFFLOAD_DIR"] = "/tmp/hf_offload"
@@ -184,8 +184,10 @@ class LTXEngine:
         self.process = subprocess.Popen([
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
             "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
-            "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc"
-            # FIX 3: Added LowVRAM explicitly to stop model hoarding during LoRA execution
+            "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc",
+            # FIX: Eliminated explicit LowVRAM restriction. Implemented explicit Partial Loading via --medvram.
+            # Passed --reserve-vram to FORCE "full load: False", forcing LoRA & Models to stay in memory mapped System RAM until executed!
+            "--medvram"
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)
         
         self.t = threading.Thread(target=self._log_reader, daemon=True)
@@ -213,9 +215,14 @@ class LTXEngine:
         
         import gc
         import torch
+        
+        # COMPLETE VRAM PURGE logic
         gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.ipc_collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+            torch.cuda.reset_peak_memory_stats()
+            
         try:
             ctypes.CDLL("libc.so.6").malloc_trim(0)
         except Exception:

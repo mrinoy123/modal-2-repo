@@ -20,7 +20,6 @@ from typing import Optional
 
 # ==============================================================================
 # PART 2: BASE IMAGE & OS CONFIGURATION
-# Purpose: Establish the foundational Ubuntu/CUDA image and install system packages.
 # ==============================================================================
 base_image = modal.Image.from_registry(
     "nvidia/cuda:12.5.1-devel-ubuntu24.04",
@@ -29,12 +28,11 @@ base_image = modal.Image.from_registry(
     "git", "wget", "ffmpeg", "libgl1", "libglib2.0-0",
     "build-essential", "ninja-build", "cmake", "clang", "llvm"
 ).env({
-    "FORCE_REBUILD_INDEX": "140"  # Bumped to ensure fresh deployment cache pulling fixes
+    "FORCE_REBUILD_INDEX": "141"
 })
 
 # ==============================================================================
 # PART 3: CORE PYTHON DEPENDENCIES & ENVIRONMENT VARIABLES
-# Purpose: Inject optimal compiler paths and install PyTorch/Triton basics.
 # ==============================================================================
 build_image = base_image.env({
     "CUDA_HOME": "/usr/local/cuda",
@@ -51,7 +49,6 @@ build_image = base_image.env({
 
 # ==============================================================================
 # PART 4: COMFYUI & CUSTOM NODES CLONING + DEPENDENCY ISOLATION
-# Purpose: Clone strictly required node repos. Added ColorCorrector.
 # ==============================================================================
 torch_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124",
@@ -84,8 +81,6 @@ final_image = deps_image.run_commands(
     "echo '' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     "echo 'sageattn_qk_int8_pv_fp16_triton = sageattn' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     "python3 -c \"filepath = '/workspace/ComfyUI/comfy/sampler_helpers.py'; code = open(filepath).read(); replacement = 'def convert_cond(cond):\\n    def flatten(x):\\n        res = []\\n        for c in x:\\n            if isinstance(c, list) and len(c) > 0 and isinstance(c[0], list): res.extend(flatten(c))\\n            else: res.append(c)\\n        return res\\n    if isinstance(cond, list): cond = flatten(cond)\\n'; code = code.replace('def convert_cond(cond):', replacement); open(filepath, 'w').write(code)\"",
-    
-    # FIX: Suppress the Kornia DeprecationWarning by natively patching the torch.cuda.amp.custom_fwd call
     "sed -i \"s/@torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)/@torch.amp.custom_fwd(device_type='cuda', cast_inputs=torch.float32)/g\" /usr/local/lib/python3.12/site-packages/kornia/feature/lightglue.py",
     
     env={
@@ -97,8 +92,7 @@ final_image = deps_image.run_commands(
 )
 
 # ==============================================================================
-# PART 5: MODAL APP CONFIGURATION & CLOUD VOLUMES
-# Purpose: Tie the environment to Modal architecture with auto-scaling limits.
+# PART 5: MODAL APP CONFIGURATION
 # ==============================================================================
 app = modal.App("media-worker")
 weights_volume = modal.Volume.from_name("ltx-new-version20-weights", create_if_missing=False)
@@ -134,12 +128,10 @@ class LTXEngine:
         print("🔗 Running Atomic Model Folder Linker...")
         base_models_dir = "/workspace/ComfyUI/models"
         
-        # FIX: Added "latent_upscale_models" explicitly so ComfyUI recognizes the upscaler path
         dirs = ["unet", "vae", "clip", "text_encoders", "text_encoder", "checkpoints", "diffusion_models", "gguf", "loras", "upscale_models", "latent_upscale_models"]
         for d in dirs: 
             os.makedirs(os.path.join(base_models_dir, d), exist_ok=True)
 
-        # Natively map canonical_storage as a valid directory for ALL model types
         yaml_config = """modal_weights:
     base_path: /mnt/weights
     checkpoints: canonical_storage
@@ -231,7 +223,6 @@ class LTXVLoadConditioning:
         
         conditioning = torch.load(os.path.join(input_dir, fname), weights_only=False)
         
-        # NORMALIZING CONDITIONING TO PREVENT DENO/ICLORA INDEX ERROR
         if isinstance(conditioning, list):
             conditioning = flatten_cond(conditioning)
             
@@ -246,18 +237,18 @@ class LTXVLoadConditioning:
         env_vars = os.environ.copy()
         env_vars["TORCH_NUM_THREADS"] = "1"
         env_vars["OMP_NUM_THREADS"] = "1"
-        # OOM FIX: Reverted PyTorch Allocator bounds to allow massive contiguous memory blocks required by 19B LoRA patching
         env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
         env_vars["CUDA_MODULE_LOADING"] = "LAZY" 
         env_vars["MALLOC_TRIM_THRESHOLD_"] = "65536" 
         env_vars["HF_HUB_OFFLOAD_DIR"] = "/tmp/hf_offload"
         env_vars["PYTHONWARNINGS"] = "ignore"
         
+        # OOM FIX: Removed '--reserve-vram' and passed '--normalvram' directly to explicitly block LowVRAM state scaling
         self.process = subprocess.Popen([
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
             "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
             "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc",
-            "--reserve-vram", "0.3"  # OOM FIX: Forces PyTorch to stage the LoRA addition in CPU RAM, preventing Model Load crashes
+            "--normalvram"
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)
         
         self.t = threading.Thread(target=self._log_reader, daemon=True)
@@ -338,7 +329,6 @@ class LTXVLoadConditioning:
 
     # ==============================================================================
     # PART 6: MAIN FASTAPI ENDPOINT & PIPELINE EXECUTION
-    # Purpose: Receive n8n payload, map timeline inputs to samplers, and run graphs.
     # ==============================================================================
     @modal.fastapi_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
@@ -352,21 +342,16 @@ class LTXVLoadConditioning:
             elif "body" in body: 
                 body = body["body"]
 
-        # ----------------------------------------------------------------------
-        # WRAP PIPELINE IN ASYNC FUNCTION FOR BACKGROUND EXECUTION
-        # ----------------------------------------------------------------------
         async def process_pipeline():
             incoming_image_urls = body.get("image_url")
             
-            # DEFAULT LENGTH IS 49. IF BASE IS 49, UPSCALED FINAL FRAME COUNT WILL BE 97.
             requested_length = int(body.get("length", 49))
-            final_upscaled_length = (requested_length * 2) - 1  # 49 -> 97 frames formula
+            final_upscaled_length = (requested_length * 2) - 1 
             
             prompts_dict = body.get("prompts", {})
             negative_prompt = body.get("negative", "worst quality, blurry, low resolution, artifacts, watermarks")
             date_folder = body.get("date_folder", time.strftime('%Y-%m-%d'))
             
-            # GENERATE RANDOM SEED TO INJECT INTO THE GENERATOR NODES
             random_seed = random.randint(1, 1125899906842624)
             print(f"🎲 Generated Random Seed for workflow run: {random_seed}")
 
@@ -402,7 +387,6 @@ class LTXVLoadConditioning:
 
             image_filenames = []
             if not urls_to_download:
-                # RESOLUTION: 320x416
                 fallback_path = os.path.join(dynamic_guides_dir, "guide_0000.png")
                 from PIL import Image
                 img = Image.new('RGB', (320, 416), color='black')
@@ -428,7 +412,6 @@ class LTXVLoadConditioning:
                     
                     if not os.path.exists(target_dest):
                         from PIL import Image
-                        # RESOLUTION: 320x416
                         img = Image.new('RGB', (320, 416), color='black')
                         img.save(target_dest)
 
@@ -483,7 +466,6 @@ class LTXVLoadConditioning:
                         sg1["246"]["inputs"]["length"] = requested_length
                         sg1["246"]["widgets_values"] = [prompts_timeline_str]
 
-                    # APPLY N8N OVERRIDE AT THE VERY END SO IT TAKES FINAL PRIORITY
                     sg1 = self.merge_overrides(sg1, body.get("subgraph_1_override"))
 
                     print("🚀 Executing Sub-Graph 1 (Text Conditioning)...")
@@ -491,7 +473,7 @@ class LTXVLoadConditioning:
                     await self.clear_comfy_memory(session)
 
                     # ==============================================================================
-                    # SUB-GRAPH 2: DISTILLED SETTINGS (12 STEPS & 12 FPS SETUP & 320x416)
+                    # SUB-GRAPH 2: DISTILLED SETTINGS (320x416 HARDCODED & FIXED LOOPING BUGS)
                     # ==============================================================================
                     sg2_raw = body.get("subgraph_2")
                     if sg2_raw:
@@ -502,7 +484,6 @@ class LTXVLoadConditioning:
 
                     if "194" in sg2:
                         if "inputs" not in sg2["194"]: sg2["194"]["inputs"] = {}
-                        # RESOLUTION: 320x416
                         sg2["194"]["inputs"]["width"] = 320
                         sg2["194"]["inputs"]["height"] = 416
                         sg2["194"]["inputs"]["length"] = requested_length
@@ -510,7 +491,6 @@ class LTXVLoadConditioning:
                     if "319" in sg2:
                         if "inputs" not in sg2["319"]: sg2["319"]["inputs"] = {}
                         sg2["319"]["inputs"]["image_paths"] = "\n".join(image_filenames)
-                        # RESOLUTION: 320x416
                         sg2["319"]["inputs"]["width"] = 320
                         sg2["319"]["inputs"]["height"] = 416
 
@@ -518,7 +498,6 @@ class LTXVLoadConditioning:
                         num_imgs = len(image_filenames)
                         if "inputs" not in sg2["318"]: sg2["318"]["inputs"] = {}
                         sg2["318"]["inputs"]["num_images"] = num_imgs
-                        # FORCE 12 FPS BASE GENERATION FOR UPSAMPLER TO DOUBLE LATER
                         sg2["318"]["inputs"]["frame_rate"] = 12
 
                     if "238" in sg2:
@@ -544,51 +523,41 @@ class LTXVLoadConditioning:
                         
                     if "249" in sg2: 
                         if "inputs" not in sg2["249"]: sg2["249"]["inputs"] = {}
-                        # 12 STEPS
                         sg2["249"]["inputs"]["steps"] = 12
 
-                    # INJECT RANDOM SEED INTO NOISE GENERATOR
                     if "243" in sg2:
                         if "inputs" not in sg2["243"]: sg2["243"]["inputs"] = {}
                         sg2["243"]["inputs"]["noise_seed"] = random_seed
 
-                    # ==============================================================================
-                    # OOM FIX LOGIC: Force tighter parameters to block User's JSON memory spikes
-                    # ==============================================================================
                     if "312" in sg2:
                         if "inputs" not in sg2["312"]: sg2["312"]["inputs"] = {}
                         sg2["312"]["inputs"]["temporal_tile_size"] = 64
-                        # MUST BE AT LEAST 16 based on ComfyUI Custom Node bounds!
                         sg2["312"]["inputs"]["temporal_overlap"] = 16
-                        # FIX: Block Spatial Tiling overhead in Looping Sampler
                         sg2["312"]["inputs"]["horizontal_tiles"] = 1
                         sg2["312"]["inputs"]["vertical_tiles"] = 1
 
                     if "252" in sg2:
                         if "inputs" not in sg2["252"]: sg2["252"]["inputs"] = {}
-                        # Block Feedforward overhead
                         sg2["252"]["inputs"]["chunks"] = 4
                         
                     if "313" in sg2:
                         if "inputs" not in sg2["313"]: sg2["313"]["inputs"] = {}
-                        # FIX: Block APG (Adaptive Prompt Guidance) which doubles memory pass
                         sg2["313"]["inputs"]["apply_apg"] = False
                         
                     if "315" in sg2:
                         if "inputs" not in sg2["315"]: sg2["315"]["inputs"] = {}
-                        # Sync preset with the Distilled target unet
                         sg2["315"]["inputs"]["preset"] = "13b Distilled"
                         
                     if "317" in sg2:
                         if "inputs" not in sg2["317"]: sg2["317"]["inputs"] = {}
-                        # FIX: Prevent infinite overlapping loops (Overlap must be < Tile Size)
-                        sg2["317"]["inputs"]["tile_overlap"] = 64
+                        # OOM / INFINITE LOOP FIX: If tile overlap == tile size (64), it will infinitely loop and memory crash!
+                        # Safely reduced to 16.
+                        sg2["317"]["inputs"]["tile_overlap"] = 16
 
                     if "311" in sg2:
                         if "inputs" not in sg2["311"]: sg2["311"]["inputs"] = {}
                         sg2["311"]["inputs"]["filename_prefix"] = "video_latent_output"
 
-                    # APPLY N8N OVERRIDE AT THE VERY END SO IT TAKES FINAL PRIORITY
                     sg2 = self.merge_overrides(sg2, body.get("subgraph_2_override"))
 
                     print(f"🚀 Executing Sub-Graph 2 (Main Video Gen: {requested_length} frames @ 320x416)...")
@@ -606,7 +575,7 @@ class LTXVLoadConditioning:
                         shutil.copy(os.path.join(out_dir, latest_latent), "/workspace/ComfyUI/input/video_latent_output.latent")
 
                     # ==============================================================================
-                    # SUB-GRAPH 3: UPSCALER (12 -> 24 FPS), COLOR CORRECT, AUDIO & SYNC
+                    # SUB-GRAPH 3: UPSCALER & MEMORY PATCHED DECODING
                     # ==============================================================================
                     sg3_raw = body.get("subgraph_3")
                     if sg3_raw:
@@ -617,7 +586,6 @@ class LTXVLoadConditioning:
 
                     if "313" in sg3:
                         if "inputs" not in sg3["313"]: sg3["313"]["inputs"] = {}
-                        # OOM FIX: Match feedforward chunk optimizations
                         sg3["313"]["inputs"]["chunks"] = 4
 
                     if "232" in sg3: 
@@ -647,27 +615,23 @@ class LTXVLoadConditioning:
                     
                     if "290" in sg3: 
                         if "inputs" not in sg3["290"]: sg3["290"]["inputs"] = {}
-                        # SYNC AUDIO FRAME COUNT WITH THE NEW UPSCALED VIDEO LENGTH
                         sg3["290"]["inputs"]["frames_number"] = final_upscaled_length
-                        # SET AUDIO FPS TO 24
                         sg3["290"]["inputs"]["frame_rate"] = 24
 
-                    # INJECT RANDOM SEED INTO NOISE GENERATOR
                     if "293" in sg3:
                         if "inputs" not in sg3["293"]: sg3["293"]["inputs"] = {}
                         sg3["293"]["inputs"]["noise_seed"] = random_seed
 
                     if "315" in sg3:
                         if "inputs" not in sg3["315"]: sg3["315"]["inputs"] = {}
-                        # 12 STEPS
                         sg3["315"]["inputs"]["steps"] = 12
 
                     if "307" in sg3:
                         if "inputs" not in sg3["307"]: sg3["307"]["inputs"] = {}
-                        # OOM FIX: Tighten VAE Decode spatial/temporal tile overlaps
-                        sg3["307"]["inputs"]["temporal_tile_length"] = 16
-                        sg3["307"]["inputs"]["spatial_tiles"] = 4
-                        sg3["307"]["inputs"]["temporal_overlap"] = 4
+                        # OOM FIX: Safely reduced temporal chunks and increased spatial slices to minimize peak VRAM spikes
+                        sg3["307"]["inputs"]["temporal_tile_length"] = 8
+                        sg3["307"]["inputs"]["spatial_tiles"] = 6
+                        sg3["307"]["inputs"]["temporal_overlap"] = 2
 
                     if "407" in sg3:
                         if "inputs" not in sg3["407"]: sg3["407"]["inputs"] = {}
@@ -676,10 +640,8 @@ class LTXVLoadConditioning:
                     if "306" in sg3:
                         if "inputs" not in sg3["306"]: sg3["306"]["inputs"] = {}
                         sg3["306"]["inputs"]["format"] = "video/h264-mp4"
-                        # COMBINE EVERYTHING AT FINAL 24 FPS
                         sg3["306"]["inputs"]["frame_rate"] = 24  
 
-                    # APPLY N8N OVERRIDE AT THE VERY END SO IT TAKES FINAL PRIORITY
                     sg3 = self.merge_overrides(sg3, body.get("subgraph_3_override"))
 
                     print(f"🚀 Executing Sub-Graph 3 (Upscaling {requested_length} -> {final_upscaled_length} frames @ 24fps)...")
@@ -705,9 +667,9 @@ class LTXVLoadConditioning:
                     await asyncio.get_event_loop().run_in_executor(
                         None, 
                         self.s3.upload_file, 
-                        target_video_file,                      # 1st param: Local file path
-                        "video-asset-files-storage-workflow",   # 2nd param: Bucket name
-                        target_key                              # 3rd param: S3 object key
+                        target_video_file,                      
+                        "video-asset-files-storage-workflow",   
+                        target_key                              
                     )
 
                     public_path_url = f"https://pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev/{target_key}" 
@@ -727,15 +689,12 @@ class LTXVLoadConditioning:
 
         # ==========================================================================
         # PART 7: STREAM RESPONSE TO BYPASS CLOUD TIMEOUTS
-        # Purpose: Keep FastAPI connection alive while GPU processes graph chunks.
         # ==========================================================================
         async def stream_response():
-            # Start the heavy GPU task in the background
             task = asyncio.create_task(process_pipeline())
             
-            # Keep-alive loop: sends a space character every 10 seconds until done
             while not task.done():
-                yield b" "  # Send whitespace character to prevent proxy/LB timeout drop
+                yield b" "  
                 done, pending = await asyncio.wait([task], timeout=10.0)
                 if task in done: 
                     break

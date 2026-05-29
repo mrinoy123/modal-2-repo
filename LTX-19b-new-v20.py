@@ -129,7 +129,6 @@ class LTXEngine:
         print("🔗 Running Atomic Model Folder Linker...")
         base_models_dir = "/workspace/ComfyUI/models"
         
-        # Added upscale_models to mapping for the LTX temporal latent upscaler
         dirs = ["unet", "vae", "clip", "text_encoders", "text_encoder", "checkpoints", "diffusion_models", "gguf", "loras", "upscale_models"]
         for d in dirs: 
             os.makedirs(os.path.join(base_models_dir, d), exist_ok=True)
@@ -158,13 +157,65 @@ class LTXEngine:
 
         saver_path = "/workspace/ComfyUI/custom_nodes/ComfyUI-LTXVideo/conditioning_saver.py"
         if os.path.exists(saver_path):
+            saver_script = """import torch
+import os
+import folder_paths
+
+class LTXVSaveConditioning:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"conditioning": ("CONDITIONING",)}, "optional": {"file_name": ("STRING", {"default": "conditioning.pt"}), "filename": ("STRING", {"default": "conditioning.pt"}), "dtype": ("STRING", {"default": "float16"})}}
+    RETURN_TYPES = ()
+    FUNCTION = "execute"
+    CATEGORY = "Lightricks/LTXVideo"
+    OUTPUT_NODE = True
+    def execute(self, conditioning, file_name="conditioning.pt", filename="conditioning.pt", dtype="float16"):
+        output_dir = folder_paths.get_output_directory()
+        fname = filename if filename != "conditioning.pt" else file_name
+        if not fname.endswith(".pt"): fname += ".pt"
+        torch.save(conditioning, os.path.join(output_dir, fname))
+        return ()"""
             with open(saver_path, "w") as f:
-                f.write('''import torch\nimport os\nimport folder_paths\nclass LTXVSaveConditioning:\n    @classmethod\n    def INPUT_TYPES(s):\n        return {"required": {"conditioning": ("CONDITIONING",)}, "optional": {"file_name": ("STRING", {"default": "conditioning.pt"}), "filename": ("STRING", {"default": "conditioning.pt"}), "dtype": ("STRING", {"default": "float16"})}}\n    RETURN_TYPES = ()\n    FUNCTION = "execute"\n    CATEGORY = "Lightricks/LTXVideo"\n    OUTPUT_NODE = True\n    def execute(self, conditioning, file_name="conditioning.pt", filename="conditioning.pt", dtype="float16"):\n        output_dir = folder_paths.get_output_directory()\n        fname = filename if filename != "conditioning.pt" else file_name\n        if not fname.endswith(".pt"): fname += ".pt"\n        torch.save(conditioning, os.path.join(output_dir, fname))\n        return ()''')
-                
+                f.write(saver_script)
+
         loader_path = "/workspace/ComfyUI/custom_nodes/ComfyUI-LTXVideo/conditioning_loader.py"
         if os.path.exists(loader_path):
+            loader_script = """import torch
+import os
+import folder_paths
+
+def flatten_cond(cond):
+    res = []
+    for c in cond:
+        if isinstance(c, list) and len(c) > 0 and isinstance(c[0], list):
+            res.extend(flatten_cond(c))
+        else:
+            res.append(c)
+    return res
+
+class LTXVLoadConditioning:
+    @classmethod
+    def INPUT_TYPES(s):
+        input_dir = folder_paths.get_output_directory()
+        files = [f for f in os.listdir(input_dir) if f.endswith(".pt") or f.endswith(".safetensors")] if os.path.exists(input_dir) else []
+        return {"required": {"file_name": (files + ["(POSITIVE)conditioning.pt", "(NEGATIVE)conditioning.pt"],)}, "optional": {"filename": ("STRING", {"default": ""}), "device": ("STRING", {"default": "cpu"})}}
+    RETURN_TYPES = ("CONDITIONING",)
+    FUNCTION = "execute"
+    CATEGORY = "Lightricks/LTXVideo"
+    def execute(self, file_name, filename="", device="cpu"):
+        input_dir = folder_paths.get_output_directory()
+        fname = filename if filename else file_name
+        if not fname.endswith(".pt"): fname += ".pt"
+        
+        conditioning = torch.load(os.path.join(input_dir, fname), weights_only=False)
+        
+        # NORMALIZING CONDITIONING TO PREVENT DENO/ICLORA INDEX ERROR
+        if isinstance(conditioning, list):
+            conditioning = flatten_cond(conditioning)
+            
+        return (conditioning,)"""
             with open(loader_path, "w") as f:
-                f.write('''import torch\nimport os\nimport folder_paths\nclass LTXVLoadConditioning:\n    @classmethod\n    def INPUT_TYPES(s):\n        input_dir = folder_paths.get_output_directory()\n        files = [f for f in os.listdir(input_dir) if f.endswith(".pt") or f.endswith(".safetensors")] if os.path.exists(input_dir) else []\n        return {"required": {"file_name": (files + ["(POSITIVE)conditioning.pt", "(NEGATIVE)conditioning.pt"],)}, "optional": {"filename": ("STRING", {"default": ""}), "device": ("STRING", {"default": "cpu"})}}\n    RETURN_TYPES = ("CONDITIONING",)\n    FUNCTION = "execute"\n    CATEGORY = "Lightricks/LTXVideo"\n    def execute(self, file_name, filename="", device="cpu"):\n        input_dir = folder_paths.get_output_directory()\n        fname = filename if filename else file_name\n        if not fname.endswith(".pt"): fname += ".pt"\n        conditioning = torch.load(os.path.join(input_dir, fname), weights_only=False)\n        return (conditioning,)''')
+                f.write(loader_script)
 
         print("🚀 Launching Hybrid-Memory LTX Server Engine with FP8 and SageAttention configurations...")
         os.makedirs("/tmp/comfy_swap", exist_ok=True)
@@ -252,13 +303,12 @@ class LTXEngine:
             except Exception: 
                 return base_graph
         for node_id, node_data in override_graph.items():
-            if node_id in base_graph:
-                if "inputs" in node_data and "inputs" in base_graph[node_id]:
-                    base_graph[node_id]["inputs"].update(node_data["inputs"])
-                else: 
-                    base_graph[node_id].update(node_data)
+            if str(node_id) in base_graph:
+                if "inputs" in node_data and "inputs" in base_graph[str(node_id)]:
+                    base_graph[str(node_id)]["inputs"].update(node_data["inputs"])
             else: 
-                base_graph[node_id] = node_data
+                if "class_type" in node_data:
+                    base_graph[str(node_id)] = node_data
         return base_graph
 
     # ==============================================================================
@@ -297,7 +347,6 @@ class LTXEngine:
             else:
                 prompts_timeline_str = str(prompts_dict).replace("\\n", "\n")
 
-            # Updated Model Definitions
             target_unet = "ltx-2-19b-distilled-fp8.safetensors"
             target_gemma = "gemma-3-12b-it-FP8.safetensors"
             target_connector = "ltx-2-19b-embeddings_connector_dev_bf16.safetensors"
@@ -322,7 +371,6 @@ class LTXEngine:
             if not urls_to_download:
                 fallback_path = os.path.join(dynamic_guides_dir, "guide_0000.png")
                 from PIL import Image
-                # ENFORCED RESOLUTION TO 384x480
                 img = Image.new('RGB', (384, 480), color='black')
                 img.save(fallback_path)
                 image_filenames = [fallback_path] 
@@ -418,25 +466,22 @@ class LTXEngine:
 
                     sg2 = self.merge_overrides(sg2, body.get("subgraph_2_override"))
 
-                    # ENFORCED RESOLUTION TO 384x480 & Update Length
                     if "194" in sg2:
                         if "inputs" not in sg2["194"]: sg2["194"]["inputs"] = {}
                         sg2["194"]["inputs"]["width"] = 384
                         sg2["194"]["inputs"]["height"] = 480
                         sg2["194"]["inputs"]["length"] = requested_length
 
-                    # Inject images directly into DenoMultiImageLoader
                     if "319" in sg2:
                         if "inputs" not in sg2["319"]: sg2["319"]["inputs"] = {}
                         sg2["319"]["inputs"]["image_paths"] = "\n".join(image_filenames)
                         sg2["319"]["inputs"]["width"] = 384
                         sg2["319"]["inputs"]["height"] = 480
 
-                    if "318" in sg2:  # DenoLTXSequencer
+                    if "318" in sg2:
                         num_imgs = len(image_filenames)
                         if "inputs" not in sg2["318"]: sg2["318"]["inputs"] = {}
                         sg2["318"]["inputs"]["num_images"] = num_imgs
-                        # Optional: Adjust dynamic frame mapping here if the node allows specific inputs for it
 
                     if "238" in sg2:
                         if "inputs" not in sg2["238"]: sg2["238"]["inputs"] = {}
@@ -456,7 +501,6 @@ class LTXEngine:
                         sg2["246"]["inputs"]["file_name"] = "(NEGATIVE)conditioning.pt"
                         
                     if "320" in sg2: 
-                        # LTXICLoRALoaderModelOnly
                         if "inputs" not in sg2["320"]: sg2["320"]["inputs"] = {}
                         sg2["320"]["inputs"]["lora_name"] = target_detailer_lora
                         
@@ -464,7 +508,6 @@ class LTXEngine:
                         if "inputs" not in sg2["249"]: sg2["249"]["inputs"] = {}
                         sg2["249"]["inputs"]["steps"] = 12
 
-                    # SET LTXVChunkFeedForward to 4 for SG2 to avoid OOM
                     if "252" in sg2:
                         if "inputs" not in sg2["252"]: sg2["252"]["inputs"] = {}
                         sg2["252"]["inputs"]["chunks"] = 4
@@ -495,7 +538,6 @@ class LTXEngine:
 
                     sg3 = self.merge_overrides(sg3, body.get("subgraph_3_override"))
 
-                    # SET LTXVChunkFeedForward to 4 for SG3 to avoid OOM
                     if "313" in sg3:
                         if "inputs" not in sg3["313"]: sg3["313"]["inputs"] = {}
                         sg3["313"]["inputs"]["chunks"] = 4
@@ -529,16 +571,14 @@ class LTXEngine:
                         if "inputs" not in sg3["290"]: sg3["290"]["inputs"] = {}
                         sg3["290"]["inputs"]["frames_number"] = requested_length
 
-                    # NEW: LowVRAMLatentUpscaleModelLoader logic
                     if "407" in sg3:
                         if "inputs" not in sg3["407"]: sg3["407"]["inputs"] = {}
                         sg3["407"]["inputs"]["model_name"] = target_upscaler
 
-                    # Update VHS_VideoCombine frame rate logic 
                     if "306" in sg3:
                         if "inputs" not in sg3["306"]: sg3["306"]["inputs"] = {}
                         sg3["306"]["inputs"]["format"] = "video/h264-mp4"
-                        sg3["306"]["inputs"]["frame_rate"] = 24  # Force to 24fps as the temporal latent upscaler doubles frames
+                        sg3["306"]["inputs"]["frame_rate"] = 24  
 
                     print("🚀 Executing Sub-Graph 3 (Upscaling, Color Correction, Audio, & Combining)...")
                     await self.execute_comfy_workflow(session, sg3)

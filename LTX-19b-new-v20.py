@@ -379,7 +379,6 @@ class LTXVLoadConditioning:
             else:
                 prompts_timeline_str = str(prompts_dict).replace("\\n", "\n")
 
-            # REVERTED TO DISTILLED MODEL
             target_unet = "ltx-2-19b-distilled-fp8.safetensors"
             target_gemma = "gemma-3-12b-it-FP8.safetensors"
             target_connector = "ltx-2-19b-embeddings_connector_dev_bf16.safetensors"
@@ -402,9 +401,10 @@ class LTXVLoadConditioning:
 
             image_filenames = []
             if not urls_to_download:
+                # CHANGED RESOLUTION: 576x704
                 fallback_path = os.path.join(dynamic_guides_dir, "guide_0000.png")
                 from PIL import Image
-                img = Image.new('RGB', (384, 480), color='black')
+                img = Image.new('RGB', (576, 704), color='black')
                 img.save(fallback_path)
                 image_filenames = [fallback_path] 
             else:
@@ -427,7 +427,8 @@ class LTXVLoadConditioning:
                     
                     if not os.path.exists(target_dest):
                         from PIL import Image
-                        img = Image.new('RGB', (384, 480), color='black')
+                        # CHANGED RESOLUTION: 576x704
+                        img = Image.new('RGB', (576, 704), color='black')
                         img.save(target_dest)
 
                 async with aiohttp.ClientSession() as download_session:
@@ -489,7 +490,7 @@ class LTXVLoadConditioning:
                     await self.clear_comfy_memory(session)
 
                     # ==============================================================================
-                    # SUB-GRAPH 2: DISTILLED SETTINGS (25 STEPS & 12 FPS SETUP)
+                    # SUB-GRAPH 2: DISTILLED SETTINGS (15 STEPS & 12 FPS SETUP & 576x704)
                     # ==============================================================================
                     sg2_raw = body.get("subgraph_2")
                     if sg2_raw:
@@ -500,15 +501,17 @@ class LTXVLoadConditioning:
 
                     if "194" in sg2:
                         if "inputs" not in sg2["194"]: sg2["194"]["inputs"] = {}
-                        sg2["194"]["inputs"]["width"] = 384
-                        sg2["194"]["inputs"]["height"] = 480
+                        # CHANGED RESOLUTION: 576x704
+                        sg2["194"]["inputs"]["width"] = 576
+                        sg2["194"]["inputs"]["height"] = 704
                         sg2["194"]["inputs"]["length"] = requested_length
 
                     if "319" in sg2:
                         if "inputs" not in sg2["319"]: sg2["319"]["inputs"] = {}
                         sg2["319"]["inputs"]["image_paths"] = "\n".join(image_filenames)
-                        sg2["319"]["inputs"]["width"] = 384
-                        sg2["319"]["inputs"]["height"] = 480
+                        # CHANGED RESOLUTION: 576x704
+                        sg2["319"]["inputs"]["width"] = 576
+                        sg2["319"]["inputs"]["height"] = 704
 
                     if "318" in sg2:
                         num_imgs = len(image_filenames)
@@ -540,8 +543,8 @@ class LTXVLoadConditioning:
                         
                     if "249" in sg2: 
                         if "inputs" not in sg2["249"]: sg2["249"]["inputs"] = {}
-                        # INCREASED TO 25 STEPS FOR DISTILLED
-                        sg2["249"]["inputs"]["steps"] = 25 
+                        # CHANGED: Reverted to 15 STEPS
+                        sg2["249"]["inputs"]["steps"] = 15
 
                     # INJECT RANDOM SEED INTO NOISE GENERATOR
                     if "243" in sg2:
@@ -559,7 +562,7 @@ class LTXVLoadConditioning:
                     # APPLY N8N OVERRIDE AT THE VERY END SO IT TAKES FINAL PRIORITY
                     sg2 = self.merge_overrides(sg2, body.get("subgraph_2_override"))
 
-                    print("🚀 Executing Sub-Graph 2 (Main Video Generation)...")
+                    print(f"🚀 Executing Sub-Graph 2 (Main Video Gen: {requested_length} frames @ 576x704)...")
                     await self.execute_comfy_workflow(session, sg2)
                     await self.clear_comfy_memory(session)
 
@@ -624,10 +627,10 @@ class LTXVLoadConditioning:
                         if "inputs" not in sg3["293"]: sg3["293"]["inputs"] = {}
                         sg3["293"]["inputs"]["noise_seed"] = random_seed
 
-                    # ENSURE STEPS ARE ALSO SET TO 25 IN SG3 FOR DISTILLED MODEL REFINEMENT
                     if "315" in sg3:
                         if "inputs" not in sg3["315"]: sg3["315"]["inputs"] = {}
-                        sg3["315"]["inputs"]["steps"] = 25
+                        # CHANGED: Reverted to 15 STEPS
+                        sg3["315"]["inputs"]["steps"] = 15
 
                     if "407" in sg3:
                         if "inputs" not in sg3["407"]: sg3["407"]["inputs"] = {}

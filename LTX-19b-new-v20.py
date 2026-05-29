@@ -98,7 +98,7 @@ app = modal.App("media-worker")
 weights_volume = modal.Volume.from_name("ltx-new-version20-weights", create_if_missing=False)
 
 @app.cls(
-    gpu="L4",
+    gpu="L40S",
     image=final_image,
     volumes={"/mnt/weights": weights_volume},
     secrets=[modal.Secret.from_name("custom-secret")],

@@ -28,7 +28,7 @@ base_image = modal.Image.from_registry(
     "git", "wget", "ffmpeg", "libgl1", "libglib2.0-0",
     "build-essential", "ninja-build", "cmake", "clang", "llvm"
 ).env({
-    "FORCE_REBUILD_INDEX": "142"
+    "FORCE_REBUILD_INDEX": "143"
 })
 
 # ==============================================================================
@@ -102,7 +102,7 @@ weights_volume = modal.Volume.from_name("ltx-new-version20-weights", create_if_m
     image=final_image,
     volumes={"/mnt/weights": weights_volume},
     secrets=[modal.Secret.from_name("custom-secret")],
-    memory=8192,  # CRITICAL OOM FIX: Replaced 8GB (8192) with 32GB (32768). Stops Linux OS from killing the process when loading 19GB+ 19B UNets.
+    memory=8192,  # RESTORED TO MAX 8GB RAM AS REQUESTED
     scaledown_window=30,
     timeout=3600
 )
@@ -243,7 +243,7 @@ class LTXVLoadConditioning:
         env_vars["HF_HUB_OFFLOAD_DIR"] = "/tmp/hf_offload"
         env_vars["PYTHONWARNINGS"] = "ignore"
         
-        # OOM FIX: Safely removed '--normalvram'. With 32GB RAM established above, ComfyUI can now automatically swap the 19B model into CPU RAM when VRAM gets tight.
+        # Kept strictly normal loading (no --reserve-vram or --lowvram args) relying on --mmap-torch-files to respect 8GB RAM
         self.process = subprocess.Popen([
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
             "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
@@ -267,7 +267,6 @@ class LTXVLoadConditioning:
 
     async def clear_comfy_memory(self, session):
         try:
-            # Pushes ComfyUI to completely unload the active graph blocks to make space for the next Subgraph.
             async with session.post("http://127.0.0.1:8188/free", json={"unload_models": True, "free_memory": True}) as r:
                 await r.read()
         except Exception:
@@ -554,15 +553,15 @@ class LTXVLoadConditioning:
                         sg2["319"]["inputs"]["height"] = 416
                         
                     if "312" in sg2 and "inputs" in sg2["312"]:
-                        # Slice 49 frames into 32-frame VRAM chunks to prevent attention/processing OOM
+                        # FIXED: Minimum Validation for temporal_overlap is 16.
                         sg2["312"]["inputs"]["temporal_tile_size"] = 32
-                        sg2["312"]["inputs"]["temporal_overlap"] = 8
+                        sg2["312"]["inputs"]["temporal_overlap"] = 16
                         sg2["312"]["inputs"]["horizontal_tiles"] = 1
                         sg2["312"]["inputs"]["vertical_tiles"] = 1
                         
                     if "252" in sg2 and "inputs" in sg2["252"]:
                         # Halve FeedForward VRAM usage
-                        sg2["252"]["inputs"]["chunks"] = 8
+                        sg2["252"]["inputs"]["chunks"] = 4
 
                     print(f"🚀 Executing Sub-Graph 2 (Main Video Gen: {requested_length} frames @ 320x416)...")
                     await self.execute_comfy_workflow(session, sg2)
@@ -640,16 +639,16 @@ class LTXVLoadConditioning:
                     
                     # --- HARDWARE OOM SAFETY LOCKS ---
                     if "313" in sg3 and "inputs" in sg3["313"]:
-                        sg3["313"]["inputs"]["chunks"] = 8
+                        sg3["313"]["inputs"]["chunks"] = 4
                     
                     if "307" in sg3 and "inputs" in sg3["307"]:
-                        # Safely process the massive 97-frame decode in micro-batches
+                        # Safely process the massive decode in micro-batches
                         sg3["307"]["inputs"]["temporal_tile_length"] = 8
-                        sg3["307"]["inputs"]["spatial_tiles"] = 4
                         sg3["307"]["inputs"]["temporal_overlap"] = 2
+                        sg3["307"]["inputs"]["spatial_tiles"] = 8
 
                     if "402" in sg3 and "inputs" in sg3["402"]:
-                        # Prevent 97-frame post-processing from destroying GPU VRAM right before finishing
+                        # Prevent post-processing from destroying GPU VRAM right before finishing
                         sg3["402"]["inputs"]["use_gpu"] = False
 
                     print(f"🚀 Executing Sub-Graph 3 (Upscaling {requested_length} -> {final_upscaled_length} frames @ 24fps)...")

@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "git", "wget", "ffmpeg", "libgl1", "libglib2.0-0",
     "build-essential", "ninja-build", "cmake", "clang", "llvm"
 ).env({
-    "FORCE_REBUILD_INDEX": "142"  # Bumped to ensure fresh deployment cache pulling fixes
+    "FORCE_REBUILD_INDEX": "140"  # Bumped to ensure fresh deployment cache pulling fixes
 })
 
 # ==============================================================================
@@ -246,8 +246,8 @@ class LTXVLoadConditioning:
         env_vars = os.environ.copy()
         env_vars["TORCH_NUM_THREADS"] = "1"
         env_vars["OMP_NUM_THREADS"] = "1"
-        # OOM FIX: Garbage collection threshold and split sizing actively prevents PyTorch memory fragmentation on the L4 GPU
-        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:128"
+        # OOM FIX: Reverted PyTorch Allocator bounds to allow massive contiguous memory blocks required by 19B LoRA patching
+        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
         env_vars["CUDA_MODULE_LOADING"] = "LAZY" 
         env_vars["MALLOC_TRIM_THRESHOLD_"] = "65536" 
         env_vars["HF_HUB_OFFLOAD_DIR"] = "/tmp/hf_offload"
@@ -256,7 +256,8 @@ class LTXVLoadConditioning:
         self.process = subprocess.Popen([
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
             "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
-            "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc"
+            "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc",
+            "--reserve-vram", "4.0"  # OOM FIX: Forces PyTorch to stage the LoRA addition in CPU RAM, preventing Model Load crashes
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)
         
         self.t = threading.Thread(target=self._log_reader, daemon=True)
@@ -401,7 +402,7 @@ class LTXVLoadConditioning:
 
             image_filenames = []
             if not urls_to_download:
-                # RESOLUTION: 320x416 to prevent OOM
+                # RESOLUTION: 320x416
                 fallback_path = os.path.join(dynamic_guides_dir, "guide_0000.png")
                 from PIL import Image
                 img = Image.new('RGB', (320, 416), color='black')
@@ -427,7 +428,7 @@ class LTXVLoadConditioning:
                     
                     if not os.path.exists(target_dest):
                         from PIL import Image
-                        # RESOLUTION: 320x416 to prevent OOM
+                        # RESOLUTION: 320x416
                         img = Image.new('RGB', (320, 416), color='black')
                         img.save(target_dest)
 

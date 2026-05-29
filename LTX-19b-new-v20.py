@@ -556,8 +556,8 @@ class LTXVLoadConditioning:
                     # ==============================================================================
                     if "312" in sg2:
                         if "inputs" not in sg2["312"]: sg2["312"]["inputs"] = {}
-                        sg2["312"]["inputs"]["temporal_tile_size"] = 32
-                        sg2["312"]["inputs"]["temporal_overlap"] = 8
+                        sg2["312"]["inputs"]["temporal_tile_size"] = 64
+                        sg2["312"]["inputs"]["temporal_overlap"] = 16
                         # FIX: Block Spatial Tiling overhead in Looping Sampler
                         sg2["312"]["inputs"]["horizontal_tiles"] = 1
                         sg2["312"]["inputs"]["vertical_tiles"] = 1

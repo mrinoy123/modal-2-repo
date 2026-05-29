@@ -13,13 +13,13 @@ import aiohttp
 import urllib.request
 import asyncio
 import ctypes
-import random
 from fastapi import Request, Response, HTTPException, Header
 from fastapi.responses import StreamingResponse
 from typing import Optional
 
 # ==============================================================================
 # PART 2: BASE IMAGE & OS CONFIGURATION
+# Purpose: Establish the foundational Ubuntu/CUDA image and install system packages.
 # ==============================================================================
 base_image = modal.Image.from_registry(
     "nvidia/cuda:12.5.1-devel-ubuntu24.04",
@@ -28,11 +28,12 @@ base_image = modal.Image.from_registry(
     "git", "wget", "ffmpeg", "libgl1", "libglib2.0-0",
     "build-essential", "ninja-build", "cmake", "clang", "llvm"
 ).env({
-    "FORCE_REBUILD_INDEX": "143"
+    "FORCE_REBUILD_INDEX": "130"  # Bumped to ensure fresh deployment cache
 })
 
 # ==============================================================================
 # PART 3: CORE PYTHON DEPENDENCIES & ENVIRONMENT VARIABLES
+# Purpose: Inject optimal compiler paths and install PyTorch/Triton basics.
 # ==============================================================================
 build_image = base_image.env({
     "CUDA_HOME": "/usr/local/cuda",
@@ -49,6 +50,7 @@ build_image = base_image.env({
 
 # ==============================================================================
 # PART 4: COMFYUI & CUSTOM NODES CLONING + DEPENDENCY ISOLATION
+# Purpose: Clone strictly required node repos. Unnecessary extensions have been purged.
 # ==============================================================================
 torch_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124",
@@ -65,8 +67,7 @@ clone_image = torch_image.run_commands(
     "git clone --depth 1 https://github.com/Deno2026/comfyui-deno-custom-nodes.git /workspace/ComfyUI/custom_nodes/comfyui-deno-custom-nodes",
     "git clone --depth 1 https://github.com/cubiq/ComfyUI_essentials.git /workspace/ComfyUI/custom_nodes/ComfyUI_essentials",
     "git clone --depth 1 https://github.com/IvanRybakov/comfyui-node-int-to-string-convertor.git /workspace/ComfyUI/custom_nodes/comfyui-node-int-to-string-convertor",
-    "git clone --depth 1 https://github.com/siraxe/ComfyUI-LTX-FDG.git /workspace/ComfyUI/custom_nodes/ComfyUI-LTX-FDG",
-    "git clone --depth 1 https://github.com/regiellis/ComfyUI-EasyColorCorrector.git /workspace/ComfyUI/custom_nodes/ComfyUI-EasyColorCorrector"
+    "git clone --depth 1 https://github.com/siraxe/ComfyUI-LTX-FDG.git /workspace/ComfyUI/custom_nodes/ComfyUI-LTX-FDG"
 )
 
 deps_image = clone_image.run_commands(
@@ -81,8 +82,6 @@ final_image = deps_image.run_commands(
     "echo '' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     "echo 'sageattn_qk_int8_pv_fp16_triton = sageattn' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     "python3 -c \"filepath = '/workspace/ComfyUI/comfy/sampler_helpers.py'; code = open(filepath).read(); replacement = 'def convert_cond(cond):\\n    def flatten(x):\\n        res = []\\n        for c in x:\\n            if isinstance(c, list) and len(c) > 0 and isinstance(c[0], list): res.extend(flatten(c))\\n            else: res.append(c)\\n        return res\\n    if isinstance(cond, list): cond = flatten(cond)\\n'; code = code.replace('def convert_cond(cond):', replacement); open(filepath, 'w').write(code)\"",
-    "sed -i \"s/@torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)/@torch.amp.custom_fwd(device_type='cuda', cast_inputs=torch.float32)/g\" /usr/local/lib/python3.12/site-packages/kornia/feature/lightglue.py",
-    
     env={
         "CUDA_HOME": "/usr/local/cuda",
         "PATH": "/usr/local/cuda/bin:" + os.environ.get("PATH", ""),
@@ -92,17 +91,18 @@ final_image = deps_image.run_commands(
 )
 
 # ==============================================================================
-# PART 5: MODAL APP CONFIGURATION
+# PART 5: MODAL APP CONFIGURATION & CLOUD VOLUMES
+# Purpose: Tie the environment to Modal architecture with auto-scaling limits.
 # ==============================================================================
 app = modal.App("media-worker")
 weights_volume = modal.Volume.from_name("ltx-new-version20-weights", create_if_missing=False)
 
 @app.cls(
-    gpu="L40S",
+    gpu="L4",
     image=final_image,
     volumes={"/mnt/weights": weights_volume},
     secrets=[modal.Secret.from_name("custom-secret")],
-    memory=8192,  # RESTORED TO MAX 8GB RAM AS REQUESTED
+    memory=8192,
     scaledown_window=30,
     timeout=3600
 )
@@ -128,24 +128,9 @@ class LTXEngine:
         print("🔗 Running Atomic Model Folder Linker...")
         base_models_dir = "/workspace/ComfyUI/models"
         
-        dirs = ["unet", "vae", "clip", "text_encoders", "text_encoder", "checkpoints", "diffusion_models", "gguf", "loras", "upscale_models", "latent_upscale_models"]
+        dirs = ["unet", "vae", "clip", "text_encoders", "text_encoder", "checkpoints", "diffusion_models", "gguf", "loras"]
         for d in dirs: 
             os.makedirs(os.path.join(base_models_dir, d), exist_ok=True)
-
-        yaml_config = """modal_weights:
-    base_path: /mnt/weights
-    checkpoints: canonical_storage
-    upscale_models: canonical_storage
-    latent_upscale_models: canonical_storage
-    unet: canonical_storage
-    loras: canonical_storage
-    vae: canonical_storage
-    clip: canonical_storage
-    text_encoders: canonical_storage
-    diffusion_models: canonical_storage
-"""
-        with open("/workspace/ComfyUI/extra_model_paths.yaml", "w") as f:
-            f.write(yaml_config)
 
         if os.path.exists("/mnt/weights"):
             for root_dir, _, files in os.walk("/mnt/weights"):
@@ -153,7 +138,7 @@ class LTXEngine:
                     if not filename.endswith((".safetensors", ".gguf", ".pth", ".pt", ".bin")): 
                         continue
                     src_path = os.path.join(root_dir, filename)
-                    for target_dir in dirs:
+                    for target_dir in ["unet", "vae", "clip", "text_encoders", "text_encoder", "checkpoints", "diffusion_models", "loras"]:
                         dest = os.path.join(base_models_dir, target_dir, filename)
                         if not os.path.exists(dest):
                             try: 
@@ -171,64 +156,13 @@ class LTXEngine:
 
         saver_path = "/workspace/ComfyUI/custom_nodes/ComfyUI-LTXVideo/conditioning_saver.py"
         if os.path.exists(saver_path):
-            saver_script = """import torch
-import os
-import folder_paths
-
-class LTXVSaveConditioning:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {"required": {"conditioning": ("CONDITIONING",)}, "optional": {"file_name": ("STRING", {"default": "conditioning.pt"}), "filename": ("STRING", {"default": "conditioning.pt"}), "dtype": ("STRING", {"default": "float16"})}}
-    RETURN_TYPES = ()
-    FUNCTION = "execute"
-    CATEGORY = "Lightricks/LTXVideo"
-    OUTPUT_NODE = True
-    def execute(self, conditioning, file_name="conditioning.pt", filename="conditioning.pt", dtype="float16"):
-        output_dir = folder_paths.get_output_directory()
-        fname = filename if filename != "conditioning.pt" else file_name
-        if not fname.endswith(".pt"): fname += ".pt"
-        torch.save(conditioning, os.path.join(output_dir, fname))
-        return ()"""
             with open(saver_path, "w") as f:
-                f.write(saver_script)
-
+                f.write('''import torch\nimport os\nimport folder_paths\nclass LTXVSaveConditioning:\n    @classmethod\n    def INPUT_TYPES(s):\n        return {"required": {"conditioning": ("CONDITIONING",)}, "optional": {"file_name": ("STRING", {"default": "conditioning.pt"}), "filename": ("STRING", {"default": "conditioning.pt"}), "dtype": ("STRING", {"default": "float16"})}}\n    RETURN_TYPES = ()\n    FUNCTION = "execute"\n    CATEGORY = "Lightricks/LTXVideo"\n    OUTPUT_NODE = True\n    def execute(self, conditioning, file_name="conditioning.pt", filename="conditioning.pt", dtype="float16"):\n        output_dir = folder_paths.get_output_directory()\n        fname = filename if filename != "conditioning.pt" else file_name\n        if not fname.endswith(".pt"): fname += ".pt"\n        torch.save(conditioning, os.path.join(output_dir, fname))\n        return ()''')
+                
         loader_path = "/workspace/ComfyUI/custom_nodes/ComfyUI-LTXVideo/conditioning_loader.py"
         if os.path.exists(loader_path):
-            loader_script = """import torch
-import os
-import folder_paths
-
-def flatten_cond(cond):
-    res = []
-    for c in cond:
-        if isinstance(c, list) and len(c) > 0 and isinstance(c[0], list):
-            res.extend(flatten_cond(c))
-        else:
-            res.append(c)
-    return res
-
-class LTXVLoadConditioning:
-    @classmethod
-    def INPUT_TYPES(s):
-        input_dir = folder_paths.get_output_directory()
-        files = [f for f in os.listdir(input_dir) if f.endswith(".pt") or f.endswith(".safetensors")] if os.path.exists(input_dir) else []
-        return {"required": {"file_name": (files + ["(POSITIVE)conditioning.pt", "(NEGATIVE)conditioning.pt"],)}, "optional": {"filename": ("STRING", {"default": ""}), "device": ("STRING", {"default": "cpu"})}}
-    RETURN_TYPES = ("CONDITIONING",)
-    FUNCTION = "execute"
-    CATEGORY = "Lightricks/LTXVideo"
-    def execute(self, file_name, filename="", device="cpu"):
-        input_dir = folder_paths.get_output_directory()
-        fname = filename if filename else file_name
-        if not fname.endswith(".pt"): fname += ".pt"
-        
-        conditioning = torch.load(os.path.join(input_dir, fname), weights_only=False)
-        
-        if isinstance(conditioning, list):
-            conditioning = flatten_cond(conditioning)
-            
-        return (conditioning,)"""
             with open(loader_path, "w") as f:
-                f.write(loader_script)
+                f.write('''import torch\nimport os\nimport folder_paths\nclass LTXVLoadConditioning:\n    @classmethod\n    def INPUT_TYPES(s):\n        input_dir = folder_paths.get_output_directory()\n        files = [f for f in os.listdir(input_dir) if f.endswith(".pt") or f.endswith(".safetensors")] if os.path.exists(input_dir) else []\n        return {"required": {"file_name": (files + ["(POSITIVE)conditioning.pt", "(NEGATIVE)conditioning.pt"],)}, "optional": {"filename": ("STRING", {"default": ""}), "device": ("STRING", {"default": "cpu"})}}\n    RETURN_TYPES = ("CONDITIONING",)\n    FUNCTION = "execute"\n    CATEGORY = "Lightricks/LTXVideo"\n    def execute(self, file_name, filename="", device="cpu"):\n        input_dir = folder_paths.get_output_directory()\n        fname = filename if filename else file_name\n        if not fname.endswith(".pt"): fname += ".pt"\n        conditioning = torch.load(os.path.join(input_dir, fname), weights_only=False)\n        return (conditioning,)''')
 
         print("🚀 Launching Hybrid-Memory LTX Server Engine with FP8 and SageAttention configurations...")
         os.makedirs("/tmp/comfy_swap", exist_ok=True)
@@ -241,13 +175,12 @@ class LTXVLoadConditioning:
         env_vars["CUDA_MODULE_LOADING"] = "LAZY" 
         env_vars["MALLOC_TRIM_THRESHOLD_"] = "65536" 
         env_vars["HF_HUB_OFFLOAD_DIR"] = "/tmp/hf_offload"
-        env_vars["PYTHONWARNINGS"] = "ignore"
         
-        # Kept strictly normal loading (no --reserve-vram or --lowvram args) relying on --mmap-torch-files to respect 8GB RAM
         self.process = subprocess.Popen([
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
             "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
             "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc"
+            
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)
         
         self.t = threading.Thread(target=self._log_reader, daemon=True)
@@ -318,16 +251,18 @@ class LTXVLoadConditioning:
             except Exception: 
                 return base_graph
         for node_id, node_data in override_graph.items():
-            if str(node_id) in base_graph:
-                if "inputs" in node_data and "inputs" in base_graph[str(node_id)]:
-                    base_graph[str(node_id)]["inputs"].update(node_data["inputs"])
+            if node_id in base_graph:
+                if "inputs" in node_data and "inputs" in base_graph[node_id]:
+                    base_graph[node_id]["inputs"].update(node_data["inputs"])
+                else: 
+                    base_graph[node_id].update(node_data)
             else: 
-                if "class_type" in node_data:
-                    base_graph[str(node_id)] = node_data
+                base_graph[node_id] = node_data
         return base_graph
 
     # ==============================================================================
     # PART 6: MAIN FASTAPI ENDPOINT & PIPELINE EXECUTION
+    # Purpose: Receive n8n payload, map timeline inputs to samplers, and run graphs.
     # ==============================================================================
     @modal.fastapi_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
@@ -341,18 +276,15 @@ class LTXVLoadConditioning:
             elif "body" in body: 
                 body = body["body"]
 
+        # ----------------------------------------------------------------------
+        # WRAP PIPELINE IN ASYNC FUNCTION FOR BACKGROUND EXECUTION
+        # ----------------------------------------------------------------------
         async def process_pipeline():
             incoming_image_urls = body.get("image_url")
-            
-            requested_length = int(body.get("length", 49))
-            final_upscaled_length = (requested_length * 2) - 1 
-            
+            requested_length = int(body.get("length", 73))
             prompts_dict = body.get("prompts", {})
             negative_prompt = body.get("negative", "worst quality, blurry, low resolution, artifacts, watermarks")
             date_folder = body.get("date_folder", time.strftime('%Y-%m-%d'))
-            
-            random_seed = random.randint(1, 1125899906842624)
-            print(f"🎲 Generated Random Seed for workflow run: {random_seed}")
 
             if isinstance(prompts_dict, dict):
                 try:
@@ -370,7 +302,6 @@ class LTXVLoadConditioning:
             target_video_vae = "ltx-2-19b-dev_video_vae.safetensors"
             target_audio_vae = "ltx-2-19b-dev_audio_vae.safetensors"
             target_detailer_lora = "ltx-2-19b-ic-lora-detailer.safetensors"
-            target_upscaler = "ltx-2-temporal-upscaler-x2-1.0.safetensors"
 
             dynamic_guides_dir = "/workspace/ComfyUI/input/dynamic_guides"
             if os.path.exists(dynamic_guides_dir): 
@@ -388,7 +319,8 @@ class LTXVLoadConditioning:
             if not urls_to_download:
                 fallback_path = os.path.join(dynamic_guides_dir, "guide_0000.png")
                 from PIL import Image
-                img = Image.new('RGB', (320, 416), color='black')
+                # ENFORCED RESOLUTION TO 384x480
+                img = Image.new('RGB', (384, 480), color='black')
                 img.save(fallback_path)
                 image_filenames = [fallback_path] 
             else:
@@ -411,7 +343,8 @@ class LTXVLoadConditioning:
                     
                     if not os.path.exists(target_dest):
                         from PIL import Image
-                        img = Image.new('RGB', (320, 416), color='black')
+                        # ENFORCED RESOLUTION TO 384x480
+                        img = Image.new('RGB', (384, 480), color='black')
                         img.save(target_dest)
 
                 async with aiohttp.ClientSession() as download_session:
@@ -438,6 +371,8 @@ class LTXVLoadConditioning:
                     else:
                         with open("comfyui-ltx-20-subgraph-1(api).json", "r") as f: 
                             sg1 = json.load(f)
+                    
+                    sg1 = self.merge_overrides(sg1, body.get("subgraph_1_override"))
 
                     if "243" in sg1:
                         if "inputs" not in sg1["243"]: sg1["243"]["inputs"] = {}
@@ -465,35 +400,60 @@ class LTXVLoadConditioning:
                         sg1["246"]["inputs"]["length"] = requested_length
                         sg1["246"]["widgets_values"] = [prompts_timeline_str]
 
-                    sg1 = self.merge_overrides(sg1, body.get("subgraph_1_override"))
-
                     print("🚀 Executing Sub-Graph 1 (Text Conditioning)...")
                     await self.execute_comfy_workflow(session, sg1)
                     await self.clear_comfy_memory(session)
 
                     # ==============================================================================
-                    # SUB-GRAPH 2: MAIN GEN (ENFORCED HARDWARE PROTECTIONS)
+                    # SUB-GRAPH 2: MAIN VIDEO GENERATION (SYNCHRONIZED WITH NEW API FILE)
                     # ==============================================================================
                     sg2_raw = body.get("subgraph_2")
                     if sg2_raw:
                         sg2 = json.loads(sg2_raw) if isinstance(sg2_raw, str) else sg2_raw
                     else:
-                        with open("comfyui-ltx-20-subgraph-2(api).json", "r") as f: 
+                        # TARGETING NEW WORKFLOW FILE:
+                        with open("new-test-comfyui-ltx-20-subgraph-2(api).json", "r") as f: 
                             sg2 = json.load(f)
 
+                    sg2 = self.merge_overrides(sg2, body.get("subgraph_2_override"))
+
+                    # ENFORCED RESOLUTION TO 384x480
                     if "194" in sg2:
                         if "inputs" not in sg2["194"]: sg2["194"]["inputs"] = {}
+                        sg2["194"]["inputs"]["width"] = 384
+                        sg2["194"]["inputs"]["height"] = 480
                         sg2["194"]["inputs"]["length"] = requested_length
+                        if "widgets_values" in sg2["194"] and len(sg2["194"]["widgets_values"]) > 2:
+                            sg2["194"]["widgets_values"][0] = 384                 
+                            sg2["194"]["widgets_values"][1] = 480                 
+                            sg2["194"]["widgets_values"][2] = requested_length    
 
-                    if "319" in sg2:
-                        if "inputs" not in sg2["319"]: sg2["319"]["inputs"] = {}
-                        sg2["319"]["inputs"]["image_paths"] = "\n".join(image_filenames)
+                    # ENFORCED RESOLUTION TO 384x480
+                    if "237" in sg2: 
+                        if "inputs" not in sg2["237"]: sg2["237"]["inputs"] = {}
+                        sg2["237"]["inputs"]["directory"] = dynamic_guides_dir
+                        sg2["237"]["inputs"]["aspect_ratio"] = "4:5"
+                        sg2["237"]["inputs"]["width"] = 384
+                        sg2["237"]["inputs"]["height"] = 480
+                        if "widgets_values" in sg2["237"] and len(sg2["237"]["widgets_values"]) > 5:
+                            sg2["237"]["widgets_values"][2] = "4:5"                
+                            sg2["237"]["widgets_values"][4] = 384                  
+                            sg2["237"]["widgets_values"][5] = 480                  
 
-                    if "318" in sg2:
+                    # SET LTXVChunkFeedForward to 4 for SG2 to avoid OOM
+                    if "252" in sg2:
+                        if "inputs" not in sg2["252"]: sg2["252"]["inputs"] = {}
+                        sg2["252"]["inputs"]["chunk_size"] = 4
+                        if "widgets_values" in sg2["252"]:
+                            sg2["252"]["widgets_values"][0] = 4
+
+                    if "235" in sg2:
                         num_imgs = len(image_filenames)
-                        if "inputs" not in sg2["318"]: sg2["318"]["inputs"] = {}
-                        sg2["318"]["inputs"]["num_images"] = num_imgs
-                        sg2["318"]["inputs"]["frame_rate"] = 12
+                        if "inputs" not in sg2["235"]: sg2["235"]["inputs"] = {}
+                        sg2["235"]["inputs"]["num_images"] = num_imgs
+                        for i in range(num_imgs):
+                            if f"frame_{i}" not in sg2["235"]["inputs"]:
+                                sg2["235"]["inputs"][f"frame_{i}"] = 0 if num_imgs == 1 else int(i * (requested_length - 1) / (num_imgs - 1))
 
                     if "238" in sg2:
                         if "inputs" not in sg2["238"]: sg2["238"]["inputs"] = {}
@@ -512,65 +472,29 @@ class LTXVLoadConditioning:
                         if "inputs" not in sg2["246"]: sg2["246"]["inputs"] = {}
                         sg2["246"]["inputs"]["file_name"] = "(NEGATIVE)conditioning.pt"
                         
-                    if "320" in sg2: 
-                        if "inputs" not in sg2["320"]: sg2["320"]["inputs"] = {}
-                        sg2["320"]["inputs"]["lora_name"] = target_detailer_lora
+                    if "248" in sg2: 
+                        if "inputs" not in sg2["248"]: sg2["248"]["inputs"] = {}
+                        sg2["248"]["inputs"]["lora_name"] = target_detailer_lora
                         
                     if "249" in sg2: 
                         if "inputs" not in sg2["249"]: sg2["249"]["inputs"] = {}
-                        sg2["249"]["inputs"]["steps"] = 12
+                        # Letting the JSON dictate steps, but forcing sequence length syncing
+                        sg2["249"]["inputs"]["length"] = requested_length
+                        sg2["249"]["inputs"]["max_frames"] = requested_length
+                    
+                    if "233" in sg2:
+                        if "inputs" not in sg2["233"]: sg2["233"]["inputs"] = {}
+                        sg2["233"]["inputs"]["length"] = requested_length
+                        sg2["233"]["inputs"]["frames"] = requested_length
 
-                    if "243" in sg2:
-                        if "inputs" not in sg2["243"]: sg2["243"]["inputs"] = {}
-                        sg2["243"]["inputs"]["noise_seed"] = random_seed
-                        
-                    if "313" in sg2:
-                        if "inputs" not in sg2["313"]: sg2["313"]["inputs"] = {}
-                        sg2["313"]["inputs"]["apply_apg"] = False
-                        
-                    if "315" in sg2:
-                        if "inputs" not in sg2["315"]: sg2["315"]["inputs"] = {}
-                        sg2["315"]["inputs"]["preset"] = "13b Distilled"
-                        
-                    if "317" in sg2:
-                        if "inputs" not in sg2["317"]: sg2["317"]["inputs"] = {}
-                        sg2["317"]["inputs"]["tile_overlap"] = 16
-
-                    if "311" in sg2:
-                        if "inputs" not in sg2["311"]: sg2["311"]["inputs"] = {}
-                        sg2["311"]["inputs"]["filename_prefix"] = "video_latent_output"
-
-                    # APPLY N8N MERGE FIRST
-                    sg2 = self.merge_overrides(sg2, body.get("subgraph_2_override"))
-
-                    # --- HARDWARE OOM SAFETY LOCKS ---
-                    # Placed *after* the merge so even if n8n passes a bad config, the backend intercepts and protects the GPU.
-                    if "194" in sg2 and "inputs" in sg2["194"]:
-                        sg2["194"]["inputs"]["width"] = 320
-                        sg2["194"]["inputs"]["height"] = 416
-                    if "319" in sg2 and "inputs" in sg2["319"]:
-                        sg2["319"]["inputs"]["width"] = 320
-                        sg2["319"]["inputs"]["height"] = 416
-                        
-                    if "312" in sg2 and "inputs" in sg2["312"]:
-                        # FIXED: Minimum Validation for temporal_overlap is 16.
-                        sg2["312"]["inputs"]["temporal_tile_size"] = 32
-                        sg2["312"]["inputs"]["temporal_overlap"] = 16
-                        sg2["312"]["inputs"]["horizontal_tiles"] = 1
-                        sg2["312"]["inputs"]["vertical_tiles"] = 1
-                        
-                    if "252" in sg2 and "inputs" in sg2["252"]:
-                        # Halve FeedForward VRAM usage
-                        sg2["252"]["inputs"]["chunks"] = 4
-
-                    print(f"🚀 Executing Sub-Graph 2 (Main Video Gen: {requested_length} frames @ 320x416)...")
+                    print("🚀 Executing Sub-Graph 2 (Main Video Generation)...")
                     await self.execute_comfy_workflow(session, sg2)
                     await self.clear_comfy_memory(session)
 
                     # ==============================================================================
                     # COPY LATENT FOR SUBGRAPH 3
                     # ==============================================================================
-                    generated_latents = [f for f in os.listdir(out_dir) if "video_latent_output" in f and f.endswith(".latent")]
+                    generated_latents = [f for f in os.listdir(out_dir) if f.startswith("video_latent_output") and f.endswith(".latent")]
                     if generated_latents:
                         os.makedirs("/workspace/ComfyUI/input", exist_ok=True)
                         generated_latents.sort(key=lambda x: os.path.getmtime(os.path.join(out_dir, x)))
@@ -578,14 +502,24 @@ class LTXVLoadConditioning:
                         shutil.copy(os.path.join(out_dir, latest_latent), "/workspace/ComfyUI/input/video_latent_output.latent")
 
                     # ==============================================================================
-                    # SUB-GRAPH 3: UPSCALER (ENFORCED HARDWARE PROTECTIONS)
+                    # SUB-GRAPH 3: AUDIO DECODING & SYNCHRONIZED VHS COMBINE (NEW API FILE)
                     # ==============================================================================
                     sg3_raw = body.get("subgraph_3")
                     if sg3_raw:
                         sg3 = json.loads(sg3_raw) if isinstance(sg3_raw, str) else sg3_raw
                     else:
-                        with open("comfyui-ltx-20-Subgraph-3(api).json", "r") as f: 
+                        # TARGETING NEW WORKFLOW FILE:
+                        with open("new-test-comfyui-ltx-20-Subgraph-3(api).json", "r") as f: 
                             sg3 = json.load(f)
+
+                    sg3 = self.merge_overrides(sg3, body.get("subgraph_3_override"))
+
+                    # SET LTXVChunkFeedForward to 4 for SG3 to avoid OOM
+                    if "304" in sg3:
+                        if "inputs" not in sg3["304"]: sg3["304"]["inputs"] = {}
+                        sg3["304"]["inputs"]["chunk_size"] = 4
+                        if "widgets_values" in sg3["304"]:
+                            sg3["304"]["widgets_values"][0] = 4
 
                     if "232" in sg3: 
                         if "inputs" not in sg3["232"]: sg3["232"]["inputs"] = {}
@@ -607,6 +541,10 @@ class LTXVLoadConditioning:
                     if "295" in sg3: 
                         if "inputs" not in sg3["295"]: sg3["295"]["inputs"] = {}
                         sg3["295"]["inputs"]["ckpt_name"] = target_audio_vae
+                        
+                    if "296" in sg3: 
+                        if "inputs" not in sg3["296"]: sg3["296"]["inputs"] = {}
+                        sg3["296"]["inputs"]["vae_name"] = target_video_vae
 
                     if "410" in sg3: 
                         if "inputs" not in sg3["410"]: sg3["410"]["inputs"] = {}
@@ -614,44 +552,23 @@ class LTXVLoadConditioning:
                     
                     if "290" in sg3: 
                         if "inputs" not in sg3["290"]: sg3["290"]["inputs"] = {}
-                        sg3["290"]["inputs"]["frames_number"] = final_upscaled_length
-                        sg3["290"]["inputs"]["frame_rate"] = 24
-
-                    if "293" in sg3:
-                        if "inputs" not in sg3["293"]: sg3["293"]["inputs"] = {}
-                        sg3["293"]["inputs"]["noise_seed"] = random_seed
-
-                    if "315" in sg3:
-                        if "inputs" not in sg3["315"]: sg3["315"]["inputs"] = {}
-                        sg3["315"]["inputs"]["steps"] = 12
-
-                    if "407" in sg3:
-                        if "inputs" not in sg3["407"]: sg3["407"]["inputs"] = {}
-                        sg3["407"]["inputs"]["model_name"] = target_upscaler
-
+                        sg3["290"]["inputs"]["frames_number"] = requested_length
+                    
+                    if "298" in sg3:
+                        if "inputs" not in sg3["298"]: sg3["298"]["inputs"] = {}
+                        sg3["298"]["inputs"]["format"] = "video/h264-mp4"
+                        sg3["298"]["inputs"]["frame_rate"] = 24
+                        
                     if "306" in sg3:
                         if "inputs" not in sg3["306"]: sg3["306"]["inputs"] = {}
                         sg3["306"]["inputs"]["format"] = "video/h264-mp4"
-                        sg3["306"]["inputs"]["frame_rate"] = 24  
+                        sg3["306"]["inputs"]["frame_rate"] = 24
+                        
+                    if "302" in sg3: 
+                        if "inputs" not in sg3["302"]: sg3["302"]["inputs"] = {}
+                        sg3["302"]["inputs"]["lora_name"] = target_detailer_lora
 
-                    # APPLY N8N MERGE FIRST
-                    sg3 = self.merge_overrides(sg3, body.get("subgraph_3_override"))
-                    
-                    # --- HARDWARE OOM SAFETY LOCKS ---
-                    if "313" in sg3 and "inputs" in sg3["313"]:
-                        sg3["313"]["inputs"]["chunks"] = 4
-                    
-                    if "307" in sg3 and "inputs" in sg3["307"]:
-                        # Safely process the massive decode in micro-batches
-                        sg3["307"]["inputs"]["temporal_tile_length"] = 8
-                        sg3["307"]["inputs"]["temporal_overlap"] = 2
-                        sg3["307"]["inputs"]["spatial_tiles"] = 8
-
-                    if "402" in sg3 and "inputs" in sg3["402"]:
-                        # Prevent post-processing from destroying GPU VRAM right before finishing
-                        sg3["402"]["inputs"]["use_gpu"] = False
-
-                    print(f"🚀 Executing Sub-Graph 3 (Upscaling {requested_length} -> {final_upscaled_length} frames @ 24fps)...")
+                    print("🚀 Executing Sub-Graph 3 (Audio Generation & Combine Decoders)...")
                     await self.execute_comfy_workflow(session, sg3)
                     await self.clear_comfy_memory(session)
 
@@ -674,9 +591,9 @@ class LTXVLoadConditioning:
                     await asyncio.get_event_loop().run_in_executor(
                         None, 
                         self.s3.upload_file, 
-                        target_video_file,                      
-                        "video-asset-files-storage-workflow",   
-                        target_key                              
+                        target_video_file,                      # 1st param: Local file path
+                        "video-asset-files-storage-workflow",   # 2nd param: Bucket name
+                        target_key                              # 3rd param: S3 object key
                     )
 
                     public_path_url = f"https://pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev/{target_key}" 
@@ -685,10 +602,7 @@ class LTXVLoadConditioning:
                         "status": "success",
                         "file_key": target_key,
                         "public_url": public_path_url,
-                        "filename": saved_filename,
-                        "seed": random_seed,
-                        "base_frames": requested_length,
-                        "upscaled_frames": final_upscaled_length
+                        "filename": saved_filename
                     }
 
             finally:
@@ -696,18 +610,22 @@ class LTXVLoadConditioning:
 
         # ==========================================================================
         # PART 7: STREAM RESPONSE TO BYPASS CLOUD TIMEOUTS
+        # Purpose: Keep FastAPI connection alive while GPU processes graph chunks.
         # ==========================================================================
         async def stream_response():
+            # Start the heavy GPU task in the background
             task = asyncio.create_task(process_pipeline())
             
+            # Keep-alive loop: sends a space character every 10 seconds until done
             while not task.done():
-                yield b" "  
+                yield b" "  # Send whitespace character to prevent proxy/LB timeout drop
                 done, pending = await asyncio.wait([task], timeout=10.0)
                 if task in done: 
                     break
             
             try:
                 result = task.result()
+                # FIX: Ensure result is serialized to JSON string if it's a dict/list
                 if isinstance(result, (dict, list)):
                     yield json.dumps(result).encode("utf-8")
                 else:
@@ -718,4 +636,7 @@ class LTXVLoadConditioning:
             except Exception as e:
                 yield json.dumps({"status": "error", "detail": str(e)}).encode("utf-8")
 
+        # RECOMMENDED: Use "text/plain" or "application/x-ndjson" if client stream-parses.
+        # If the client reads the whole response at once, "application/json" is fine 
+        # because standard JSON parsers ignore leading whitespace.
         return StreamingResponse(stream_response(), media_type="application/json")

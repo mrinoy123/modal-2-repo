@@ -185,8 +185,6 @@ class LTXEngine:
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
             "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
             "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc",
-            # FIX: No --lowvram. No --medvram. 
-            # We use --normalvram (allows dynamic swapping to RAM) 
             # and --reserve-vram 1.0 (forces ComfyUI to declare "full_load: False" and strictly do Partial Loading)
             "--normalvram", "--reserve-vram", "12.0"
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)

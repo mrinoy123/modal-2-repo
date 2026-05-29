@@ -356,7 +356,11 @@ class LTXVLoadConditioning:
         # ----------------------------------------------------------------------
         async def process_pipeline():
             incoming_image_urls = body.get("image_url")
-            requested_length = int(body.get("length", 73))
+            
+            # DEFAULT LENGTH IS 49. IF BASE IS 49, UPSCALED FINAL FRAME COUNT WILL BE 97.
+            requested_length = int(body.get("length", 49))
+            final_upscaled_length = (requested_length * 2) - 1  # 49 -> 97 frames formula
+            
             prompts_dict = body.get("prompts", {})
             negative_prompt = body.get("negative", "worst quality, blurry, low resolution, artifacts, watermarks")
             date_folder = body.get("date_folder", time.strftime('%Y-%m-%d'))
@@ -375,8 +379,8 @@ class LTXVLoadConditioning:
             else:
                 prompts_timeline_str = str(prompts_dict).replace("\\n", "\n")
 
-            # CHANGED: Now pointing to the dev safetensor rather than distilled
-            target_unet = "ltx-2-19b-dev-fp8.safetensors"
+            # REVERTED TO DISTILLED MODEL
+            target_unet = "ltx-2-19b-distilled-fp8.safetensors"
             target_gemma = "gemma-3-12b-it-FP8.safetensors"
             target_connector = "ltx-2-19b-embeddings_connector_dev_bf16.safetensors"
             target_video_vae = "ltx-2-19b-dev_video_vae.safetensors"
@@ -485,7 +489,7 @@ class LTXVLoadConditioning:
                     await self.clear_comfy_memory(session)
 
                     # ==============================================================================
-                    # SUB-GRAPH 2: DEV SETTINGS & NEW DENO MULTI-IMAGE LOADER
+                    # SUB-GRAPH 2: DISTILLED SETTINGS (25 STEPS & 12 FPS SETUP)
                     # ==============================================================================
                     sg2_raw = body.get("subgraph_2")
                     if sg2_raw:
@@ -510,6 +514,8 @@ class LTXVLoadConditioning:
                         num_imgs = len(image_filenames)
                         if "inputs" not in sg2["318"]: sg2["318"]["inputs"] = {}
                         sg2["318"]["inputs"]["num_images"] = num_imgs
+                        # FORCE 12 FPS BASE GENERATION FOR UPSAMPLER TO DOUBLE LATER
+                        sg2["318"]["inputs"]["frame_rate"] = 12
 
                     if "238" in sg2:
                         if "inputs" not in sg2["238"]: sg2["238"]["inputs"] = {}
@@ -534,7 +540,8 @@ class LTXVLoadConditioning:
                         
                     if "249" in sg2: 
                         if "inputs" not in sg2["249"]: sg2["249"]["inputs"] = {}
-                        sg2["249"]["inputs"]["steps"] = 20 # CHANGED: Explicitly updated to 20 for Dev model
+                        # INCREASED TO 25 STEPS FOR DISTILLED
+                        sg2["249"]["inputs"]["steps"] = 25 
 
                     # INJECT RANDOM SEED INTO NOISE GENERATOR
                     if "243" in sg2:
@@ -567,7 +574,7 @@ class LTXVLoadConditioning:
                         shutil.copy(os.path.join(out_dir, latest_latent), "/workspace/ComfyUI/input/video_latent_output.latent")
 
                     # ==============================================================================
-                    # SUB-GRAPH 3: UPSCALE, COLOR CORRECT, AUDIO & SYNC
+                    # SUB-GRAPH 3: UPSCALER (12 -> 24 FPS), COLOR CORRECT, AUDIO & SYNC
                     # ==============================================================================
                     sg3_raw = body.get("subgraph_3")
                     if sg3_raw:
@@ -607,17 +614,20 @@ class LTXVLoadConditioning:
                     
                     if "290" in sg3: 
                         if "inputs" not in sg3["290"]: sg3["290"]["inputs"] = {}
-                        sg3["290"]["inputs"]["frames_number"] = requested_length
+                        # SYNC AUDIO FRAME COUNT WITH THE NEW UPSCALED VIDEO LENGTH
+                        sg3["290"]["inputs"]["frames_number"] = final_upscaled_length
+                        # SET AUDIO FPS TO 24
+                        sg3["290"]["inputs"]["frame_rate"] = 24
 
                     # INJECT RANDOM SEED INTO NOISE GENERATOR
                     if "293" in sg3:
                         if "inputs" not in sg3["293"]: sg3["293"]["inputs"] = {}
                         sg3["293"]["inputs"]["noise_seed"] = random_seed
 
-                    # ENSURE STEPS ARE ALSO SET TO 20 IN SG3 FOR CONSISTENCY
+                    # ENSURE STEPS ARE ALSO SET TO 25 IN SG3 FOR DISTILLED MODEL REFINEMENT
                     if "315" in sg3:
                         if "inputs" not in sg3["315"]: sg3["315"]["inputs"] = {}
-                        sg3["315"]["inputs"]["steps"] = 20
+                        sg3["315"]["inputs"]["steps"] = 25
 
                     if "407" in sg3:
                         if "inputs" not in sg3["407"]: sg3["407"]["inputs"] = {}
@@ -626,12 +636,13 @@ class LTXVLoadConditioning:
                     if "306" in sg3:
                         if "inputs" not in sg3["306"]: sg3["306"]["inputs"] = {}
                         sg3["306"]["inputs"]["format"] = "video/h264-mp4"
+                        # COMBINE EVERYTHING AT FINAL 24 FPS
                         sg3["306"]["inputs"]["frame_rate"] = 24  
 
                     # APPLY N8N OVERRIDE AT THE VERY END SO IT TAKES FINAL PRIORITY
                     sg3 = self.merge_overrides(sg3, body.get("subgraph_3_override"))
 
-                    print("🚀 Executing Sub-Graph 3 (Upscaling, Color Correction, Audio, & Combining)...")
+                    print(f"🚀 Executing Sub-Graph 3 (Upscaling {requested_length} -> {final_upscaled_length} frames @ 24fps)...")
                     await self.execute_comfy_workflow(session, sg3)
                     await self.clear_comfy_memory(session)
 
@@ -666,7 +677,9 @@ class LTXVLoadConditioning:
                         "file_key": target_key,
                         "public_url": public_path_url,
                         "filename": saved_filename,
-                        "seed": random_seed
+                        "seed": random_seed,
+                        "base_frames": requested_length,
+                        "upscaled_frames": final_upscaled_length
                     }
 
             finally:

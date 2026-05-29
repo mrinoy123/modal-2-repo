@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "git", "wget", "ffmpeg", "libgl1", "libglib2.0-0",
     "build-essential", "ninja-build", "cmake", "clang", "llvm"
 ).env({
-    "FORCE_REBUILD_INDEX": "139"  # Bumped to ensure fresh deployment cache pulling fixes
+    "FORCE_REBUILD_INDEX": "142"  # Bumped to ensure fresh deployment cache pulling fixes
 })
 
 # ==============================================================================
@@ -401,7 +401,7 @@ class LTXVLoadConditioning:
 
             image_filenames = []
             if not urls_to_download:
-                # CHANGED RESOLUTION: 320x416 to prevent OOM
+                # RESOLUTION: 320x416 to prevent OOM
                 fallback_path = os.path.join(dynamic_guides_dir, "guide_0000.png")
                 from PIL import Image
                 img = Image.new('RGB', (320, 416), color='black')
@@ -427,7 +427,7 @@ class LTXVLoadConditioning:
                     
                     if not os.path.exists(target_dest):
                         from PIL import Image
-                        # CHANGED RESOLUTION: 320x416 to prevent OOM
+                        # RESOLUTION: 320x416 to prevent OOM
                         img = Image.new('RGB', (320, 416), color='black')
                         img.save(target_dest)
 
@@ -501,7 +501,7 @@ class LTXVLoadConditioning:
 
                     if "194" in sg2:
                         if "inputs" not in sg2["194"]: sg2["194"]["inputs"] = {}
-                        # CHANGED RESOLUTION: 320x416
+                        # RESOLUTION: 320x416
                         sg2["194"]["inputs"]["width"] = 320
                         sg2["194"]["inputs"]["height"] = 416
                         sg2["194"]["inputs"]["length"] = requested_length
@@ -509,7 +509,7 @@ class LTXVLoadConditioning:
                     if "319" in sg2:
                         if "inputs" not in sg2["319"]: sg2["319"]["inputs"] = {}
                         sg2["319"]["inputs"]["image_paths"] = "\n".join(image_filenames)
-                        # CHANGED RESOLUTION: 320x416
+                        # RESOLUTION: 320x416
                         sg2["319"]["inputs"]["width"] = 320
                         sg2["319"]["inputs"]["height"] = 416
 
@@ -543,7 +543,7 @@ class LTXVLoadConditioning:
                         
                     if "249" in sg2: 
                         if "inputs" not in sg2["249"]: sg2["249"]["inputs"] = {}
-                        # CHANGED: Reverted to 12 STEPS
+                        # 12 STEPS
                         sg2["249"]["inputs"]["steps"] = 12
 
                     # INJECT RANDOM SEED INTO NOISE GENERATOR
@@ -557,6 +557,7 @@ class LTXVLoadConditioning:
                     if "312" in sg2:
                         if "inputs" not in sg2["312"]: sg2["312"]["inputs"] = {}
                         sg2["312"]["inputs"]["temporal_tile_size"] = 64
+                        # MUST BE AT LEAST 16 based on ComfyUI Custom Node bounds!
                         sg2["312"]["inputs"]["temporal_overlap"] = 16
                         # FIX: Block Spatial Tiling overhead in Looping Sampler
                         sg2["312"]["inputs"]["horizontal_tiles"] = 1
@@ -657,7 +658,7 @@ class LTXVLoadConditioning:
 
                     if "315" in sg3:
                         if "inputs" not in sg3["315"]: sg3["315"]["inputs"] = {}
-                        # CHANGED: Reverted to 12 STEPS
+                        # 12 STEPS
                         sg3["315"]["inputs"]["steps"] = 12
 
                     if "307" in sg3:

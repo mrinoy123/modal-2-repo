@@ -13,6 +13,7 @@ import aiohttp
 import urllib.request
 import asyncio
 import ctypes
+import random
 from fastapi import Request, Response, HTTPException, Header
 from fastapi.responses import StreamingResponse
 from typing import Optional
@@ -359,6 +360,10 @@ class LTXVLoadConditioning:
             prompts_dict = body.get("prompts", {})
             negative_prompt = body.get("negative", "worst quality, blurry, low resolution, artifacts, watermarks")
             date_folder = body.get("date_folder", time.strftime('%Y-%m-%d'))
+            
+            # GENERATE RANDOM SEED TO INJECT INTO THE GENERATOR NODES
+            random_seed = random.randint(1, 1125899906842624)
+            print(f"🎲 Generated Random Seed for workflow run: {random_seed}")
 
             if isinstance(prompts_dict, dict):
                 try:
@@ -370,7 +375,8 @@ class LTXVLoadConditioning:
             else:
                 prompts_timeline_str = str(prompts_dict).replace("\\n", "\n")
 
-            target_unet = "ltx-2-19b-distilled-fp8.safetensors"
+            # CHANGED: Now pointing to the dev safetensor rather than distilled
+            target_unet = "ltx-2-19b-dev-fp8.safetensors"
             target_gemma = "gemma-3-12b-it-FP8.safetensors"
             target_connector = "ltx-2-19b-embeddings_connector_dev_bf16.safetensors"
             target_video_vae = "ltx-2-19b-dev_video_vae.safetensors"
@@ -444,8 +450,6 @@ class LTXVLoadConditioning:
                     else:
                         with open("comfyui-ltx-20-subgraph-1(api).json", "r") as f: 
                             sg1 = json.load(f)
-                    
-                    sg1 = self.merge_overrides(sg1, body.get("subgraph_1_override"))
 
                     if "243" in sg1:
                         if "inputs" not in sg1["243"]: sg1["243"]["inputs"] = {}
@@ -473,12 +477,15 @@ class LTXVLoadConditioning:
                         sg1["246"]["inputs"]["length"] = requested_length
                         sg1["246"]["widgets_values"] = [prompts_timeline_str]
 
+                    # APPLY N8N OVERRIDE AT THE VERY END SO IT TAKES FINAL PRIORITY
+                    sg1 = self.merge_overrides(sg1, body.get("subgraph_1_override"))
+
                     print("🚀 Executing Sub-Graph 1 (Text Conditioning)...")
                     await self.execute_comfy_workflow(session, sg1)
                     await self.clear_comfy_memory(session)
 
                     # ==============================================================================
-                    # SUB-GRAPH 2: DISTILLED SETTINGS & NEW DENO MULTI-IMAGE LOADER
+                    # SUB-GRAPH 2: DEV SETTINGS & NEW DENO MULTI-IMAGE LOADER
                     # ==============================================================================
                     sg2_raw = body.get("subgraph_2")
                     if sg2_raw:
@@ -486,8 +493,6 @@ class LTXVLoadConditioning:
                     else:
                         with open("comfyui-ltx-20-subgraph-2(api).json", "r") as f: 
                             sg2 = json.load(f)
-
-                    sg2 = self.merge_overrides(sg2, body.get("subgraph_2_override"))
 
                     if "194" in sg2:
                         if "inputs" not in sg2["194"]: sg2["194"]["inputs"] = {}
@@ -529,7 +534,12 @@ class LTXVLoadConditioning:
                         
                     if "249" in sg2: 
                         if "inputs" not in sg2["249"]: sg2["249"]["inputs"] = {}
-                        sg2["249"]["inputs"]["steps"] = 12
+                        sg2["249"]["inputs"]["steps"] = 20 # CHANGED: Explicitly updated to 20 for Dev model
+
+                    # INJECT RANDOM SEED INTO NOISE GENERATOR
+                    if "243" in sg2:
+                        if "inputs" not in sg2["243"]: sg2["243"]["inputs"] = {}
+                        sg2["243"]["inputs"]["noise_seed"] = random_seed
 
                     if "252" in sg2:
                         if "inputs" not in sg2["252"]: sg2["252"]["inputs"] = {}
@@ -538,6 +548,9 @@ class LTXVLoadConditioning:
                     if "311" in sg2:
                         if "inputs" not in sg2["311"]: sg2["311"]["inputs"] = {}
                         sg2["311"]["inputs"]["filename_prefix"] = "video_latent_output"
+
+                    # APPLY N8N OVERRIDE AT THE VERY END SO IT TAKES FINAL PRIORITY
+                    sg2 = self.merge_overrides(sg2, body.get("subgraph_2_override"))
 
                     print("🚀 Executing Sub-Graph 2 (Main Video Generation)...")
                     await self.execute_comfy_workflow(session, sg2)
@@ -562,8 +575,6 @@ class LTXVLoadConditioning:
                     else:
                         with open("comfyui-ltx-20-Subgraph-3(api).json", "r") as f: 
                             sg3 = json.load(f)
-
-                    sg3 = self.merge_overrides(sg3, body.get("subgraph_3_override"))
 
                     if "313" in sg3:
                         if "inputs" not in sg3["313"]: sg3["313"]["inputs"] = {}
@@ -598,6 +609,16 @@ class LTXVLoadConditioning:
                         if "inputs" not in sg3["290"]: sg3["290"]["inputs"] = {}
                         sg3["290"]["inputs"]["frames_number"] = requested_length
 
+                    # INJECT RANDOM SEED INTO NOISE GENERATOR
+                    if "293" in sg3:
+                        if "inputs" not in sg3["293"]: sg3["293"]["inputs"] = {}
+                        sg3["293"]["inputs"]["noise_seed"] = random_seed
+
+                    # ENSURE STEPS ARE ALSO SET TO 20 IN SG3 FOR CONSISTENCY
+                    if "315" in sg3:
+                        if "inputs" not in sg3["315"]: sg3["315"]["inputs"] = {}
+                        sg3["315"]["inputs"]["steps"] = 20
+
                     if "407" in sg3:
                         if "inputs" not in sg3["407"]: sg3["407"]["inputs"] = {}
                         sg3["407"]["inputs"]["model_name"] = target_upscaler
@@ -606,6 +627,9 @@ class LTXVLoadConditioning:
                         if "inputs" not in sg3["306"]: sg3["306"]["inputs"] = {}
                         sg3["306"]["inputs"]["format"] = "video/h264-mp4"
                         sg3["306"]["inputs"]["frame_rate"] = 24  
+
+                    # APPLY N8N OVERRIDE AT THE VERY END SO IT TAKES FINAL PRIORITY
+                    sg3 = self.merge_overrides(sg3, body.get("subgraph_3_override"))
 
                     print("🚀 Executing Sub-Graph 3 (Upscaling, Color Correction, Audio, & Combining)...")
                     await self.execute_comfy_workflow(session, sg3)
@@ -641,7 +665,8 @@ class LTXVLoadConditioning:
                         "status": "success",
                         "file_key": target_key,
                         "public_url": public_path_url,
-                        "filename": saved_filename
+                        "filename": saved_filename,
+                        "seed": random_seed
                     }
 
             finally:

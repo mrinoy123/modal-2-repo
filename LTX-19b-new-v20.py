@@ -257,7 +257,7 @@ class LTXVLoadConditioning:
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
             "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
             "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc",
-            "--reserve-vram", "4.0"  # OOM FIX: Forces PyTorch to stage the LoRA addition in CPU RAM, preventing Model Load crashes
+            "--reserve-vram", "0.3"  # OOM FIX: Forces PyTorch to stage the LoRA addition in CPU RAM, preventing Model Load crashes
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)
         
         self.t = threading.Thread(target=self._log_reader, daemon=True)

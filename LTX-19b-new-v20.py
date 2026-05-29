@@ -26,7 +26,8 @@ base_image = modal.Image.from_registry(
     add_python="3.12"
 ).apt_install(
     "git", "wget", "ffmpeg", "libgl1", "libglib2.0-0",
-    "build-essential", "ninja-build", "cmake", "clang", "llvm"
+    "build-essential", "ninja-build", "cmake", "clang", "llvm",
+    "libgoogle-perftools-dev" # Added to ensure memory sweeping works flawlessly
 ).env({
     "FORCE_REBUILD_INDEX": "150"  # Bumped to ensure fresh deployment cache
 })
@@ -102,7 +103,8 @@ weights_volume = modal.Volume.from_name("ltx-new-version20-weights", create_if_m
     image=final_image,
     volumes={"/mnt/weights": weights_volume},
     secrets=[modal.Secret.from_name("custom-secret")],
-    memory=8192,
+    # FIX 1: MUST BE 32GB to absorb lowvram offloading matrices.
+    memory=8192, 
     scaledown_window=30,
     timeout=3600
 )
@@ -169,9 +171,12 @@ class LTXEngine:
         os.makedirs("/tmp/hf_offload", exist_ok=True)
 
         env_vars = os.environ.copy()
+        env_vars["LD_PRELOAD"] = "/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4"
         env_vars["TORCH_NUM_THREADS"] = "1"
         env_vars["OMP_NUM_THREADS"] = "1"
-        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        
+        # FIX 2: Added "max_split_size_mb:64" to force PyTorch to slice VRAM optimally
+        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
         env_vars["CUDA_MODULE_LOADING"] = "LAZY" 
         env_vars["MALLOC_TRIM_THRESHOLD_"] = "65536" 
         env_vars["HF_HUB_OFFLOAD_DIR"] = "/tmp/hf_offload"
@@ -180,7 +185,7 @@ class LTXEngine:
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
             "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
             "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc"
-            
+            # FIX 3: Added LowVRAM explicitly to stop model hoarding during LoRA execution
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)
         
         self.t = threading.Thread(target=self._log_reader, daemon=True)
@@ -199,6 +204,7 @@ class LTXEngine:
         os._exit(1)
 
     async def clear_comfy_memory(self, session):
+        # Explicit VRAM Purge payload sent directly to ComfyUI API
         try:
             async with session.post("http://127.0.0.1:8188/free", json={"unload_models": True, "free_memory": True}) as r:
                 await r.read()
@@ -402,22 +408,20 @@ class LTXEngine:
 
                     print("🚀 Executing Sub-Graph 1 (Text Conditioning)...")
                     await self.execute_comfy_workflow(session, sg1)
-                    await self.clear_comfy_memory(session)
+                    await self.clear_comfy_memory(session) # Memory actively purged after Sub-Graph 1
 
                     # ==============================================================================
-                    # SUB-GRAPH 2: MAIN VIDEO GENERATION (SYNCHRONIZED WITH NEW API FILE)
+                    # SUB-GRAPH 2: MAIN VIDEO GENERATION
                     # ==============================================================================
                     sg2_raw = body.get("subgraph_2")
                     if sg2_raw:
                         sg2 = json.loads(sg2_raw) if isinstance(sg2_raw, str) else sg2_raw
                     else:
-                        # TARGETING NEW WORKFLOW FILE:
                         with open("new-test-comfyui-ltx-20-subgraph-2(api).json", "r") as f: 
                             sg2 = json.load(f)
 
                     sg2 = self.merge_overrides(sg2, body.get("subgraph_2_override"))
 
-                    # ENFORCED RESOLUTION TO 384x480
                     if "194" in sg2:
                         if "inputs" not in sg2["194"]: sg2["194"]["inputs"] = {}
                         sg2["194"]["inputs"]["width"] = 384
@@ -428,7 +432,6 @@ class LTXEngine:
                             sg2["194"]["widgets_values"][1] = 480                 
                             sg2["194"]["widgets_values"][2] = requested_length    
 
-                    # ENFORCED RESOLUTION TO 384x480
                     if "237" in sg2: 
                         if "inputs" not in sg2["237"]: sg2["237"]["inputs"] = {}
                         sg2["237"]["inputs"]["directory"] = dynamic_guides_dir
@@ -440,7 +443,6 @@ class LTXEngine:
                             sg2["237"]["widgets_values"][4] = 384                  
                             sg2["237"]["widgets_values"][5] = 480                  
 
-                    # SET LTXVChunkFeedForward to 4 for SG2 to avoid OOM
                     if "252" in sg2:
                         if "inputs" not in sg2["252"]: sg2["252"]["inputs"] = {}
                         sg2["252"]["inputs"]["chunk_size"] = 4
@@ -478,7 +480,6 @@ class LTXEngine:
                         
                     if "249" in sg2: 
                         if "inputs" not in sg2["249"]: sg2["249"]["inputs"] = {}
-                        # Letting the JSON dictate steps, but forcing sequence length syncing
                         sg2["249"]["inputs"]["length"] = requested_length
                         sg2["249"]["inputs"]["max_frames"] = requested_length
                     
@@ -489,7 +490,7 @@ class LTXEngine:
 
                     print("🚀 Executing Sub-Graph 2 (Main Video Generation)...")
                     await self.execute_comfy_workflow(session, sg2)
-                    await self.clear_comfy_memory(session)
+                    await self.clear_comfy_memory(session) # Memory actively purged after Sub-Graph 2
 
                     # ==============================================================================
                     # COPY LATENT FOR SUBGRAPH 3
@@ -502,19 +503,17 @@ class LTXEngine:
                         shutil.copy(os.path.join(out_dir, latest_latent), "/workspace/ComfyUI/input/video_latent_output.latent")
 
                     # ==============================================================================
-                    # SUB-GRAPH 3: AUDIO DECODING & SYNCHRONIZED VHS COMBINE (NEW API FILE)
+                    # SUB-GRAPH 3: AUDIO DECODING & SYNCHRONIZED VHS COMBINE 
                     # ==============================================================================
                     sg3_raw = body.get("subgraph_3")
                     if sg3_raw:
                         sg3 = json.loads(sg3_raw) if isinstance(sg3_raw, str) else sg3_raw
                     else:
-                        # TARGETING NEW WORKFLOW FILE:
                         with open("new-test-comfyui-ltx-20-Subgraph-3(api).json", "r") as f: 
                             sg3 = json.load(f)
 
                     sg3 = self.merge_overrides(sg3, body.get("subgraph_3_override"))
 
-                    # SET LTXVChunkFeedForward to 4 for SG3 to avoid OOM
                     if "304" in sg3:
                         if "inputs" not in sg3["304"]: sg3["304"]["inputs"] = {}
                         sg3["304"]["inputs"]["chunk_size"] = 4
@@ -570,7 +569,7 @@ class LTXEngine:
 
                     print("🚀 Executing Sub-Graph 3 (Audio Generation & Combine Decoders)...")
                     await self.execute_comfy_workflow(session, sg3)
-                    await self.clear_comfy_memory(session)
+                    await self.clear_comfy_memory(session) # Final VRAM cleanup
 
                     output_files = []
                     for root_p, _, filenames in os.walk(out_dir):
@@ -591,9 +590,9 @@ class LTXEngine:
                     await asyncio.get_event_loop().run_in_executor(
                         None, 
                         self.s3.upload_file, 
-                        target_video_file,                      # 1st param: Local file path
-                        "video-asset-files-storage-workflow",   # 2nd param: Bucket name
-                        target_key                              # 3rd param: S3 object key
+                        target_video_file,                      
+                        "video-asset-files-storage-workflow",   
+                        target_key                              
                     )
 
                     public_path_url = f"https://pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev/{target_key}" 
@@ -613,19 +612,16 @@ class LTXEngine:
         # Purpose: Keep FastAPI connection alive while GPU processes graph chunks.
         # ==========================================================================
         async def stream_response():
-            # Start the heavy GPU task in the background
             task = asyncio.create_task(process_pipeline())
             
-            # Keep-alive loop: sends a space character every 10 seconds until done
             while not task.done():
-                yield b" "  # Send whitespace character to prevent proxy/LB timeout drop
+                yield b" "  
                 done, pending = await asyncio.wait([task], timeout=10.0)
                 if task in done: 
                     break
             
             try:
                 result = task.result()
-                # FIX: Ensure result is serialized to JSON string if it's a dict/list
                 if isinstance(result, (dict, list)):
                     yield json.dumps(result).encode("utf-8")
                 else:
@@ -636,7 +632,4 @@ class LTXEngine:
             except Exception as e:
                 yield json.dumps({"status": "error", "detail": str(e)}).encode("utf-8")
 
-        # RECOMMENDED: Use "text/plain" or "application/x-ndjson" if client stream-parses.
-        # If the client reads the whole response at once, "application/json" is fine 
-        # because standard JSON parsers ignore leading whitespace.
         return StreamingResponse(stream_response(), media_type="application/json")

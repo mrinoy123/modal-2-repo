@@ -401,10 +401,10 @@ class LTXVLoadConditioning:
 
             image_filenames = []
             if not urls_to_download:
-                # CHANGED RESOLUTION: 384x480
+                # CHANGED RESOLUTION: 320x416 to prevent OOM
                 fallback_path = os.path.join(dynamic_guides_dir, "guide_0000.png")
                 from PIL import Image
-                img = Image.new('RGB', (384, 480), color='black')
+                img = Image.new('RGB', (320, 416), color='black')
                 img.save(fallback_path)
                 image_filenames = [fallback_path] 
             else:
@@ -427,8 +427,8 @@ class LTXVLoadConditioning:
                     
                     if not os.path.exists(target_dest):
                         from PIL import Image
-                        # CHANGED RESOLUTION: 384x480
-                        img = Image.new('RGB', (384, 480), color='black')
+                        # CHANGED RESOLUTION: 320x416 to prevent OOM
+                        img = Image.new('RGB', (320, 416), color='black')
                         img.save(target_dest)
 
                 async with aiohttp.ClientSession() as download_session:
@@ -490,7 +490,7 @@ class LTXVLoadConditioning:
                     await self.clear_comfy_memory(session)
 
                     # ==============================================================================
-                    # SUB-GRAPH 2: DISTILLED SETTINGS (12 STEPS & 12 FPS SETUP & 384x480)
+                    # SUB-GRAPH 2: DISTILLED SETTINGS (12 STEPS & 12 FPS SETUP & 320x416)
                     # ==============================================================================
                     sg2_raw = body.get("subgraph_2")
                     if sg2_raw:
@@ -501,17 +501,17 @@ class LTXVLoadConditioning:
 
                     if "194" in sg2:
                         if "inputs" not in sg2["194"]: sg2["194"]["inputs"] = {}
-                        # CHANGED RESOLUTION: 384x480
-                        sg2["194"]["inputs"]["width"] = 384
-                        sg2["194"]["inputs"]["height"] = 480
+                        # CHANGED RESOLUTION: 320x416
+                        sg2["194"]["inputs"]["width"] = 320
+                        sg2["194"]["inputs"]["height"] = 416
                         sg2["194"]["inputs"]["length"] = requested_length
 
                     if "319" in sg2:
                         if "inputs" not in sg2["319"]: sg2["319"]["inputs"] = {}
                         sg2["319"]["inputs"]["image_paths"] = "\n".join(image_filenames)
-                        # CHANGED RESOLUTION: 384x480
-                        sg2["319"]["inputs"]["width"] = 384
-                        sg2["319"]["inputs"]["height"] = 480
+                        # CHANGED RESOLUTION: 320x416
+                        sg2["319"]["inputs"]["width"] = 320
+                        sg2["319"]["inputs"]["height"] = 416
 
                     if "318" in sg2:
                         num_imgs = len(image_filenames)
@@ -589,7 +589,7 @@ class LTXVLoadConditioning:
                     # APPLY N8N OVERRIDE AT THE VERY END SO IT TAKES FINAL PRIORITY
                     sg2 = self.merge_overrides(sg2, body.get("subgraph_2_override"))
 
-                    print(f"🚀 Executing Sub-Graph 2 (Main Video Gen: {requested_length} frames @ 384x480)...")
+                    print(f"🚀 Executing Sub-Graph 2 (Main Video Gen: {requested_length} frames @ 320x416)...")
                     await self.execute_comfy_workflow(session, sg2)
                     await self.clear_comfy_memory(session)
 

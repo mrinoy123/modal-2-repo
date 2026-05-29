@@ -28,7 +28,7 @@ base_image = modal.Image.from_registry(
     "git", "wget", "ffmpeg", "libgl1", "libglib2.0-0",
     "build-essential", "ninja-build", "cmake", "clang", "llvm"
 ).env({
-    "FORCE_REBUILD_INDEX": "130"  # Bumped to ensure fresh deployment cache
+    "FORCE_REBUILD_INDEX": "131"  # Bumped to ensure fresh deployment cache pulling new nodes
 })
 
 # ==============================================================================
@@ -50,7 +50,7 @@ build_image = base_image.env({
 
 # ==============================================================================
 # PART 4: COMFYUI & CUSTOM NODES CLONING + DEPENDENCY ISOLATION
-# Purpose: Clone strictly required node repos. Unnecessary extensions have been purged.
+# Purpose: Clone strictly required node repos. Added ColorCorrector.
 # ==============================================================================
 torch_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124",
@@ -67,7 +67,8 @@ clone_image = torch_image.run_commands(
     "git clone --depth 1 https://github.com/Deno2026/comfyui-deno-custom-nodes.git /workspace/ComfyUI/custom_nodes/comfyui-deno-custom-nodes",
     "git clone --depth 1 https://github.com/cubiq/ComfyUI_essentials.git /workspace/ComfyUI/custom_nodes/ComfyUI_essentials",
     "git clone --depth 1 https://github.com/IvanRybakov/comfyui-node-int-to-string-convertor.git /workspace/ComfyUI/custom_nodes/comfyui-node-int-to-string-convertor",
-    "git clone --depth 1 https://github.com/siraxe/ComfyUI-LTX-FDG.git /workspace/ComfyUI/custom_nodes/ComfyUI-LTX-FDG"
+    "git clone --depth 1 https://github.com/siraxe/ComfyUI-LTX-FDG.git /workspace/ComfyUI/custom_nodes/ComfyUI-LTX-FDG",
+    "git clone --depth 1 https://github.com/regiellis/ComfyUI-EasyColorCorrector.git /workspace/ComfyUI/custom_nodes/ComfyUI-EasyColorCorrector"
 )
 
 deps_image = clone_image.run_commands(
@@ -128,7 +129,8 @@ class LTXEngine:
         print("🔗 Running Atomic Model Folder Linker...")
         base_models_dir = "/workspace/ComfyUI/models"
         
-        dirs = ["unet", "vae", "clip", "text_encoders", "text_encoder", "checkpoints", "diffusion_models", "gguf", "loras"]
+        # Added upscale_models to mapping for the LTX temporal latent upscaler
+        dirs = ["unet", "vae", "clip", "text_encoders", "text_encoder", "checkpoints", "diffusion_models", "gguf", "loras", "upscale_models"]
         for d in dirs: 
             os.makedirs(os.path.join(base_models_dir, d), exist_ok=True)
 
@@ -138,7 +140,7 @@ class LTXEngine:
                     if not filename.endswith((".safetensors", ".gguf", ".pth", ".pt", ".bin")): 
                         continue
                     src_path = os.path.join(root_dir, filename)
-                    for target_dir in ["unet", "vae", "clip", "text_encoders", "text_encoder", "checkpoints", "diffusion_models", "loras"]:
+                    for target_dir in ["unet", "vae", "clip", "text_encoders", "text_encoder", "checkpoints", "diffusion_models", "loras", "upscale_models"]:
                         dest = os.path.join(base_models_dir, target_dir, filename)
                         if not os.path.exists(dest):
                             try: 
@@ -180,7 +182,6 @@ class LTXEngine:
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
             "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
             "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc"
-            
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)
         
         self.t = threading.Thread(target=self._log_reader, daemon=True)
@@ -296,12 +297,14 @@ class LTXEngine:
             else:
                 prompts_timeline_str = str(prompts_dict).replace("\\n", "\n")
 
+            # Updated Model Definitions
             target_unet = "ltx-2-19b-distilled-fp8.safetensors"
             target_gemma = "gemma-3-12b-it-FP8.safetensors"
             target_connector = "ltx-2-19b-embeddings_connector_dev_bf16.safetensors"
             target_video_vae = "ltx-2-19b-dev_video_vae.safetensors"
             target_audio_vae = "ltx-2-19b-dev_audio_vae.safetensors"
             target_detailer_lora = "ltx-2-19b-ic-lora-detailer.safetensors"
+            target_upscaler = "ltx-2-temporal-upscaler-x2-1.0.safetensors"
 
             dynamic_guides_dir = "/workspace/ComfyUI/input/dynamic_guides"
             if os.path.exists(dynamic_guides_dir): 
@@ -343,7 +346,6 @@ class LTXEngine:
                     
                     if not os.path.exists(target_dest):
                         from PIL import Image
-                        # ENFORCED RESOLUTION TO 384x480
                         img = Image.new('RGB', (384, 480), color='black')
                         img.save(target_dest)
 
@@ -405,7 +407,7 @@ class LTXEngine:
                     await self.clear_comfy_memory(session)
 
                     # ==============================================================================
-                    # SUB-GRAPH 2: DISTILLED SETTINGS & DIRECTORY IMAGE LOADING
+                    # SUB-GRAPH 2: DISTILLED SETTINGS & NEW DENO MULTI-IMAGE LOADER
                     # ==============================================================================
                     sg2_raw = body.get("subgraph_2")
                     if sg2_raw:
@@ -416,43 +418,25 @@ class LTXEngine:
 
                     sg2 = self.merge_overrides(sg2, body.get("subgraph_2_override"))
 
-                    # ENFORCED RESOLUTION TO 384x480
+                    # ENFORCED RESOLUTION TO 384x480 & Update Length
                     if "194" in sg2:
                         if "inputs" not in sg2["194"]: sg2["194"]["inputs"] = {}
                         sg2["194"]["inputs"]["width"] = 384
                         sg2["194"]["inputs"]["height"] = 480
                         sg2["194"]["inputs"]["length"] = requested_length
-                        if "widgets_values" in sg2["194"] and len(sg2["194"]["widgets_values"]) > 2:
-                            sg2["194"]["widgets_values"][0] = 384                 
-                            sg2["194"]["widgets_values"][1] = 480                 
-                            sg2["194"]["widgets_values"][2] = requested_length    
 
-                    # ENFORCED RESOLUTION TO 384x480
-                    if "237" in sg2: 
-                        if "inputs" not in sg2["237"]: sg2["237"]["inputs"] = {}
-                        sg2["237"]["inputs"]["directory"] = dynamic_guides_dir
-                        sg2["237"]["inputs"]["aspect_ratio"] = "4:5"
-                        sg2["237"]["inputs"]["width"] = 384
-                        sg2["237"]["inputs"]["height"] = 480
-                        if "widgets_values" in sg2["237"] and len(sg2["237"]["widgets_values"]) > 5:
-                            sg2["237"]["widgets_values"][2] = "4:5"                
-                            sg2["237"]["widgets_values"][4] = 384                  
-                            sg2["237"]["widgets_values"][5] = 480                  
+                    # Inject images directly into DenoMultiImageLoader
+                    if "319" in sg2:
+                        if "inputs" not in sg2["319"]: sg2["319"]["inputs"] = {}
+                        sg2["319"]["inputs"]["image_paths"] = "\n".join(image_filenames)
+                        sg2["319"]["inputs"]["width"] = 384
+                        sg2["319"]["inputs"]["height"] = 480
 
-                    # SET LTXVChunkFeedForward to 4 for SG2 to avoid OOM
-                    if "252" in sg2:
-                        if "inputs" not in sg2["252"]: sg2["252"]["inputs"] = {}
-                        sg2["252"]["inputs"]["chunk_size"] = 4
-                        if "widgets_values" in sg2["252"]:
-                            sg2["252"]["widgets_values"][0] = 4
-
-                    if "235" in sg2:
+                    if "318" in sg2:  # DenoLTXSequencer
                         num_imgs = len(image_filenames)
-                        if "inputs" not in sg2["235"]: sg2["235"]["inputs"] = {}
-                        sg2["235"]["inputs"]["num_images"] = num_imgs
-                        for i in range(num_imgs):
-                            if f"frame_{i}" not in sg2["235"]["inputs"]:
-                                sg2["235"]["inputs"][f"frame_{i}"] = 0 if num_imgs == 1 else int(i * (requested_length - 1) / (num_imgs - 1))
+                        if "inputs" not in sg2["318"]: sg2["318"]["inputs"] = {}
+                        sg2["318"]["inputs"]["num_images"] = num_imgs
+                        # Optional: Adjust dynamic frame mapping here if the node allows specific inputs for it
 
                     if "238" in sg2:
                         if "inputs" not in sg2["238"]: sg2["238"]["inputs"] = {}
@@ -471,20 +455,19 @@ class LTXEngine:
                         if "inputs" not in sg2["246"]: sg2["246"]["inputs"] = {}
                         sg2["246"]["inputs"]["file_name"] = "(NEGATIVE)conditioning.pt"
                         
-                    if "248" in sg2: 
-                        if "inputs" not in sg2["248"]: sg2["248"]["inputs"] = {}
-                        sg2["248"]["inputs"]["lora_name"] = target_detailer_lora
+                    if "320" in sg2: 
+                        # LTXICLoRALoaderModelOnly
+                        if "inputs" not in sg2["320"]: sg2["320"]["inputs"] = {}
+                        sg2["320"]["inputs"]["lora_name"] = target_detailer_lora
                         
                     if "249" in sg2: 
                         if "inputs" not in sg2["249"]: sg2["249"]["inputs"] = {}
                         sg2["249"]["inputs"]["steps"] = 12
-                        sg2["249"]["inputs"]["length"] = requested_length
-                        sg2["249"]["inputs"]["max_frames"] = requested_length
-                    
-                    if "233" in sg2:
-                        if "inputs" not in sg2["233"]: sg2["233"]["inputs"] = {}
-                        sg2["233"]["inputs"]["length"] = requested_length
-                        sg2["233"]["inputs"]["frames"] = requested_length
+
+                    # SET LTXVChunkFeedForward to 4 for SG2 to avoid OOM
+                    if "252" in sg2:
+                        if "inputs" not in sg2["252"]: sg2["252"]["inputs"] = {}
+                        sg2["252"]["inputs"]["chunks"] = 4
 
                     print("🚀 Executing Sub-Graph 2 (Main Video Generation)...")
                     await self.execute_comfy_workflow(session, sg2)
@@ -501,7 +484,7 @@ class LTXEngine:
                         shutil.copy(os.path.join(out_dir, latest_latent), "/workspace/ComfyUI/input/video_latent_output.latent")
 
                     # ==============================================================================
-                    # SUB-GRAPH 3: AUDIO DECODING & SYNCHRONIZED VHS COMBINE
+                    # SUB-GRAPH 3: UPSCALE, COLOR CORRECT, AUDIO & SYNC
                     # ==============================================================================
                     sg3_raw = body.get("subgraph_3")
                     if sg3_raw:
@@ -513,11 +496,9 @@ class LTXEngine:
                     sg3 = self.merge_overrides(sg3, body.get("subgraph_3_override"))
 
                     # SET LTXVChunkFeedForward to 4 for SG3 to avoid OOM
-                    if "304" in sg3:
-                        if "inputs" not in sg3["304"]: sg3["304"]["inputs"] = {}
-                        sg3["304"]["inputs"]["chunk_size"] = 4
-                        if "widgets_values" in sg3["304"]:
-                            sg3["304"]["widgets_values"][0] = 4
+                    if "313" in sg3:
+                        if "inputs" not in sg3["313"]: sg3["313"]["inputs"] = {}
+                        sg3["313"]["inputs"]["chunks"] = 4
 
                     if "232" in sg3: 
                         if "inputs" not in sg3["232"]: sg3["232"]["inputs"] = {}
@@ -539,25 +520,27 @@ class LTXEngine:
                     if "295" in sg3: 
                         if "inputs" not in sg3["295"]: sg3["295"]["inputs"] = {}
                         sg3["295"]["inputs"]["ckpt_name"] = target_audio_vae
-                        
-                    if "296" in sg3: 
-                        if "inputs" not in sg3["296"]: sg3["296"]["inputs"] = {}
-                        sg3["296"]["inputs"]["vae_name"] = target_video_vae
+
+                    if "410" in sg3: 
+                        if "inputs" not in sg3["410"]: sg3["410"]["inputs"] = {}
+                        sg3["410"]["inputs"]["vae_name"] = target_video_vae
                     
                     if "290" in sg3: 
                         if "inputs" not in sg3["290"]: sg3["290"]["inputs"] = {}
                         sg3["290"]["inputs"]["frames_number"] = requested_length
-                    
-                    if "298" in sg3:
-                        if "inputs" not in sg3["298"]: sg3["298"]["inputs"] = {}
-                        sg3["298"]["inputs"]["format"] = "video/h264-mp4"
-                        sg3["298"]["inputs"]["frame_rate"] = 24
-                        
-                    if "302" in sg3: 
-                        if "inputs" not in sg3["302"]: sg3["302"]["inputs"] = {}
-                        sg3["302"]["inputs"]["lora_name"] = target_detailer_lora
 
-                    print("🚀 Executing Sub-Graph 3 (Audio Generation & Combine Decoders)...")
+                    # NEW: LowVRAMLatentUpscaleModelLoader logic
+                    if "407" in sg3:
+                        if "inputs" not in sg3["407"]: sg3["407"]["inputs"] = {}
+                        sg3["407"]["inputs"]["model_name"] = target_upscaler
+
+                    # Update VHS_VideoCombine frame rate logic 
+                    if "306" in sg3:
+                        if "inputs" not in sg3["306"]: sg3["306"]["inputs"] = {}
+                        sg3["306"]["inputs"]["format"] = "video/h264-mp4"
+                        sg3["306"]["inputs"]["frame_rate"] = 24  # Force to 24fps as the temporal latent upscaler doubles frames
+
+                    print("🚀 Executing Sub-Graph 3 (Upscaling, Color Correction, Audio, & Combining)...")
                     await self.execute_comfy_workflow(session, sg3)
                     await self.clear_comfy_memory(session)
 
@@ -614,7 +597,6 @@ class LTXEngine:
             
             try:
                 result = task.result()
-                # FIX: Ensure result is serialized to JSON string if it's a dict/list
                 if isinstance(result, (dict, list)):
                     yield json.dumps(result).encode("utf-8")
                 else:
@@ -625,7 +607,4 @@ class LTXEngine:
             except Exception as e:
                 yield json.dumps({"status": "error", "detail": str(e)}).encode("utf-8")
 
-        # RECOMMENDED: Use "text/plain" or "application/x-ndjson" if client stream-parses.
-        # If the client reads the whole response at once, "application/json" is fine 
-        # because standard JSON parsers ignore leading whitespace.
         return StreamingResponse(stream_response(), media_type="application/json")

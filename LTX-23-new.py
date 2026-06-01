@@ -246,14 +246,17 @@ NODE_CLASS_MAPPINGS = {"LTXColorFixer": LTXColorFixer}
         if not comfy_ready:
             os._exit(1)
 
-        print("🔥 Running Ghost Load to build mmap pointers and stream weights directly to GPU...")
+
+
+print("🔥 Running Ghost Load to build mmap pointers and stream weights directly to GPU...")
         try:
-            # FIX: Added `"device": "default"` into the VAELoaderKJ inputs so it successfully passes ComfyUI Validation!
+            # FIX: Swapped to native 'VAELoader' to completely bypass KJNodes validation errors!
+            # Removed 'device' arguments as native nodes do not require them.
             prewarm_payload = {
                 "prompt": {
                     "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors", "weight_dtype": "fp8_e4m3fn"}},
-                    "2": {"class_type": "VAELoaderKJ", "inputs": {"vae_name": "LTX23_video_vae_bf16.safetensors", "weight_dtype": "bf16", "device": "default"}},
-                    "3": {"class_type": "DualCLIPLoader", "inputs": {"clip_name1": "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors", "clip_name2": "ltx-2.3_text_projection_bf16.safetensors", "type": "ltxv", "device": "default"}},
+                    "2": {"class_type": "VAELoader", "inputs": {"vae_name": "LTX23_video_vae_bf16.safetensors"}},
+                    "3": {"class_type": "DualCLIPLoader", "inputs": {"clip_name1": "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors", "clip_name2": "ltx-2.3_text_projection_bf16.safetensors", "type": "ltxv"}},
                     "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "prewarm system", "clip": ["3", 0]}},
                     "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 128, "height": 128, "batch_size": 1}},
                     "6": {"class_type": "KSampler", "inputs": {
@@ -270,6 +273,7 @@ NODE_CLASS_MAPPINGS = {"LTXColorFixer": LTXColorFixer}
             print("✅ Ghost Load complete. System is prepared for n8n API.")
         except Exception as e:
             print(f"⚠️ Ghost Load skipped: {e}")
+    
 
     async def clear_comfy_memory(self, session):
         try:

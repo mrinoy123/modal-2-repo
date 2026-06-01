@@ -28,7 +28,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "207" # Bumped to ensure a fresh build layer for the updates
+    "FORCE_REBUILD_INDEX": "208"  # Bumped to ensure a completely fresh image build layer
 })
 
 # ==============================================================================
@@ -94,7 +94,7 @@ weights_volume = modal.Volume.from_name("Ltx-23-model-weights-new", create_if_mi
     image=final_image,
     volumes={"/mnt/weights": weights_volume},
     secrets=[modal.Secret.from_name("custom-secret")],
-    memory=8192, # STRICT 8GB RAM REQUIREMENT ENFORCED HERE
+    memory=8192, # STRICT 8GB RAM REQUIREMENT ENFORCED
     scaledown_window=30,
     timeout=3600
 )
@@ -154,14 +154,12 @@ class LTX23Engine:
         env_vars["TORCH_NUM_THREADS"] = "1"
         env_vars["OMP_NUM_THREADS"] = "1"
         
-        # Aggressive memory cleanup thresholds to keep the 8GB RAM ceiling clear
         env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:64"
         env_vars["CUDA_MODULE_LOADING"] = "LAZY" 
         
-        # OOM FIX APPLIED HERE: Replaced --highvram with --normalvram to force proper VRAM purging across steps
         self.process = subprocess.Popen([
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
-            "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
+            "--mmap-torch-files", "--normalvram", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
             "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc"
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)
         
@@ -310,7 +308,7 @@ class LTX23Engine:
             try:
                 async with aiohttp.ClientSession() as session:
                     
-                    # 1. Acquire JSON Workflow
+                    # 1. Acquire JSON Workflow File
                     workflow_raw = body.get("workflow_json")
                     if workflow_raw:
                         workflow = json.loads(workflow_raw) if isinstance(workflow_raw, str) else workflow_raw
@@ -327,46 +325,32 @@ class LTX23Engine:
                     
                     workflow = self.merge_overrides(workflow, body.get("workflow_override"))
 
-                    # 2. Mathematical Extraction and Graph Injection
+                    # 2. Chronological Prompt Sequence Calculations
                     num_imgs = len(image_filenames)
                     num_prompts = len(prompts_list)
 
                     prompt_frames = [int(i * (requested_length - 1) / max(1, num_prompts - 1)) for i in range(num_prompts)]
                     local_prompts_str = "\n".join([f"{frame}: {prompt}" for frame, prompt in zip(prompt_frames, prompts_list)])
 
-                    # Setup timeline map string fallback
-                    timeline_data_str = json.dumps({"segments": [], "audioSegments": []})
-
+                    # 3. Structural 1-Image vs. Multi-Image Conditional Routing
                     if num_imgs == 1:
-                        # 1-Image Fix: Pull resolution bounds
-                        custom_w = 1280
-                        custom_h = 704
-                        if "46" in workflow and "inputs" in workflow["46"]:
-                            custom_w = workflow["46"]["inputs"].get("custom_width", 1280)
-                            custom_h = workflow["46"]["inputs"].get("custom_height", 704)
-                        
-                        target_img_name = "guide_single_init.png"
-                        target_path = os.path.join("/workspace/ComfyUI/input", target_img_name)
-                        
-                        # Dynamically resize the single frame to maintain matrix integrity
-                        from PIL import Image
-                        img = Image.open(image_filenames[0]).convert("RGB")
-                        img = img.resize((custom_w, custom_h), Image.Resampling.LANCZOS)
-                        img.save(target_path)
-                        
-                        # GRAPH VALIDATION CRASH FIX APPLIED HERE:
-                        # Removed the dynamic Node 9990/9991 injection and the optional_latent mapping.
-                        # We now explicitly target the Director node's native image conditioning parameter.
-                        if "46" in workflow:
-                            if "inputs" not in workflow["46"]: workflow["46"]["inputs"] = {}
-                            if "optional_latent" in workflow["46"]["inputs"]: 
-                                del workflow["46"]["inputs"]["optional_latent"]
-                                
-                            workflow["46"]["inputs"]["image"] = target_img_name
-                            workflow["46"]["inputs"]["images"] = target_img_name
+                        # 1-Image Setup: Create a micro dropping anchor timeline (Frame 0 & Frame 1)
+                        # This initializes the latent canvas and gives prompts 100% control over subsequent frames.
+                        segments = []
+                        for frame in [0, 1]:
+                            try:
+                                with open(image_filenames[0], "rb") as f:
+                                    b64_img = base64.b64encode(f.read()).decode("utf-8")
+                                    segments.append({
+                                        "frame": frame,
+                                        "image": f"data:image/png;base64,{b64_img}"
+                                    })
+                            except Exception:
+                                continue
+                        timeline_data_str = json.dumps({"segments": segments, "audioSegments": []})
                             
                     elif num_imgs > 1:
-                        # 2+ Image Math: Build smooth multi-segment base64 timeline data for Director cross-fading
+                        # Multi-Image Setup: Distribute images across the entire sequence for smooth transitions
                         img_frames = [int(i * (requested_length - 1) / max(1, num_imgs - 1)) for i in range(num_imgs)]
                         segments = []
                         for frame, img_path in zip(img_frames, image_filenames):
@@ -387,8 +371,12 @@ class LTX23Engine:
                         workflow["46"]["inputs"]["duration_frames"] = requested_length
                         workflow["46"]["inputs"]["local_prompts"] = local_prompts_str
                         workflow["46"]["inputs"]["timeline_data"] = timeline_data_str
+                        
+                        # CRITICAL BUG FIX: Force frame rate tracking back down to 24fps cinema speed 
+                        # This overrides the hidden 222fps default and ensures a complete 6+ second output file
+                        workflow["46"]["inputs"]["frame_rate"] = 24
 
-                    # V10 Model File Mappings ensuring hard drive alignment
+                    # V10 Model Mapping Layer Validations
                     if "98" in workflow: workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors"
                     if "100" in workflow: workflow["100"]["inputs"]["lora_name"] = "ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors"
                     if "101" in workflow:

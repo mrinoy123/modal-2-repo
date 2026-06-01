@@ -246,18 +246,29 @@ NODE_CLASS_MAPPINGS = {"LTXColorFixer": LTXColorFixer}
         if not comfy_ready:
             os._exit(1)
 
-        print("🔥 Running Ghost Load to build mmap pointers and compile kernels...")
+        print("🔥 Running Ghost Load to build mmap pointers and stream weights directly to GPU...")
         try:
+            # FIX 1: Added a valid execution path with a SaveImage output node!
+            # This makes ComfyUI accept the request, bypassing the "no outputs" error
+            # and cleanly maps the heavy model weights directly to the GPU without bloating RAM.
             prewarm_payload = {
                 "prompt": {
                     "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors", "weight_dtype": "fp8_e4m3fn"}},
                     "2": {"class_type": "VAELoaderKJ", "inputs": {"vae_name": "LTX23_video_vae_bf16.safetensors", "weight_dtype": "bf16"}},
-                    "3": {"class_type": "DualCLIPLoader", "inputs": {"clip_name1": "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors", "clip_name2": "ltx-2.3_text_projection_bf16.safetensors", "type": "ltxv", "device": "default"}}
+                    "3": {"class_type": "DualCLIPLoader", "inputs": {"clip_name1": "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors", "clip_name2": "ltx-2.3_text_projection_bf16.safetensors", "type": "ltxv", "device": "default"}},
+                    "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "prewarm system", "clip": ["3", 0]}},
+                    "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 128, "height": 128, "batch_size": 1}},
+                    "6": {"class_type": "KSampler", "inputs": {
+                        "seed": 0, "steps": 1, "cfg": 1.0, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0,
+                        "model": ["1", 0], "positive": ["4", 0], "negative": ["4", 0], "latent_image": ["5", 0]
+                    }},
+                    "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["2", 0]}},
+                    "8": {"class_type": "SaveImage", "inputs": {"filename_prefix": "ghost_load", "images": ["7", 0]}}
                 }
             }
             req = urllib.request.Request("http://127.0.0.1:8188/prompt", data=json.dumps(prewarm_payload).encode('utf-8'), headers={'Content-Type': 'application/json'})
-            urllib.request.urlopen(req, timeout=120) 
-            time.sleep(5)
+            urllib.request.urlopen(req, timeout=300) 
+            time.sleep(10)
             print("✅ Ghost Load complete. System is prepared for n8n API.")
         except Exception as e:
             print(f"⚠️ Ghost Load skipped: {e}")
@@ -458,6 +469,31 @@ NODE_CLASS_MAPPINGS = {"LTXColorFixer": LTXColorFixer}
                     if "103" in workflow: workflow["103"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                     if "102" in workflow: workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
                     if "94:105" in workflow: workflow["94:105"]["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+
+                    # ==============================================================================
+                    # FIX 2: 🎨 DYNAMICALLY WIRE THE BRIGHTNESS / COLOR FIXER INTO THE WORKFLOW
+                    # ==============================================================================
+                    # We locate the node where your video images are being compiled or saved, 
+                    # intercept the connection, and insert the Fixer node in between!
+                    keys = list(workflow.keys())
+                    for node_id in keys:
+                        node_info = workflow[node_id]
+                        if node_info.get("class_type") in ["VHS_VideoCombine", "SaveVideo"]:
+                            if "inputs" in node_info and "images" in node_info["inputs"]:
+                                original_image_source = node_info["inputs"]["images"]
+                                
+                                fixer_id = "9999_color_fixer"
+                                workflow[fixer_id] = {
+                                    "class_type": "LTXColorFixer",
+                                    "inputs": {
+                                        "image": original_image_source,
+                                        "target_brightness": 0.40,
+                                        "max_boost": 2.0  # Increased slightly to help with very dark generations
+                                    }
+                                }
+                                node_info["inputs"]["images"] = [fixer_id, 0]
+                                print(f"🔗 Successfully wired LTXColorFixer before node {node_id}")
+                    # ==============================================================================
 
                     print(f"🚀 Executing Monolithic LTX 2.3 Director Generation ({num_imgs} Images, {num_prompts} Prompts)...")
                     await self.execute_comfy_workflow(session, workflow)

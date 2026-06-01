@@ -248,13 +248,11 @@ NODE_CLASS_MAPPINGS = {"LTXColorFixer": LTXColorFixer}
 
         print("🔥 Running Ghost Load to build mmap pointers and stream weights directly to GPU...")
         try:
-            # FIX 1: Added a valid execution path with a SaveImage output node!
-            # This makes ComfyUI accept the request, bypassing the "no outputs" error
-            # and cleanly maps the heavy model weights directly to the GPU without bloating RAM.
+            # FIX: Added `"device": "default"` into the VAELoaderKJ inputs so it successfully passes ComfyUI Validation!
             prewarm_payload = {
                 "prompt": {
                     "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors", "weight_dtype": "fp8_e4m3fn"}},
-                    "2": {"class_type": "VAELoaderKJ", "inputs": {"vae_name": "LTX23_video_vae_bf16.safetensors", "weight_dtype": "bf16"}},
+                    "2": {"class_type": "VAELoaderKJ", "inputs": {"vae_name": "LTX23_video_vae_bf16.safetensors", "weight_dtype": "bf16", "device": "default"}},
                     "3": {"class_type": "DualCLIPLoader", "inputs": {"clip_name1": "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors", "clip_name2": "ltx-2.3_text_projection_bf16.safetensors", "type": "ltxv", "device": "default"}},
                     "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "prewarm system", "clip": ["3", 0]}},
                     "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 128, "height": 128, "batch_size": 1}},
@@ -473,8 +471,6 @@ NODE_CLASS_MAPPINGS = {"LTXColorFixer": LTXColorFixer}
                     # ==============================================================================
                     # FIX 2: 🎨 DYNAMICALLY WIRE THE BRIGHTNESS / COLOR FIXER INTO THE WORKFLOW
                     # ==============================================================================
-                    # We locate the node where your video images are being compiled or saved, 
-                    # intercept the connection, and insert the Fixer node in between!
                     keys = list(workflow.keys())
                     for node_id in keys:
                         node_info = workflow[node_id]
@@ -488,7 +484,7 @@ NODE_CLASS_MAPPINGS = {"LTXColorFixer": LTXColorFixer}
                                     "inputs": {
                                         "image": original_image_source,
                                         "target_brightness": 0.40,
-                                        "max_boost": 2.0  # Increased slightly to help with very dark generations
+                                        "max_boost": 2.0
                                     }
                                 }
                                 node_info["inputs"]["images"] = [fixer_id, 0]

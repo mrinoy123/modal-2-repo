@@ -28,7 +28,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "212"  # Bumped to ensure a completely fresh image build layer
+    "FORCE_REBUILD_INDEX": "213"  # Bumped to ensure a completely fresh image build layer
 })
 
 # ==============================================================================
@@ -246,7 +246,6 @@ NODE_CLASS_MAPPINGS = {"LTXColorFixer": LTXColorFixer}
         if not comfy_ready:
             os._exit(1)
 
-
         print("🔥 Running Ghost Load to build mmap pointers and stream weights directly to GPU...")
         try:
             # FIX: Swapped to native 'VAELoader' to completely bypass KJNodes validation errors!
@@ -353,17 +352,6 @@ NODE_CLASS_MAPPINGS = {"LTXColorFixer": LTXColorFixer}
             date_folder = body.get("date_folder", time.strftime('%Y-%m-%d'))
             workflow_url = body.get("workflow_url") 
 
-            if isinstance(prompts_dict, list):
-                prompts_list = [str(p).strip() for p in prompts_dict if str(p).strip()]
-            elif isinstance(prompts_dict, dict):
-                try:
-                    sorted_keys = sorted(prompts_dict.keys(), key=lambda x: int(x) if str(x).isdigit() else 0)
-                    prompts_list = [str(prompts_dict[k]).strip() for k in sorted_keys if str(prompts_dict[k]).strip()]
-                except Exception:
-                    prompts_list = [str(v).strip() for v in prompts_dict.values()]
-            else:
-                prompts_list = [p.strip() for p in str(prompts_dict).split("\n") if p.strip()]
-
             urls_to_download = []
             if incoming_image_urls:
                 if isinstance(incoming_image_urls, list): 
@@ -418,13 +406,49 @@ NODE_CLASS_MAPPINGS = {"LTXColorFixer": LTXColorFixer}
                     
                     workflow = self.merge_overrides(workflow, body.get("workflow_override"))
 
+                    # ========================================================================
+                    # CUSTOM TIMING FIX: Reads exact frame keys if a dict is passed from n8n
+                    # ========================================================================
                     num_imgs = len(image_filenames)
-                    num_prompts = len(prompts_list)
-
-                    prompt_frames = [int(i * (requested_length - 1) / max(1, num_prompts - 1)) for i in range(num_prompts)]
-                    local_prompts_str = "\n".join([f"{frame}: {prompt}" for frame, prompt in zip(prompt_frames, prompts_list)])
+                    
+                    if isinstance(prompts_dict, dict) and any(str(k).isdigit() for k in prompts_dict.keys()):
+                        # Native Custom Timing: Maps exactly to the frame numbers you provided (e.g. 0, 50, 75)
+                        sorted_keys = sorted(prompts_dict.keys(), key=lambda x: int(x) if str(x).isdigit() else -1)
+                        valid_keys = [k for k in sorted_keys if str(k).isdigit() and str(prompts_dict[k]).strip()]
+                        local_prompts_str = "\n".join([f"{k}: {prompts_dict[k].strip()}" for k in valid_keys])
+                        num_prompts = len(valid_keys)
+                    else:
+                        # Fallback for old simple arrays
+                        if isinstance(prompts_dict, list):
+                            prompts_list = [str(p).strip() for p in prompts_dict if str(p).strip()]
+                        elif isinstance(prompts_dict, dict):
+                            prompts_list = [str(v).strip() for v in prompts_dict.values() if str(v).strip()]
+                        else:
+                            prompts_list = [p.strip() for p in str(prompts_dict).split("\n") if p.strip()]
+                            
+                        num_prompts = len(prompts_list)
+                        if num_prompts > 0:
+                            prompt_frames = [int(i * (requested_length - 1) / max(1, num_prompts - 1)) for i in range(num_prompts)]
+                            local_prompts_str = "\n".join([f"{frame}: {prompt}" for frame, prompt in zip(prompt_frames, prompts_list)])
+                        else:
+                            local_prompts_str = ""
+                    # ========================================================================
 
                     if num_imgs == 1:
+                        custom_w = 1280
+                        custom_h = 704
+                        if "46" in workflow and "inputs" in workflow["46"]:
+                            custom_w = workflow["46"]["inputs"].get("custom_width", 1280)
+                            custom_h = workflow["46"]["inputs"].get("custom_height", 704)
+                        
+                        target_img_name = "guide_single_init.png"
+                        target_path = os.path.join("/workspace/ComfyUI/input", target_img_name)
+                        
+                        from PIL import Image
+                        img = Image.open(image_filenames[0]).convert("RGB")
+                        img = img.resize((custom_w, custom_h), Image.Resampling.LANCZOS)
+                        img.save(target_path)
+                        
                         segments = []
                         for frame in [0, 1]:
                             try:

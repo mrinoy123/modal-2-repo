@@ -44,7 +44,7 @@ build_image = base_image.env({
     "CXX": "g++"
 }).run_commands(
     "python3.12 -m pip install --no-cache-dir fastapi aiohttp boto3 triton>=3.1.0 ninja setuptools>=70.0.0 wheel pip>=24.0 Pillow",
-    "python3.12 -m pip install --no-cache-dir pandas numexpr pytz python-dateutil scipy matplotlib colorama librosa soundfile decord imageio scikit-image numba einops bitsandbytes"
+    "python3.12 -m pip install --no-cache-dir pandas numexpr pytz python-dateutil scipy matplotlib colorama torchvision librosa soundfile decord imageio scikit-image numba einops bitsandbytes"
 )
 
 # ==============================================================================
@@ -94,7 +94,7 @@ weights_volume = modal.Volume.from_name("Ltx-23-model-weights-new", create_if_mi
     image=final_image,
     volumes={"/mnt/weights": weights_volume},
     secrets=[modal.Secret.from_name("custom-secret")],
-    memory=8192, # STRICT 8GB RAM REQUIREMENT ENFORCED
+    memory=8192, 
     scaledown_window=30,
     timeout=3600
 )
@@ -117,6 +117,70 @@ class LTX23Engine:
     @modal.enter()
     def start_comfy(self):
         import boto3
+        
+        # 🔥 SMART AUTO-EXPOSURE & COLOR FIXER NODE 🔥
+        print("🎨 Injecting Smart Auto-Exposure LTX Color Fixer Node...")
+        color_node_path = "/workspace/ComfyUI/custom_nodes/LTXColorFixer.py"
+        with open(color_node_path, "w") as f:
+            f.write("""
+import torch
+import torchvision.transforms.functional as TF
+
+class LTXColorFixer:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "image": ("IMAGE",),
+            "target_brightness": ("FLOAT", {"default": 0.40, "min": 0.1, "max": 1.0, "step": 0.05, "tooltip": "Target average luminance (0.4 is good daylight)"}),
+            "max_boost": ("FLOAT", {"default": 1.6, "min": 1.0, "max": 3.0, "step": 0.1, "tooltip": "Maximum multiplier so dark scenes don't blow out completely"}),
+        }}
+    
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "process"
+    CATEGORY = "image/postprocessing"
+
+    def process(self, image, target_brightness, max_boost):
+        # Image shape from ComfyUI is (Batch/Frames, Height, Width, Channels RGB) [0.0 to 1.0]
+        
+        # 1. Calculate the real mean luminance (brightness) of the entire video batch
+        # ITU-R BT.601 formula for relative luminance
+        r = image[:, :, :, 0]
+        g = image[:, :, :, 1]
+        b = image[:, :, :, 2]
+        luminance = 0.299 * r + 0.587 * g + 0.114 * b
+        
+        mean_lum = torch.mean(luminance).item()
+        
+        # 2. Dynamic Logic Gate: Only trigger if the video is too dark
+        if mean_lum < target_brightness and mean_lum > 0.01:
+            # Calculate exactly how much to multiply the pixels to reach the target
+            boost = target_brightness / mean_lum
+            
+            # Clamp it to the safe maximum so we don't destroy contrast
+            boost = min(boost, max_boost)
+            print(f"[LTX Smart Exposure] Video is dark (Luma: {mean_lum:.3f}). Applying Auto-Boost: {boost:.2f}x")
+            
+            # TF functions expect (B, C, H, W)
+            img_t = image.permute(0, 3, 1, 2)
+            
+            # Apply dynamic brightness
+            img_t = TF.adjust_brightness(img_t, boost)
+            
+            # Auto-compensate saturation (brighter pixels wash out, so we boost saturation slightly based on the brightness boost)
+            sat_boost = 1.0 + ((boost - 1.0) * 0.4) 
+            img_t = TF.adjust_saturation(img_t, sat_boost)
+            
+            # Convert back to ComfyUI standard shape (B, H, W, C)
+            image = img_t.permute(0, 2, 3, 1)
+        else:
+            print(f"[LTX Smart Exposure] Video brightness is optimal (Luma: {mean_lum:.3f}). Bypassing adjustments.")
+            
+        return (image,)
+
+NODE_CLASS_MAPPINGS = {"LTXColorFixer": LTXColorFixer}
+""")
+        # =====================================================================
+
         print("🔗 Running Atomic Model Folder Linker for LTX 2.3...")
         base_models_dir = "/workspace/ComfyUI/models"
         
@@ -146,7 +210,7 @@ class LTX23Engine:
             region_name="auto"
         )
 
-        print("🚀 Launching Monolithic LTX 2.3 Server Engine (Disk-to-VRAM Mode)...")
+        print("🚀 Launching Monolithic LTX 2.3 Server Engine...")
         os.makedirs("/tmp/comfy_swap", exist_ok=True)
 
         env_vars = os.environ.copy()
@@ -157,7 +221,6 @@ class LTX23Engine:
         env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:64"
         env_vars["CUDA_MODULE_LOADING"] = "LAZY" 
         
-        # EXACT original arguments kept as requested (prevents OOM!)
         self.process = subprocess.Popen([
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
             "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
@@ -167,7 +230,6 @@ class LTX23Engine:
         self.t = threading.Thread(target=self._log_reader, daemon=True)
         self.t.start()
 
-        # MODIFIED LOOP: Now uses a break instead of a return so it can trigger the Ghost Load
         start_time = time.time()
         comfy_ready = False
         while time.time() - start_time < 300:
@@ -184,9 +246,7 @@ class LTX23Engine:
         if not comfy_ready:
             os._exit(1)
 
-        # 🔥 THE GHOST LOAD (Pre-Warm Phase)
-        # This compiles the SageAttention kernels and indexes the files so the first n8n request is instant.
-        print("🔥 Running Ghost Load to build mmap pointers and compile Triton kernels...")
+        print("🔥 Running Ghost Load to build mmap pointers and compile kernels...")
         try:
             prewarm_payload = {
                 "prompt": {
@@ -195,14 +255,12 @@ class LTX23Engine:
                     "3": {"class_type": "DualCLIPLoader", "inputs": {"clip_name1": "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors", "clip_name2": "ltx-2.3_text_projection_bf16.safetensors", "type": "ltxv", "device": "default"}}
                 }
             }
-            # Timeout set high (120s) because PyTorch kernel compilation takes time on the first boot
             req = urllib.request.Request("http://127.0.0.1:8188/prompt", data=json.dumps(prewarm_payload).encode('utf-8'), headers={'Content-Type': 'application/json'})
             urllib.request.urlopen(req, timeout=120) 
-            
             time.sleep(5)
-            print("✅ Ghost Load complete. VRAM is perfectly clear and system is prepared for n8n API.")
+            print("✅ Ghost Load complete. System is prepared for n8n API.")
         except Exception as e:
-            print(f"⚠️ Ghost Load skipped or timed out (will load on first request): {e}")
+            print(f"⚠️ Ghost Load skipped: {e}")
 
     async def clear_comfy_memory(self, session):
         try:
@@ -333,8 +391,6 @@ class LTX23Engine:
 
             try:
                 async with aiohttp.ClientSession() as session:
-                    
-                    # 1. Acquire JSON Workflow File
                     workflow_raw = body.get("workflow_json")
                     if workflow_raw:
                         workflow = json.loads(workflow_raw) if isinstance(workflow_raw, str) else workflow_raw
@@ -351,17 +407,13 @@ class LTX23Engine:
                     
                     workflow = self.merge_overrides(workflow, body.get("workflow_override"))
 
-                    # 2. Chronological Prompt Sequence Calculations
                     num_imgs = len(image_filenames)
                     num_prompts = len(prompts_list)
 
                     prompt_frames = [int(i * (requested_length - 1) / max(1, num_prompts - 1)) for i in range(num_prompts)]
                     local_prompts_str = "\n".join([f"{frame}: {prompt}" for frame, prompt in zip(prompt_frames, prompts_list)])
 
-                    # 3. Structural 1-Image vs. Multi-Image Conditional Routing
                     if num_imgs == 1:
-                        # 1-Image Setup: Create a micro dropping anchor timeline (Frame 0 & Frame 1)
-                        # This initializes the latent canvas and gives prompts 100% control over subsequent frames.
                         segments = []
                         for frame in [0, 1]:
                             try:
@@ -376,7 +428,6 @@ class LTX23Engine:
                         timeline_data_str = json.dumps({"segments": segments, "audioSegments": []})
                             
                     elif num_imgs > 1:
-                        # Multi-Image Setup: Distribute images across the entire sequence for smooth transitions
                         img_frames = [int(i * (requested_length - 1) / max(1, num_imgs - 1)) for i in range(num_imgs)]
                         segments = []
                         for frame, img_path in zip(img_frames, image_filenames):
@@ -391,18 +442,13 @@ class LTX23Engine:
                                 continue
                         timeline_data_str = json.dumps({"segments": segments, "audioSegments": []})
 
-                    # Inject Master Controls into LTXDirector Node (46)
                     if "46" in workflow:
                         if "inputs" not in workflow["46"]: workflow["46"]["inputs"] = {}
                         workflow["46"]["inputs"]["duration_frames"] = requested_length
                         workflow["46"]["inputs"]["local_prompts"] = local_prompts_str
                         workflow["46"]["inputs"]["timeline_data"] = timeline_data_str
-                        
-                        # CRITICAL BUG FIX: Force frame rate tracking back down to 24fps cinema speed 
-                        # This overrides the hidden 222fps default and ensures a complete 6+ second output file
                         workflow["46"]["inputs"]["frame_rate"] = 24
 
-                    # V10 Model Mapping Layer Validations
                     if "98" in workflow: workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors"
                     if "100" in workflow: workflow["100"]["inputs"]["lora_name"] = "ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors"
                     if "101" in workflow:
@@ -449,24 +495,18 @@ class LTX23Engine:
             finally:
                 ram_task.cancel()
 
-        # ==========================================================================
-        # PART 7: STREAM RESPONSE TO BYPASS CLOUD TIMEOUTS
-        # ==========================================================================
         async def stream_response():
             task = asyncio.create_task(process_pipeline())
-            
             while not task.done():
                 yield b" "  
                 done, pending = await asyncio.wait([task], timeout=10.0)
                 if task in done: break
-            
             try:
                 result = task.result()
                 if isinstance(result, (dict, list)):
                     yield json.dumps(result).encode("utf-8")
                 else:
                     yield str(result).encode("utf-8")
-                    
             except HTTPException as e:
                 yield json.dumps({"status": "error", "detail": e.detail}).encode("utf-8")
             except Exception as e:

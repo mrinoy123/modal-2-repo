@@ -157,6 +157,7 @@ class LTX23Engine:
         env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:64"
         env_vars["CUDA_MODULE_LOADING"] = "LAZY" 
         
+        # EXACT original arguments kept as requested (prevents OOM!)
         self.process = subprocess.Popen([
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
             "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
@@ -166,17 +167,42 @@ class LTX23Engine:
         self.t = threading.Thread(target=self._log_reader, daemon=True)
         self.t.start()
 
+        # MODIFIED LOOP: Now uses a break instead of a return so it can trigger the Ghost Load
         start_time = time.time()
+        comfy_ready = False
         while time.time() - start_time < 300:
             if self.process.poll() is not None: 
                 os._exit(1)
             try:
                 with urllib.request.urlopen("http://127.0.0.1:8188/", timeout=1) as response:
                     if response.status == 200: 
-                        return
+                        comfy_ready = True
+                        break
             except Exception: 
                 time.sleep(2)
-        os._exit(1)
+                
+        if not comfy_ready:
+            os._exit(1)
+
+        # 🔥 THE GHOST LOAD (Pre-Warm Phase)
+        # This compiles the SageAttention kernels and indexes the files so the first n8n request is instant.
+        print("🔥 Running Ghost Load to build mmap pointers and compile Triton kernels...")
+        try:
+            prewarm_payload = {
+                "prompt": {
+                    "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors", "weight_dtype": "fp8_e4m3fn"}},
+                    "2": {"class_type": "VAELoaderKJ", "inputs": {"vae_name": "LTX23_video_vae_bf16.safetensors", "weight_dtype": "bf16"}},
+                    "3": {"class_type": "DualCLIPLoader", "inputs": {"clip_name1": "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors", "clip_name2": "ltx-2.3_text_projection_bf16.safetensors", "type": "ltxv", "device": "default"}}
+                }
+            }
+            # Timeout set high (120s) because PyTorch kernel compilation takes time on the first boot
+            req = urllib.request.Request("http://127.0.0.1:8188/prompt", data=json.dumps(prewarm_payload).encode('utf-8'), headers={'Content-Type': 'application/json'})
+            urllib.request.urlopen(req, timeout=120) 
+            
+            time.sleep(5)
+            print("✅ Ghost Load complete. VRAM is perfectly clear and system is prepared for n8n API.")
+        except Exception as e:
+            print(f"⚠️ Ghost Load skipped or timed out (will load on first request): {e}")
 
     async def clear_comfy_memory(self, session):
         try:

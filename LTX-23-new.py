@@ -245,7 +245,7 @@ class LTX23Engine:
     # ==============================================================================
     # PART 6: MAIN FASTAPI ENDPOINT (TIMELINE MAPPING & GENERATION)
     # ==============================================================================
-    @modal.web_endpoint(method="POST")
+    @modal.fastapi_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
         if x_api_key != "testing-modal-workflow-2": 
             raise HTTPException(status_code=403, detail="Unauthorized Account 2 Pipeline Request")

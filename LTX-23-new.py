@@ -1,6 +1,5 @@
 # ==============================================================================
 # PART 1: IMPORTS & ENVIRONMENT SETUP
-# Purpose: Load all necessary standard libraries, networking utilities, and Modal types.
 # ==============================================================================
 import modal
 import subprocess
@@ -20,7 +19,6 @@ from typing import Optional
 
 # ==============================================================================
 # PART 2: BASE IMAGE & OS CONFIGURATION
-# Purpose: Establish the foundational Ubuntu/CUDA image and install system packages.
 # ==============================================================================
 base_image = modal.Image.from_registry(
     "nvidia/cuda:12.5.1-devel-ubuntu24.04",
@@ -30,7 +28,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "205"  # Bumped to ensure fresh deployment cache for LTX 2.3
+    "FORCE_REBUILD_INDEX": "206"
 })
 
 # ==============================================================================
@@ -50,8 +48,7 @@ build_image = base_image.env({
 )
 
 # ==============================================================================
-# PART 4: COMFYUI & CUSTOM NODES CLONING + DEPENDENCY ISOLATION
-# Purpose: Pull required LTX 2.3 repositories including WhatDreamsCost Director.
+# PART 4: COMFYUI & CUSTOM NODES CLONING
 # ==============================================================================
 torch_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124",
@@ -87,17 +84,17 @@ final_image = deps_image.run_commands(
 )
 
 # ==============================================================================
-# PART 5: MODAL APP CONFIGURATION & CLOUD VOLUMES (LTX 2.3 STORAGE)
+# PART 5: MODAL APP CONFIGURATION & CLOUD VOLUMES (8GB SYSTEM RAM LIMIT)
 # ==============================================================================
 app = modal.App("media-worker-ltx23")
 weights_volume = modal.Volume.from_name("Ltx-23-model-weights-new", create_if_missing=False)
 
 @app.cls(
-    gpu="L40S", # Ensure you use an L40S or L4 for robust VRAM capacity
+    gpu="L40S", 
     image=final_image,
     volumes={"/mnt/weights": weights_volume},
     secrets=[modal.Secret.from_name("custom-secret")],
-    memory=32768, 
+    memory=8192, # STRIcT 8GB RAM REQUIREMENT ENFORCED HERE
     scaledown_window=30,
     timeout=3600
 )
@@ -123,7 +120,6 @@ class LTX23Engine:
         print("🔗 Running Atomic Model Folder Linker for LTX 2.3...")
         base_models_dir = "/workspace/ComfyUI/models"
         
-        # Cross-mapping all structural folder paths observed in your configuration
         dirs = ["unet", "vae", "clip", "text_encoders", "checkpoints", "loras", "upscale_models", "latent_upscale_models"]
         for d in dirs: 
             os.makedirs(os.path.join(base_models_dir, d), exist_ok=True)
@@ -150,7 +146,7 @@ class LTX23Engine:
             region_name="auto"
         )
 
-        print("🚀 Launching Monolithic LTX 2.3 Server Engine...")
+        print("🚀 Launching Monolithic LTX 2.3 Server Engine (Disk-to-VRAM Mode)...")
         os.makedirs("/tmp/comfy_swap", exist_ok=True)
 
         env_vars = os.environ.copy()
@@ -158,12 +154,14 @@ class LTX23Engine:
         env_vars["TORCH_NUM_THREADS"] = "1"
         env_vars["OMP_NUM_THREADS"] = "1"
         
-        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
+        # Aggressive memory cleanup thresholds to keep the 8GB RAM ceiling clear
+        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:64"
         env_vars["CUDA_MODULE_LOADING"] = "LAZY" 
         
+        # Added --highvram flag: Forces direct disk mmap transfers straight to VRAM, bypassing RAM cache
         self.process = subprocess.Popen([
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
-            "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
+            "--mmap-torch-files", "--highvram", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
             "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc"
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)
         
@@ -243,7 +241,7 @@ class LTX23Engine:
         return base_graph
 
     # ==============================================================================
-    # PART 6: MAIN FASTAPI ENDPOINT (TIMELINE MAPPING & GENERATION)
+    # PART 6: MAIN FASTAPI ENDPOINT & DYNAMIC TIMELINE / LATENT INJECTION
     # ==============================================================================
     @modal.fastapi_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
@@ -257,12 +255,11 @@ class LTX23Engine:
 
         async def process_pipeline():
             incoming_image_urls = body.get("image_url")
-            requested_length = int(body.get("length", 480)) # Defaulting to 20 seconds at 24fps
+            requested_length = int(body.get("length", 480)) 
             prompts_dict = body.get("prompts", {})
             date_folder = body.get("date_folder", time.strftime('%Y-%m-%d'))
-            workflow_url = body.get("workflow_url") # Fallback to fetch JSON dynamically from n8n
+            workflow_url = body.get("workflow_url") 
 
-            # Parse Prompts Safely (Handles Dicts and Lists from n8n)
             if isinstance(prompts_dict, list):
                 prompts_list = [str(p).strip() for p in prompts_dict if str(p).strip()]
             elif isinstance(prompts_dict, dict):
@@ -274,7 +271,6 @@ class LTX23Engine:
             else:
                 prompts_list = [p.strip() for p in str(prompts_dict).split("\n") if p.strip()]
 
-            # Parse Image URLs (Handles Arrays or Comma Strings)
             urls_to_download = []
             if incoming_image_urls:
                 if isinstance(incoming_image_urls, list): 
@@ -286,9 +282,6 @@ class LTX23Engine:
             if os.path.exists(dynamic_guides_dir): shutil.rmtree(dynamic_guides_dir)
             os.makedirs(dynamic_guides_dir, exist_ok=True)
 
-            # --------------------------------------------------------------------------
-            # 1. DOWNLOAD IMAGES & ENCODE TO BASE64
-            # --------------------------------------------------------------------------
             async def download_one(session, url_str, target_dest):
                 try:
                     async with session.get(url_str, timeout=120) as r:
@@ -296,7 +289,6 @@ class LTX23Engine:
                             with open(target_dest, "wb") as f: f.write(await r.read())
                 except Exception: pass
                 
-                # Fallback blank image generation if download fails (1280x704 to match config)
                 if not os.path.exists(target_dest):
                     from PIL import Image
                     img = Image.new('RGB', (1280, 704), color='black') 
@@ -309,37 +301,6 @@ class LTX23Engine:
                     await asyncio.gather(*tasks)
                 image_filenames = [os.path.join(dynamic_guides_dir, f"guide_{i:04d}.png") for i in range(len(urls_to_download))]
 
-            # --------------------------------------------------------------------------
-            # 2. DYNAMIC TIMELINE MATH FOR LTXDIRECTOR (N Images, M Prompts)
-            # --------------------------------------------------------------------------
-            num_imgs = len(image_filenames)
-            num_prompts = len(prompts_list)
-
-            # Calculate exact frame mapping to span across entire requested length (e.g. 480)
-            img_frames = [int(i * (requested_length - 1) / max(1, num_imgs - 1)) for i in range(num_imgs)]
-            prompt_frames = [int(i * (requested_length - 1) / max(1, num_prompts - 1)) for i in range(num_prompts)]
-
-            # Construct `local_prompts` string (e.g., "0: First prompt \n 240: Second prompt")
-            local_prompts_str = "\n".join([f"{frame}: {prompt}" for frame, prompt in zip(prompt_frames, prompts_list)])
-
-            # Construct `timeline_data` Base64 Object Array
-            segments = []
-            for frame, img_path in zip(img_frames, image_filenames):
-                try:
-                    with open(img_path, "rb") as f:
-                        b64_img = base64.b64encode(f.read()).decode("utf-8")
-                        segments.append({
-                            "frame": frame,
-                            "image": f"data:image/png;base64,{b64_img}"
-                        })
-                except Exception:
-                    continue
-
-            timeline_data_str = json.dumps({"segments": segments, "audioSegments": []})
-
-            # --------------------------------------------------------------------------
-            # 3. WORKFLOW ACQUISITION & INJECTION
-            # --------------------------------------------------------------------------
             out_dir = "/workspace/ComfyUI/output"
             if os.path.exists(out_dir): shutil.rmtree(out_dir)
             os.makedirs(out_dir)
@@ -349,7 +310,7 @@ class LTX23Engine:
             try:
                 async with aiohttp.ClientSession() as session:
                     
-                    # Look for explicit JSON payload in body, then URL fetch, then local fallback
+                    # 1. Acquire JSON Workflow
                     workflow_raw = body.get("workflow_json")
                     if workflow_raw:
                         workflow = json.loads(workflow_raw) if isinstance(workflow_raw, str) else workflow_raw
@@ -366,6 +327,66 @@ class LTX23Engine:
                     
                     workflow = self.merge_overrides(workflow, body.get("workflow_override"))
 
+                    # 2. Mathematical Extraction and Graph Injection
+                    num_imgs = len(image_filenames)
+                    num_prompts = len(prompts_list)
+
+                    prompt_frames = [int(i * (requested_length - 1) / max(1, num_prompts - 1)) for i in range(num_prompts)]
+                    local_prompts_str = "\n".join([f"{frame}: {prompt}" for frame, prompt in zip(prompt_frames, prompts_list)])
+
+                    # Setup timeline map string fallback
+                    timeline_data_str = json.dumps({"segments": [], "audioSegments": []})
+
+                    if num_imgs == 1:
+                        # 1-Image Fix: Pull resolution bounds to protect VAE matrices
+                        custom_w = 1280
+                        custom_h = 704
+                        if "46" in workflow and "inputs" in workflow["46"]:
+                            custom_w = workflow["46"]["inputs"].get("custom_width", 1280)
+                            custom_h = workflow["46"]["inputs"].get("custom_height", 704)
+                        
+                        target_img_name = "guide_single_init.png"
+                        target_path = os.path.join("/workspace/ComfyUI/input", target_img_name)
+                        
+                        # Dynamically resize the single frame so standard latent concatenators don't crash the matrix
+                        from PIL import Image
+                        img = Image.open(image_filenames[0]).convert("RGB")
+                        img = img.resize((custom_w, custom_h), Image.Resampling.LANCZOS)
+                        img.save(target_path)
+                        
+                        # Dynamically build and link the missing Initial Latent structures
+                        workflow["9990"] = {
+                            "class_type": "LoadImage",
+                            "inputs": {"image": target_img_name}
+                        }
+                        workflow["9991"] = {
+                            "class_type": "VAEEncode",
+                            "inputs": {
+                                "pixels": ["9990", 0],
+                                "vae": ["103", 0] # Routes directly to the V10 core VAE Node
+                            }
+                        }
+                        if "46" in workflow:
+                            if "inputs" not in workflow["46"]: workflow["46"]["inputs"] = {}
+                            # Assign the newly encoded frame specifically as the baseline starting condition
+                            workflow["46"]["inputs"]["optional_latent"] = ["9991", 0]
+                            
+                    elif num_imgs > 1:
+                        # 2+ Image Math: Build smooth multi-segment base64 timeline data for Director cross-fading
+                        img_frames = [int(i * (requested_length - 1) / max(1, num_imgs - 1)) for i in range(num_imgs)]
+                        segments = []
+                        for frame, img_path in zip(img_frames, image_filenames):
+                            try:
+                                with open(img_path, "rb") as f:
+                                    b64_img = base64.b64encode(f.read()).decode("utf-8")
+                                    segments.append({
+                                        "frame": frame,
+                                        "image": f"data:image/png;base64,{b64_img}"
+                                    })
+                            except Exception:
+                                continue
+                        timeline_data_str = json.dumps({"segments": segments, "audioSegments": []})
+
                     # Inject Master Controls into LTXDirector Node (46)
                     if "46" in workflow:
                         if "inputs" not in workflow["46"]: workflow["46"]["inputs"] = {}
@@ -373,9 +394,9 @@ class LTX23Engine:
                         workflow["46"]["inputs"]["local_prompts"] = local_prompts_str
                         workflow["46"]["inputs"]["timeline_data"] = timeline_data_str
 
-                    # MAPPING UPDATED HERE: Fixed LoRA name mapping to match the modal volume perfectly.
+                    # V10 Model File Mappings ensuring hard drive alignment
                     if "98" in workflow: workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors"
-                    if "100" in workflow: workflow["100"]["inputs"]["lora_name"] = "ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors"
+                    if "100" in workflow: workflow["100"]["inputs"]["lora_name"] = "ltx-2-Image2Vid-Adapter.safetensors"
                     if "101" in workflow:
                         workflow["101"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
                         workflow["101"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
@@ -388,9 +409,6 @@ class LTX23Engine:
                     await self.execute_comfy_workflow(session, workflow)
                     await self.clear_comfy_memory(session)
 
-                    # --------------------------------------------------------------------------
-                    # 4. HARVEST AND UPLOAD RESULT
-                    # --------------------------------------------------------------------------
                     output_files = []
                     for root_p, _, filenames in os.walk(out_dir):
                         for name in filenames:

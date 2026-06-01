@@ -28,7 +28,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "206"
+    "FORCE_REBUILD_INDEX": "207" # Bumped to ensure a fresh build layer for the updates
 })
 
 # ==============================================================================
@@ -94,7 +94,7 @@ weights_volume = modal.Volume.from_name("Ltx-23-model-weights-new", create_if_mi
     image=final_image,
     volumes={"/mnt/weights": weights_volume},
     secrets=[modal.Secret.from_name("custom-secret")],
-    memory=8192, # STRIcT 8GB RAM REQUIREMENT ENFORCED HERE
+    memory=8192, # STRICT 8GB RAM REQUIREMENT ENFORCED HERE
     scaledown_window=30,
     timeout=3600
 )
@@ -158,10 +158,10 @@ class LTX23Engine:
         env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:64"
         env_vars["CUDA_MODULE_LOADING"] = "LAZY" 
         
-        # Added --highvram flag: Forces direct disk mmap transfers straight to VRAM, bypassing RAM cache
+        # OOM FIX APPLIED HERE: Replaced --highvram with --normalvram to force proper VRAM purging across steps
         self.process = subprocess.Popen([
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
-            "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
+            "--mmap-torch-files", "--normalvram", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
             "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc"
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)
         
@@ -338,7 +338,7 @@ class LTX23Engine:
                     timeline_data_str = json.dumps({"segments": [], "audioSegments": []})
 
                     if num_imgs == 1:
-                        # 1-Image Fix: Pull resolution bounds to protect VAE matrices
+                        # 1-Image Fix: Pull resolution bounds
                         custom_w = 1280
                         custom_h = 704
                         if "46" in workflow and "inputs" in workflow["46"]:
@@ -348,28 +348,22 @@ class LTX23Engine:
                         target_img_name = "guide_single_init.png"
                         target_path = os.path.join("/workspace/ComfyUI/input", target_img_name)
                         
-                        # Dynamically resize the single frame so standard latent concatenators don't crash the matrix
+                        # Dynamically resize the single frame to maintain matrix integrity
                         from PIL import Image
                         img = Image.open(image_filenames[0]).convert("RGB")
                         img = img.resize((custom_w, custom_h), Image.Resampling.LANCZOS)
                         img.save(target_path)
                         
-                        # Dynamically build and link the missing Initial Latent structures
-                        workflow["9990"] = {
-                            "class_type": "LoadImage",
-                            "inputs": {"image": target_img_name}
-                        }
-                        workflow["9991"] = {
-                            "class_type": "VAEEncode",
-                            "inputs": {
-                                "pixels": ["9990", 0],
-                                "vae": ["103", 0] # Routes directly to the V10 core VAE Node
-                            }
-                        }
+                        # GRAPH VALIDATION CRASH FIX APPLIED HERE:
+                        # Removed the dynamic Node 9990/9991 injection and the optional_latent mapping.
+                        # We now explicitly target the Director node's native image conditioning parameter.
                         if "46" in workflow:
                             if "inputs" not in workflow["46"]: workflow["46"]["inputs"] = {}
-                            # Assign the newly encoded frame specifically as the baseline starting condition
-                            workflow["46"]["inputs"]["optional_latent"] = ["9991", 0]
+                            if "optional_latent" in workflow["46"]["inputs"]: 
+                                del workflow["46"]["inputs"]["optional_latent"]
+                                
+                            workflow["46"]["inputs"]["image"] = target_img_name
+                            workflow["46"]["inputs"]["images"] = target_img_name
                             
                     elif num_imgs > 1:
                         # 2+ Image Math: Build smooth multi-segment base64 timeline data for Director cross-fading
@@ -396,10 +390,7 @@ class LTX23Engine:
 
                     # V10 Model File Mappings ensuring hard drive alignment
                     if "98" in workflow: workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors"
-                    
-                    # BUG FIX APPLIED HERE: Reverted back to the correct LoRA file name
                     if "100" in workflow: workflow["100"]["inputs"]["lora_name"] = "ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors"
-                    
                     if "101" in workflow:
                         workflow["101"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
                         workflow["101"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"

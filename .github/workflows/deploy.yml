@@ -1,3 +1,8 @@
+# ==============================================================================
+# PART 1: WORKFLOW IDENTITY & INTERACTIVE TRIGGERS
+# Purpose: Define the action namespace and configure structural choice selection
+#          inputs for isolated cloud runtime deployment targeting Account 2.
+# ==============================================================================
 name: 🚀 Deploy API Engines to Modal (Account 2)
 
 on:
@@ -6,12 +11,17 @@ on:
       target:
         description: 'Which API engine to deploy?'
         required: true
-        default: 'ltx-19b'
+        default: 'LTX-23-new'
         type: choice
         options:
+          - LTX-23-new
           - ltx-19b
           - sonic-1vpsync
 
+# ==============================================================================
+# PART 2: ISOLATED DEPLOYMENT ENVIRONMENT ORCHESTRATION
+# Purpose: Provision fresh runner compute nodes and inject isolated access keys.
+# ==============================================================================
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -29,6 +39,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install modal fastapi aiohttp
 
+# ==============================================================================
+# PART 3: TARGET ROUTING EVALUATION LOGIC
+# Purpose: Execute execution branches matching target boundaries cleanly, 
+#          ensuring fresh environments are generated out-of-the-box.
+# ==============================================================================
       - name: Deploy Selected API Engine
         # Maps the unique Account 2 secrets in GitHub to what Modal expects
         env:
@@ -36,13 +51,20 @@ jobs:
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET_2 }}
           TARGET: ${{ github.event.inputs.target }}
         run: |
-          if [ "$TARGET" = "ltx-19b" ]; then
+          if [ "$TARGET" = "LTX-23-new" ]; then
+            echo "🚀 Deploying completely brand-new LTX-23-new Video API to Account 2..."
+            echo "ℹ️ This execution thread establishes an independent, unshared container snapshot image."
+            modal deploy LTX-23-new.py
+            
+          elif [ "$TARGET" = "ltx-19b" ]; then
             echo "Deploying LTX-19b-new-v20 Video API to Account 2..."
             modal deploy LTX-19b-new-v20.py
+            
           elif [ "$TARGET" = "sonic-1vpsync" ]; then
             echo "Deploying sonic-1vpsync Video API to Account 2..."
             modal deploy sonic-1vpsync.py
+            
           else
-            echo "Error: Unknown deployment target '$TARGET'"
+            echo "❌ Error: Unknown deployment target '$TARGET'"
             exit 1
           fi

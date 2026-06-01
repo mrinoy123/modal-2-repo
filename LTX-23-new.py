@@ -161,7 +161,7 @@ class LTX23Engine:
         # Added --highvram flag: Forces direct disk mmap transfers straight to VRAM, bypassing RAM cache
         self.process = subprocess.Popen([
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
-            "--mmap-torch-files", "--highvram", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
+            "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
             "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc"
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)
         

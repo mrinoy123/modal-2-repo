@@ -45,7 +45,7 @@ build_image = base_image.env({
     "CC": "gcc",
     "CXX": "g++"
 }).run_commands(
-    "python3.12 -m pip install --no-cache-dir fastapi aiohttp boto3 triton>=3.1.0 ninja setuptools>=70.0.0 wheel pip>=24.0",
+    "python3.12 -m pip install --no-cache-dir fastapi aiohttp boto3 triton>=3.1.0 ninja setuptools>=70.0.0 wheel pip>=24.0 Pillow",
     "python3.12 -m pip install --no-cache-dir pandas numexpr pytz python-dateutil scipy matplotlib colorama librosa soundfile decord imageio scikit-image numba einops bitsandbytes"
 )
 
@@ -75,8 +75,6 @@ deps_image = clone_image.run_commands(
 )
 
 final_image = deps_image.run_commands(
-    # Pulling your specific workflow directly into the container so it's always available
-    # Replace URL if you host the JSON file elsewhere online
     "wget -qO /workspace/ComfyUI/ltxDirector_v10_api.json 'https://raw.githubusercontent.com/WhatDreamsCost/WhatDreamsCost-ComfyUI/main/workflows/LTX%20Director%20Example%20Workflow%20(Fixed).json' || true",
     "echo '' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     "echo 'sageattn_qk_int8_pv_fp16_triton = sageattn' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
@@ -246,9 +244,8 @@ class LTX23Engine:
 
     # ==============================================================================
     # PART 6: MAIN FASTAPI ENDPOINT (TIMELINE MAPPING & GENERATION)
-    # Purpose: Handles N:M ratios (e.g., 2 Images, 3 Prompts) across a 20s timeline.
     # ==============================================================================
-    @modal.fastapi_endpoint(method="POST")
+    @modal.web_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
         if x_api_key != "testing-modal-workflow-2": 
             raise HTTPException(status_code=403, detail="Unauthorized Account 2 Pipeline Request")

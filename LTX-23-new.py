@@ -247,8 +247,7 @@ NODE_CLASS_MAPPINGS = {"LTXColorFixer": LTXColorFixer}
             os._exit(1)
 
 
-
-print("🔥 Running Ghost Load to build mmap pointers and stream weights directly to GPU...")
+    print("🔥 Running Ghost Load to build mmap pointers and stream weights directly to GPU...")
         try:
             # FIX: Swapped to native 'VAELoader' to completely bypass KJNodes validation errors!
             # Removed 'device' arguments as native nodes do not require them.
@@ -273,6 +272,10 @@ print("🔥 Running Ghost Load to build mmap pointers and stream weights directl
             print("✅ Ghost Load complete. System is prepared for n8n API.")
         except Exception as e:
             print(f"⚠️ Ghost Load skipped: {e}")
+
+
+
+
     
 
     async def clear_comfy_memory(self, session):

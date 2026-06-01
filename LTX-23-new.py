@@ -373,9 +373,9 @@ class LTX23Engine:
                         workflow["46"]["inputs"]["local_prompts"] = local_prompts_str
                         workflow["46"]["inputs"]["timeline_data"] = timeline_data_str
 
-                    # Map Nodes to Explicit Weights Based on Image Layouts
+                    # MAPPING UPDATED HERE: Fixed LoRA name mapping to match the modal volume perfectly.
                     if "98" in workflow: workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors"
-                    if "100" in workflow: workflow["100"]["inputs"]["lora_name"] = "ltx-2-Image2Vid-Adapter.safetensors"
+                    if "100" in workflow: workflow["100"]["inputs"]["lora_name"] = "ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors"
                     if "101" in workflow:
                         workflow["101"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
                         workflow["101"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"

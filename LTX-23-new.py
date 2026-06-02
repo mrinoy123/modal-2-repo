@@ -607,6 +607,13 @@ NODE_CLASS_MAPPINGS = {
 
                         if "94:28" in pass2_workflow: pass2_workflow["94:28"]["inputs"]["noise_seed"] = scene["_seed"]
                         
+                        # --- AUDIO FIX INJECTION START ---
+                        # Prevent Latent Upscaler from deeply frying the pristine audio latent
+                        if "94:16" in pass2_workflow:
+                            if "inputs" in pass2_workflow["94:16"] and "samples" in pass2_workflow["94:16"]["inputs"]:
+                                pass2_workflow["94:16"]["inputs"]["samples"] = ["94:13", 1]
+                        # --- AUDIO FIX INJECTION END ---
+
                         keys = list(pass2_workflow.keys())
                         for node_id in keys:
                             node_info = pass2_workflow[node_id]
@@ -616,6 +623,7 @@ NODE_CLASS_MAPPINGS = {
                             if c_type in ["VHS_VideoCombine", "SaveVideo", "CreateVideo"]:
                                 if "inputs" in node_info:
                                     node_info["inputs"]["frame_rate"] = 24
+                                    node_info["inputs"]["fps"] = 24 # Added fps override for VideoCombine compatibility
                                     if "pingpong" in node_info["inputs"]:
                                         node_info["inputs"]["pingpong"] = False
 

@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "250"  # Bumped to implement Dynamic LoRA Stacking
+    "FORCE_REBUILD_INDEX": "250"  
 })
 
 # ==============================================================================
@@ -118,7 +118,6 @@ class LTX23Engine:
     def start_comfy(self):
         import boto3
         
-        # 🔥 CUSTOM NODES: LTXColorFixer, Two-Pass Cache Writers & VAE Armor Patch 🔥
         print("🎨 Injecting Smart Nodes, Caches & VAE Memory Protections...")
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline.py"
         with open(custom_nodes_path, "w") as f:
@@ -158,7 +157,6 @@ class LTXColorFixer:
             
         return (image,)
 
-# High-Speed Python Dictionary serving as VRAM Cache Buffer
 LTX_CACHE = {}
 
 class MemoryCacheWriter:
@@ -210,7 +208,6 @@ class MemoryCacheReader:
         print(f"\\n[Two-Pass System] 🚀 Bypassing Loaders: Loaded Pre-Cached Conditionings for Scene {scene_id}\\n")
         return (data["model"], data["positive"], data["video_latent"], data["audio_latent"], data["guide_data"], data["frame_rate"])
 
-# VAE Memory Armor Patch: Prevents massive allocations from dumping the UNet
 class FastVAEDecode(nodes.VAEDecode):
     def decode(self, vae, samples):
         print("\\n[Two-Pass System] 🛡️ Auto-Routing to Tiled VAE Decoding to protect 22B UNet VRAM state.\\n")
@@ -380,7 +377,6 @@ NODE_CLASS_MAPPINGS = {
 
             try:
                 async with aiohttp.ClientSession() as session:
-                    # 1. Base Workflow Extraction
                     base_workflow = body.get("workflow_json")
                     if isinstance(base_workflow, str):
                         base_workflow = json.loads(base_workflow)
@@ -388,11 +384,16 @@ NODE_CLASS_MAPPINGS = {
                     custom_w = 576
                     custom_h = 1024
                     overrides = body.get("workflow_override", {})
+                    
+                    base_global = ""
                     if "46" in overrides and "inputs" in overrides["46"]:
                         custom_w = overrides["46"]["inputs"].get("custom_width", 576)
                         custom_h = overrides["46"]["inputs"].get("custom_height", 1024)
+                        base_global = overrides["46"]["inputs"].get("global_prompt", "")
 
-                    # Dynamic Target Injector
+                    if not base_global and "46" in base_workflow:
+                        base_global = base_workflow["46"].get("inputs", {}).get("global_prompt", "")
+
                     def inject_model_paths(workflow):
                         if "98" in workflow: workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
                         if "100" in workflow: workflow["100"]["inputs"]["lora_name"] = "ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors"
@@ -405,9 +406,6 @@ NODE_CLASS_MAPPINGS = {
                             workflow["101"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
                         return workflow
 
-                    # ==============================================================================
-                    # PRE-COMPUTE: Download Images & Calculate Dimensions
-                    # ==============================================================================
                     for idx, scene in enumerate(batch_scenes):
                         target_img_name = f"guide_anchor_{idx}.png"
                         target_path = os.path.join(dynamic_guides_dir, target_img_name)
@@ -473,11 +471,14 @@ NODE_CLASS_MAPPINGS = {
                         
                         cam_trigger_text = " ".join(cam_triggers)
                         
+                        # ✨ LORA CAMERA FIX: Pushing the trigger string deeply into the Global Prompt! 
+                        scene["_global_prompt_str"] = f"{cam_trigger_text} {base_global}".strip()
+                        
                         static_env = f"{subject} {style} {bg} {light}".strip()
                         
                         local_prompts_list = []
                         for step_frame, action_text in zip(keyframe_steps, actions):
-                            fused_prompt = f"{action_text}. {cam_trigger_text} Cinematic environment and styling: {static_env}".strip()
+                            fused_prompt = f"{action_text}. Cinematic environment and styling: {static_env}".strip()
                             local_prompts_list.append(f"{step_frame}: {fused_prompt}")
                             
                         local_prompts_str = "\n".join(local_prompts_list)
@@ -519,6 +520,7 @@ NODE_CLASS_MAPPINGS = {
 
                     for idx, scene in enumerate(batch_scenes):
                         scene_46 = json.loads(json.dumps(orig_46))
+                        scene_46["inputs"]["global_prompt"] = scene["_global_prompt_str"]
                         scene_46["inputs"]["duration_frames"] = scene["_total_frames"]
                         scene_46["inputs"]["local_prompts"] = scene["_local_prompts_str"]
                         scene_46["inputs"]["timeline_data"] = scene["_timeline_data_str"]
@@ -614,34 +616,35 @@ NODE_CLASS_MAPPINGS = {
                             if "inputs" in pass2_workflow["94:16"] and "samples" in pass2_workflow["94:16"]["inputs"]:
                                 pass2_workflow["94:16"]["inputs"]["samples"] = ["94:13", 1]
 
-                        keys = list(pass2_workflow.keys())
-                        for node_id in keys:
-                            node_info = pass2_workflow[node_id]
-                            c_type = node_info.get("class_type", "")
-                            
-                            # ✨ FIXED ROUTING: Only inject what the nodes explicitly ask for.
-                            if c_type == "VHS_VideoCombine":
-                                if "inputs" in node_info:
-                                    node_info["inputs"]["frame_rate"] = [f"reader_{idx}", 5]
-                                    if "pingpong" in node_info["inputs"]:
-                                        node_info["inputs"]["pingpong"] = False
-                                        
-                            elif c_type == "CreateVideo":
-                                if "inputs" in node_info:
-                                    node_info["inputs"]["fps"] = [f"reader_{idx}", 5]
+                        # ✨ AUDIO SYNC FIX: We rip out the generic CreateVideo/SaveVideo Nodes 
+                        # and forcefully replace them with VHS_VideoCombine.
+                        if "94:17" in pass2_workflow: del pass2_workflow["94:17"]
+                        if "106" in pass2_workflow: del pass2_workflow["106"]
 
-                            # Note: SaveVideo is INTENTIONALLY excluded here, it needs no fps/frame_rate injection!
+                        # Color Fixer Injection
+                        fixer_id = f"9999_color_fixer_{idx}"
+                        pass2_workflow[fixer_id] = {
+                            "class_type": "LTXColorFixer",
+                            "inputs": {"image": ["94:15", 0], "target_brightness": 0.40, "max_boost": 2.0}
+                        }
 
-                            # Color Fixer Injection (Only for nodes that process raw "images")
-                            if c_type in ["VHS_VideoCombine", "CreateVideo"]:
-                                if "inputs" in node_info and "images" in node_info["inputs"]:
-                                    original_image_source = node_info["inputs"]["images"]
-                                    fixer_id = f"9999_color_fixer_{idx}"
-                                    pass2_workflow[fixer_id] = {
-                                        "class_type": "LTXColorFixer",
-                                        "inputs": {"image": original_image_source, "target_brightness": 0.40, "max_boost": 2.0}
-                                    }
-                                    node_info["inputs"]["images"] = [fixer_id, 0]
+                        # Dynamic VHS Video Combine node Injection
+                        pass2_workflow[f"106_vhs_{idx}"] = {
+                            "class_type": "VHS_VideoCombine",
+                            "inputs": {
+                                "frame_rate": [f"reader_{idx}", 5],
+                                "loop_count": 0,
+                                "filename_prefix": "LTX_Video",
+                                "format": "video/h264-mp4",
+                                "pix_fmt": "yuv420p",
+                                "crf": 19,
+                                "save_metadata": True,
+                                "pingpong": False,
+                                "save_output": True,
+                                "images": [fixer_id, 0],
+                                "audio": ["94:16", 0]
+                            }
+                        }
 
                         await self.execute_comfy_workflow(session, pass2_workflow)
 

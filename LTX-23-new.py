@@ -271,7 +271,7 @@ NODE_CLASS_MAPPINGS = {
         self.process = subprocess.Popen([
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
             "--mmap-torch-files", "--temp-directory", "/tmp/comfy_swap", 
-            "--bf16-vae", "--use-sage-attention", "--reserve-vram-mb", "3072"
+            "--bf16-vae", "--use-sage-attention"
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)
         
         self.t = threading.Thread(target=self._log_reader, daemon=True)

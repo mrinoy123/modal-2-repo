@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "226"  # Bumped to ensure cache rebuilds with Two-Pass Nodes
+    "FORCE_REBUILD_INDEX": "227"  # Bumped to ensure cache rebuilds with Two-Pass Nodes
 })
 
 # ==============================================================================

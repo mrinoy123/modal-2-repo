@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "227"  # Bumped to ensure cache rebuilds with Two-Pass Nodes
+    "FORCE_REBUILD_INDEX": "228"  # Bumped to ensure cache rebuilds with new fixed Custom Nodes
 })
 
 # ==============================================================================
@@ -166,7 +166,10 @@ class MemoryCacheWriter:
         return {"required": {
             "model": ("MODEL",),
             "positive": ("CONDITIONING",),
-            "negative": ("CONDITIONING",),
+            "video_latent": ("LATENT",),
+            "audio_latent": ("LATENT",),
+            "guide_data": ("GUIDE_DATA",),
+            "frame_rate": ("FLOAT", {"default": 24.0, "forceInput": True}),
             "scene_id": ("STRING", {"default": "0"})
         }}
     RETURN_TYPES = ()
@@ -174,9 +177,16 @@ class MemoryCacheWriter:
     FUNCTION = "write_cache"
     CATEGORY = "LTXBatch"
 
-    def write_cache(self, model, positive, negative, scene_id):
+    def write_cache(self, model, positive, video_latent, audio_latent, guide_data, frame_rate, scene_id):
         global LTX_CACHE
-        LTX_CACHE[str(scene_id)] = {"model": model, "positive": positive, "negative": negative}
+        LTX_CACHE[str(scene_id)] = {
+            "model": model, 
+            "positive": positive,
+            "video_latent": video_latent,
+            "audio_latent": audio_latent,
+            "guide_data": guide_data,
+            "frame_rate": frame_rate
+        }
         print(f"\\n[Two-Pass System] 💾 Encoded & Saved Conditionings for Scene {scene_id} into RAM\\n")
         return ()
 
@@ -186,8 +196,8 @@ class MemoryCacheReader:
         return {"required": {
             "scene_id": ("STRING", {"default": "0"})
         }}
-    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING")
-    RETURN_NAMES = ("model", "positive", "negative")
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "LATENT", "LATENT", "GUIDE_DATA", "FLOAT")
+    RETURN_NAMES = ("model", "positive", "video_latent", "audio_latent", "guide_data", "frame_rate")
     FUNCTION = "read_cache"
     CATEGORY = "LTXBatch"
 
@@ -197,7 +207,7 @@ class MemoryCacheReader:
         if data is None:
             raise ValueError(f"Cache for Scene {scene_id} not found in RAM! Text Encoder Pass failed.")
         print(f"\\n[Two-Pass System] 🚀 Bypassing Loaders: Loaded Pre-Cached Conditionings for Scene {scene_id}\\n")
-        return (data["model"], data["positive"], data["negative"])
+        return (data["model"], data["positive"], data["video_latent"], data["audio_latent"], data["guide_data"], data["frame_rate"])
 
 NODE_CLASS_MAPPINGS = {
     "LTXColorFixer": LTXColorFixer,
@@ -370,6 +380,19 @@ NODE_CLASS_MAPPINGS = {
                         custom_w = overrides["46"]["inputs"].get("custom_width", 576)
                         custom_h = overrides["46"]["inputs"].get("custom_height", 1024)
 
+                    # Dynamic Target Injector explicitly to fix the "Value not in list" errors
+                    def inject_model_paths(workflow):
+                        if "98" in workflow: workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
+                        if "100" in workflow: workflow["100"]["inputs"]["lora_name"] = "ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors"
+                        if "97" in workflow: workflow["97"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
+                        if "103" in workflow: workflow["103"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
+                        if "102" in workflow: workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
+                        if "94:105" in workflow: workflow["94:105"]["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+                        if "101" in workflow: 
+                            workflow["101"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
+                            workflow["101"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
+                        return workflow
+
                     # ==============================================================================
                     # PRE-COMPUTE: Download Images & Calculate Dimensions
                     # ==============================================================================
@@ -440,6 +463,7 @@ NODE_CLASS_MAPPINGS = {
                     print("\n[Two-Pass System] 🎬 PASS 1 START: Initiating Text Encoding Marathon...")
                     pass1_workflow = json.loads(json.dumps(base_workflow))
                     pass1_workflow = self.merge_overrides(pass1_workflow, overrides)
+                    pass1_workflow = inject_model_paths(pass1_workflow)
 
                     # Strip heavy execution layers to make Pass 1 exclusively a text compiler
                     keys_to_delete = []
@@ -468,7 +492,10 @@ NODE_CLASS_MAPPINGS = {
                             "inputs": {
                                 "model": [f"46_{idx}", 0],
                                 "positive": [f"46_{idx}", 1],
-                                "negative": [f"46_{idx}", 2],
+                                "video_latent": [f"46_{idx}", 2],
+                                "audio_latent": [f"46_{idx}", 3],
+                                "guide_data": [f"46_{idx}", 4],
+                                "frame_rate": [f"46_{idx}", 5],
                                 "scene_id": str(idx)
                             }
                         }
@@ -487,6 +514,7 @@ NODE_CLASS_MAPPINGS = {
                         
                         pass2_workflow = json.loads(json.dumps(base_workflow))
                         pass2_workflow = self.merge_overrides(pass2_workflow, overrides)
+                        pass2_workflow = inject_model_paths(pass2_workflow)
 
                         out_dir = "/workspace/ComfyUI/output"
                         if os.path.exists(out_dir): shutil.rmtree(out_dir)
@@ -510,13 +538,7 @@ NODE_CLASS_MAPPINGS = {
 
                         # General Overrides & Hook Color Fixer
                         if "94:28" in pass2_workflow: pass2_workflow["94:28"]["inputs"]["noise_seed"] = scene["_seed"]
-                        if "98" in pass2_workflow: pass2_workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
-                        if "100" in pass2_workflow: pass2_workflow["100"]["inputs"]["lora_name"] = "ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors"
-                        if "97" in pass2_workflow: pass2_workflow["97"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
-                        if "103" in pass2_workflow: pass2_workflow["103"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
-                        if "102" in pass2_workflow: pass2_workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
-                        if "94:105" in pass2_workflow: pass2_workflow["94:105"]["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
-
+                        
                         keys = list(pass2_workflow.keys())
                         for node_id in keys:
                             node_info = pass2_workflow[node_id]

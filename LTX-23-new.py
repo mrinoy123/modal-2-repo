@@ -13,6 +13,7 @@ import urllib.request
 import asyncio
 import ctypes
 import base64
+import math
 from fastapi import Request, Response, HTTPException, Header
 from fastapi.responses import StreamingResponse
 from typing import Optional
@@ -118,8 +119,8 @@ class LTX23Engine:
     def start_comfy(self):
         import boto3
         
-        # 🔥 SMART AUTO-EXPOSURE CUSTOM NODE 🔥
-        print("🎨 Injecting Smart Auto-Exposure Node...")
+        # 🔥 CUSTOM NODES: LTXColorFixer & L40S Batch SubGraphIsolator 🔥
+        print("🎨 Injecting Smart Auto-Exposure & Batch SubGraph Nodes...")
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline.py"
         with open(custom_nodes_path, "w") as f:
             f.write("""
@@ -157,8 +158,35 @@ class LTXColorFixer:
             
         return (image,)
 
+class SubGraphIsolator:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "model": ("MODEL",),
+            "positive": ("CONDITIONING",),
+            "negative": ("CONDITIONING",)
+        }}
+    
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING")
+    FUNCTION = "isolate_and_flush"
+    CATEGORY = "utils"
+
+    def isolate_and_flush(self, model, positive, negative):
+        import gc
+        import comfy.model_management
+        print("\\n[SubGraph System] 🛑 Pass 1 (Text Encoding) Complete. Isolating Conditionings.")
+        
+        # L40S Optimization: We clear PyTorch activation cache but KEEP models loaded in VRAM for speed
+        comfy.model_management.soft_empty_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        print("[SubGraph System] 🟢 Activation memory cleared. Handing Patched Data to KSampler.\\n")
+        return (model, positive, negative)
+
 NODE_CLASS_MAPPINGS = {
-    "LTXColorFixer": LTXColorFixer
+    "LTXColorFixer": LTXColorFixer,
+    "SubGraphIsolator": SubGraphIsolator
 }
 """)
 
@@ -226,14 +254,14 @@ NODE_CLASS_MAPPINGS = {
         if not comfy_ready:
             os._exit(1)
 
-        print("✅ Base pipeline active. Awaiting API triggers.")
+        print("✅ Base pipeline active. Awaiting API Batch triggers.")
 
-    async def clear_comfy_memory(self, session):
+    async def clear_comfy_memory(self, session, unload_models=False):
+        # Optimized for Batching: Clears cache but KEEPS weights loaded between sequences
         try:
-            async with session.post("http://127.0.0.1:8188/free", json={"unload_models": True, "free_memory": True}) as r:
+            async with session.post("http://127.0.0.1:8188/free", json={"unload_models": unload_models, "free_memory": True}) as r:
                 await r.read()
-        except Exception:
-            pass
+        except Exception: pass
         
         import gc
         import torch
@@ -245,9 +273,8 @@ NODE_CLASS_MAPPINGS = {
             
         try:
             ctypes.CDLL("libc.so.6").malloc_trim(0)
-        except Exception:
-            pass
-        await asyncio.sleep(2)
+        except Exception: pass
+        await asyncio.sleep(1)
 
     async def execute_comfy_workflow(self, session, workflow_json):
         async with session.post("http://127.0.0.1:8188/prompt", json={"prompt": workflow_json}) as r:
@@ -289,12 +316,12 @@ NODE_CLASS_MAPPINGS = {
         return base_graph
 
     # ==============================================================================
-    # PART 6: MAIN FASTAPI ENDPOINT & DYNAMIC TIMELINE / LATENT INJECTION
+    # PART 6: MAIN HIGH-SPEED INTERNAL BATCH ENDPOINT
     # ==============================================================================
     @modal.fastapi_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
         if x_api_key != "testing-modal-workflow-2": 
-            raise HTTPException(status_code=403, detail="Unauthorized Account 2 Pipeline Request")
+            raise HTTPException(status_code=403, detail="Unauthorized Pipeline Request")
         
         body = await request.json()
         if isinstance(body, dict):
@@ -302,263 +329,225 @@ NODE_CLASS_MAPPINGS = {
             elif "body" in body: body = body["body"]
 
         async def process_pipeline():
-            incoming_image_urls = body.get("image_url")
-            requested_length = int(body.get("length", 480)) 
-            prompts_dict = body.get("prompts", {})
             date_folder = body.get("date_folder", time.strftime('%Y-%m-%d'))
             workflow_url = body.get("workflow_url") 
 
-            # DYNAMIC RESOLUTION EXTRACTION: Defaults to 9:16 aspect ratio (576x1024)
-            custom_w = 576
-            custom_h = 1024
-            overrides = body.get("workflow_override", {})
-            if "46" in overrides and "inputs" in overrides["46"]:
-                custom_w = overrides["46"]["inputs"].get("custom_width", 576)
-                custom_h = overrides["46"]["inputs"].get("custom_height", 1024)
-
-            # ==============================================================================
-            # IMAGE ROUTING: Detects explicit UNEVEN timing maps or falls back to flat lists
-            # ==============================================================================
-            urls_to_download = []
-            target_image_frames = [] # Records exact uneven frame numbers if provided
-            
-            if incoming_image_urls:
-                if isinstance(incoming_image_urls, dict):
-                    # Parses {"0": "img1.png", "45": "img2.png"} to support uneven timelines natively
-                    sorted_keys = sorted([k for k in incoming_image_urls.keys() if str(k).isdigit()], key=lambda x: int(x))
-                    for k in sorted_keys:
-                        v = incoming_image_urls[k]
-                        if str(v).strip():
-                            target_image_frames.append(int(k))
-                            urls_to_download.append(str(v).strip())
-                elif isinstance(incoming_image_urls, list): 
-                    urls_to_download = [str(u).strip() for u in incoming_image_urls if str(u).strip()]
-                elif isinstance(incoming_image_urls, str) and incoming_image_urls.strip():
-                    urls_to_download = [u.strip() for u in incoming_image_urls.split(",") if u.strip()]
+            # Normalize incoming payload to handle both flat fallback and advanced batch formats
+            batch_scenes = body.get("batch_scenes", [])
+            if not batch_scenes:
+                print("⚠️ No batch_scenes array found. Falling back to legacy single-item format mapping.")
+                batch_scenes = [{
+                    "name": body.get("filename", "clip_output"),
+                    "image_url": body.get("image_url", ""),
+                    "kinetic_actions": [p for p in body.get("prompts", {}).values()] if isinstance(body.get("prompts"), dict) else body.get("prompts", []),
+                    "style": body.get("style_profile", ""),
+                    "subject": body.get("subject", ""),
+                    "background": body.get("background", ""),
+                    "lighting": body.get("lighting", ""),
+                    "camera": body.get("camera", "")
+                }]
 
             dynamic_guides_dir = "/workspace/ComfyUI/input/dynamic_guides"
             if os.path.exists(dynamic_guides_dir): shutil.rmtree(dynamic_guides_dir)
             os.makedirs(dynamic_guides_dir, exist_ok=True)
 
-            async def download_one(session, url_str, target_dest, width, height):
-                try:
-                    # SECURE AUTHENTICATED BYPASS FOR PRIVATE R2 BUCKETS
-                    if "pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev" in url_str:
-                        s3_key = url_str.split(".dev/")[-1]
-                        print(f"🔐 Authenticating & Downloading PRIVATE Image from S3/R2: {s3_key}")
-                        loop = asyncio.get_event_loop()
-                        await loop.run_in_executor(
-                            None, 
-                            self.s3.download_file, 
-                            "video-asset-files-storage-workflow", 
-                            s3_key, 
-                            target_dest
-                        )
-                        print(f"✅ Successfully Downloaded Private Reference Image: {s3_key}")
-                    else:
-                        # Standard public download fallback
-                        async with session.get(url_str, timeout=120) as r:
-                            if r.status == 200:
-                                with open(target_dest, "wb") as f: f.write(await r.read())
-                                print(f"✅ Downloaded public reference image: {url_str}")
-                            else:
-                                print(f"❌ HTTP ERROR {r.status} while downloading: {url_str}")
-                except Exception as e:
-                    print(f"❌ CONNECTION ERROR downloading {url_str}: {e}")
-                
-                if not os.path.exists(target_dest):
-                    print(f"⚠️ WARNING: Falling back to BLANK BLACK IMAGE because {url_str} could not be downloaded!")
-                    from PIL import Image
-                    img = Image.new('RGB', (width, height), color='black') 
-                    img.save(target_dest)
-
-            image_filenames = []
-            if urls_to_download:
-                async with aiohttp.ClientSession() as download_session:
-                    tasks = [download_one(download_session, url, os.path.join(dynamic_guides_dir, f"guide_{i:04d}.png"), custom_w, custom_h) for i, url in enumerate(urls_to_download)]
-                    await asyncio.gather(*tasks)
-                image_filenames = [os.path.join(dynamic_guides_dir, f"guide_{i:04d}.png") for i in range(len(urls_to_download))]
-
-            out_dir = "/workspace/ComfyUI/output"
-            if os.path.exists(out_dir): shutil.rmtree(out_dir)
-            os.makedirs(out_dir)
-
             ram_task = asyncio.create_task(self._ram_squeezer())
+            generated_outputs = []
 
             try:
                 async with aiohttp.ClientSession() as session:
+                    # 1. Fetch Master Workflow Template Once
                     workflow_raw = body.get("workflow_json")
                     if workflow_raw:
-                        workflow = json.loads(workflow_raw) if isinstance(workflow_raw, str) else workflow_raw
+                        base_workflow = json.loads(workflow_raw) if isinstance(workflow_raw, str) else workflow_raw
                     elif workflow_url:
-                        async with session.get(workflow_url) as resp:
-                            workflow = await resp.json()
+                        async with session.get(workflow_url) as resp: base_workflow = await resp.json()
                     else:
                         try:
-                            with open("/workspace/ComfyUI/ltxDirector_v10_api.json", "r") as f: 
-                                workflow = json.load(f)
+                            with open("/workspace/ComfyUI/ltxDirector_v10_api.json", "r") as f: base_workflow = json.load(f)
                         except FileNotFoundError:
-                            with open("ltxDirector_v10(modified-own)api.json", "r") as f: 
-                                workflow = json.load(f)
-                    
-                    workflow = self.merge_overrides(workflow, body.get("workflow_override"))
+                            with open("ltxDirector_v10(modified-own)api.json", "r") as f: base_workflow = json.load(f)
 
-                    # ========================================================================
-                    # PROMPT TIMING FIX: Reads explicit uneven frame mapping
-                    # ========================================================================
-                    num_imgs = len(image_filenames)
-                    
-                    if isinstance(prompts_dict, dict) and any(str(k).isdigit() for k in prompts_dict.keys()):
-                        sorted_keys = sorted(prompts_dict.keys(), key=lambda x: int(x) if str(x).isdigit() else -1)
-                        valid_keys = [k for k in sorted_keys if str(k).isdigit() and str(prompts_dict[k]).strip()]
-                        local_prompts_str = "\n".join([f"{k}: {prompts_dict[k].strip()}" for k in valid_keys])
-                        num_prompts = len(valid_keys)
-                    else:
-                        # Fallback: Distribute evenly if sent as array
-                        if isinstance(prompts_dict, list):
-                            prompts_list = [str(p).strip() for p in prompts_dict if str(p).strip()]
-                        elif isinstance(prompts_dict, dict):
-                            prompts_list = [str(v).strip() for v in prompts_dict.values() if str(v).strip()]
-                        else:
-                            prompts_list = [p.strip() for p in str(prompts_dict).split("\n") if p.strip()]
-                            
-                        num_prompts = len(prompts_list)
-                        if num_prompts > 0:
-                            prompt_frames = [int(i * (requested_length - 1) / max(1, num_prompts - 1)) for i in range(num_prompts)]
-                            local_prompts_str = "\n".join([f"{frame}: {prompt}" for frame, prompt in zip(prompt_frames, prompts_list)])
-                        else:
-                            local_prompts_str = ""
+                    # DYNAMIC RESOLUTION EXTRACTION: Defaults to 9:16 aspect ratio
+                    custom_w = 576
+                    custom_h = 1024
+                    overrides = body.get("workflow_override", {})
+                    if "46" in overrides and "inputs" in overrides["46"]:
+                        custom_w = overrides["46"]["inputs"].get("custom_width", 576)
+                        custom_h = overrides["46"]["inputs"].get("custom_height", 1024)
 
                     # ==============================================================================
-                    # MULTI-REFERENCE NORMALIZATION: Supports Explicit Uneven Timing
+                    # 🚀 HIGH SPEED BATCH LOOP BEGINS HERE
                     # ==============================================================================
-                    if num_imgs > 0:
-                        # Uniformly resize all sequential guide images
-                        from PIL import Image
-                        for img_path in image_filenames:
-                            try:
-                                img = Image.open(img_path).convert("RGB")
-                                img = img.resize((custom_w, custom_h), Image.Resampling.LANCZOS)
-                                img.save(img_path)
-                            except Exception as e:
-                                print(f"[Image PreProcessor] Minor warning on resize: {e}")
-                                
-                        # 3. Structural 1-Image vs. Multi-Image Conditional Routing
-                        if num_imgs == 1:
-                            # 1-Image Setup: Create a micro dropping anchor timeline (Frame 0 & Frame 1)
-                            # Respects dynamic base frame if provided by uneven dict mapping
-                            base_frame = target_image_frames[0] if target_image_frames else 0
-                            segments = []
-                            for frame in [base_frame, base_frame + 1]:
-                                try:
-                                    with open(image_filenames[0], "rb") as f:
-                                        b64_img = base64.b64encode(f.read()).decode("utf-8")
-                                        segments.append({
-                                            "frame": frame,
-                                            "image": f"data:image/png;base64,{b64_img}"
-                                        })
-                                except Exception:
-                                    continue
-                            timeline_data_str = json.dumps({"segments": segments, "audioSegments": []})
-                        else:
-                            # Multi-Reference Sequential Logic
-                            segments = []
-                            # Check if the user passed explicit uneven frames mapping (e.g. {"0":url, "45":url})
-                            if target_image_frames and len(target_image_frames) == num_imgs:
-                                img_frames = target_image_frames
-                            else:
-                                # Fallback: Scale linearly across the requested length
-                                img_frames = [int(i * (requested_length - 1) / max(1, num_imgs - 1)) for i in range(num_imgs)]
-                                
-                            for frame, img_path in zip(img_frames, image_filenames):
-                                try:
-                                    with open(img_path, "rb") as f:
-                                        b64_img = base64.b64encode(f.read()).decode("utf-8")
-                                        segments.append({
-                                            "frame": frame,
-                                            "image": f"data:image/png;base64,{b64_img}"
-                                        })
-                                except Exception:
-                                    continue
-                            timeline_data_str = json.dumps({"segments": segments, "audioSegments": []})
-
-                    if "46" in workflow:
-                        if "inputs" not in workflow["46"]: workflow["46"]["inputs"] = {}
-                        workflow["46"]["inputs"]["duration_frames"] = requested_length
-                        workflow["46"]["inputs"]["local_prompts"] = local_prompts_str
-                        workflow["46"]["inputs"]["timeline_data"] = timeline_data_str
-                        workflow["46"]["inputs"]["frame_rate"] = 24
-
-                    # ==============================================================================
-                    # MODEL WEIGHT INJECTIONS
-                    # ==============================================================================
-                    if "98" in workflow: 
-                        workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
-                        workflow["98"]["inputs"]["weight_dtype"] = "fp8_e4m3fn"
-                    if "100" in workflow: workflow["100"]["inputs"]["lora_name"] = "ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors"
-                    if "101" in workflow:
-                        workflow["101"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
-                        workflow["101"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
-                    if "97" in workflow: workflow["97"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
-                    if "103" in workflow: workflow["103"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
-                    if "102" in workflow: workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
-                    if "94:105" in workflow: workflow["94:105"]["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
-
-                    # ==============================================================================
-                    # COLOR FIXER INJECTION
-                    # ==============================================================================
-                    keys = list(workflow.keys())
-                    for node_id in keys:
-                        node_info = workflow[node_id]
+                    for idx, scene in enumerate(batch_scenes):
+                        print(f"\\n🎬 Preparing Batch Loop Sequence [{idx+1}/{len(batch_scenes)}]: {scene.get('name', 'Clip')}")
                         
-                        if node_info.get("class_type") in ["VHS_VideoCombine", "SaveVideo"]:
-                            if "inputs" in node_info and "images" in node_info["inputs"]:
-                                original_image_source = node_info["inputs"]["images"]
-                                fixer_id = "9999_color_fixer"
-                                workflow[fixer_id] = {
-                                    "class_type": "LTXColorFixer",
-                                    "inputs": {
-                                        "image": original_image_source,
-                                        "target_brightness": 0.40,
-                                        "max_boost": 2.0
+                        workflow = json.loads(json.dumps(base_workflow)) # Fresh copy per loop
+                        workflow = self.merge_overrides(workflow, overrides)
+
+                        # A. Ensure Out Dir is fresh for this specific video execution
+                        out_dir = "/workspace/ComfyUI/output"
+                        if os.path.exists(out_dir): shutil.rmtree(out_dir)
+                        os.makedirs(out_dir)
+
+                        # B. Single-Image Downloader & Initializer
+                        target_img_name = f"guide_anchor_{idx}.png"
+                        target_path = os.path.join(dynamic_guides_dir, target_img_name)
+                        
+                        image_url = scene.get("image_url", "")
+                        if image_url:
+                            try:
+                                async with session.get(image_url, timeout=120) as r:
+                                    if r.status == 200:
+                                        with open(target_path, "wb") as f: f.write(await r.read())
+                            except Exception: pass
+                        
+                        if not os.path.exists(target_path):
+                            from PIL import Image
+                            Image.new('RGB', (custom_w, custom_h), color='black').save(target_path)
+                            
+                        # Resize precisely to LTX Grid Constraints
+                        from PIL import Image
+                        img = Image.open(target_path).convert("RGB")
+                        img = img.resize((custom_w, custom_h), Image.Resampling.LANCZOS)
+                        img.save(target_path)
+                        
+                        segments = []
+                        for frame in [0, 1]:
+                            with open(target_path, "rb") as f:
+                                b64_img = base64.b64encode(f.read()).decode("utf-8")
+                                segments.append({"frame": frame, "image": f"data:image/png;base64,{b64_img}"})
+                        timeline_data_str = json.dumps({"segments": segments, "audioSegments": []})
+
+                        # C. ⚙️ AUTO FRAME CALCULATOR & 6-PART PROMPT FUSION ⚙️
+                        actions = scene.get("kinetic_actions", [])
+                        if not actions: actions = ["The subject moves dynamically across the cinematic scene."]
+                        
+                        # Math Calculation Phase (130 WPM Pacing) -> Frames -> 8n+1 Grid Formatter
+                        total_words = sum(len(str(a).split()) for a in actions)
+                        seconds = max(total_words / (130 / 60.0), 2.5)  # Strict minimum 2.5 sec buffer
+                        raw_frames = seconds * 24
+                        total_frames = int(math.ceil((raw_frames - 1) / 8) * 8 + 1)
+                        total_frames = max(33, min(total_frames, 257))  # Hardware sanity clamp (1.3s to 10.7s)
+                        
+                        num_actions = len(actions)
+                        keyframe_steps = [int(i * (total_frames - 1) / max(1, num_actions - 1)) for i in range(num_actions)]
+
+                        style = scene.get("style", "")
+                        subject = scene.get("subject", "")
+                        bg = scene.get("background", "")
+                        light = scene.get("lighting", "")
+                        cam = scene.get("camera", "")
+                        
+                        # Unify the static parameters
+                        static_env = f"{subject} {style} {bg} {light}".strip()
+                        
+                        local_prompts_list = []
+                        for step_frame, action_text in zip(keyframe_steps, actions):
+                            # Master Grammar Alignment Equation
+                            action_cam = f"{action_text} {cam}".strip()
+                            fused_prompt = f"{action_cam}. Cinematic environment and styling: {static_env}"
+                            local_prompts_list.append(f"{step_frame}: {fused_prompt}")
+                            
+                        local_prompts_str = "\n".join(local_prompts_list)
+                        print(f"📊 Auto-Calculated Math: {total_words} Words -> {seconds:.1f} Sec -> Locked exactly to {total_frames} Frames.")
+
+                        # D. Core Parameter Injection
+                        if "46" in workflow:
+                            if "inputs" not in workflow["46"]: workflow["46"]["inputs"] = {}
+                            workflow["46"]["inputs"]["duration_frames"] = total_frames
+                            workflow["46"]["inputs"]["local_prompts"] = local_prompts_str
+                            workflow["46"]["inputs"]["timeline_data"] = timeline_data_str
+                            workflow["46"]["inputs"]["frame_rate"] = 24
+
+                        if "98" in workflow: 
+                            workflow["98"]["inputs"]["unet_name"] = "LTX-2.3-22B-Distilled-FP4ME.safetensors"
+                        if "100" in workflow: workflow["100"]["inputs"]["lora_name"] = "ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors"
+                        if "101" in workflow:
+                            workflow["101"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
+                            workflow["101"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
+                        if "97" in workflow: workflow["97"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
+                        if "103" in workflow: workflow["103"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
+                        if "102" in workflow: workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
+                        if "94:105" in workflow: workflow["94:105"]["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+                        if "94:28" in workflow and "seed" in scene: workflow["94:28"]["inputs"]["noise_seed"] = scene["seed"]
+
+                        # E. Dynamic SubGraph & Color Fixer Network Hooking
+                        keys = list(workflow.keys())
+                        for node_id in keys:
+                            node_info = workflow[node_id]
+                            
+                            # Wire Color Fixer
+                            if node_info.get("class_type") in ["VHS_VideoCombine", "SaveVideo"]:
+                                if "inputs" in node_info and "images" in node_info["inputs"]:
+                                    original_image_source = node_info["inputs"]["images"]
+                                    fixer_id = f"9999_color_fixer_{idx}"
+                                    workflow[fixer_id] = {
+                                        "class_type": "LTXColorFixer",
+                                        "inputs": {"image": original_image_source, "target_brightness": 0.40, "max_boost": 2.0}
                                     }
-                                }
-                                node_info["inputs"]["images"] = [fixer_id, 0]
+                                    node_info["inputs"]["images"] = [fixer_id, 0]
 
-                    print(f"🚀 Executing Native LTX 2.3 Generation ({num_imgs} Images, {num_prompts} Prompts)...")
-                    await self.execute_comfy_workflow(session, workflow)
+                            # Wire SubGraph Isolator inline before the primary Guider/Sampler kicks off UNet calculation
+                            if node_info.get("class_type") in ["KSampler", "KSamplerAdvanced", "SamplerCustom", "CFGGuider", "BasicGuider"]:
+                                if "model" in node_info.get("inputs", {}) and "positive" in node_info.get("inputs", {}):
+                                    orig_model = node_info["inputs"]["model"]
+                                    orig_pos = node_info["inputs"]["positive"]
+                                    orig_neg = node_info["inputs"]["negative"]
+                                    
+                                    isolator_id = f"9998_subgraph_isolator_{node_id}_{idx}"
+                                    workflow[isolator_id] = {
+                                        "class_type": "SubGraphIsolator",
+                                        "inputs": {
+                                            "model": orig_model,
+                                            "positive": orig_pos,
+                                            "negative": orig_neg
+                                        }
+                                    }
+                                    
+                                    node_info["inputs"]["model"] = [isolator_id, 0]
+                                    node_info["inputs"]["positive"] = [isolator_id, 1]
+                                    node_info["inputs"]["negative"] = [isolator_id, 2]
+
+                        print(f"🚀 Processing Sequence via L40S Server Matrix...")
+                        await self.execute_comfy_workflow(session, workflow)
+
+                        # F. File Capture and Upload Phase
+                        output_files = []
+                        for root_p, _, filenames in os.walk(out_dir):
+                            for name in filenames:
+                                if name.endswith((".mp4", ".gif", ".webm")):
+                                    output_files.append(os.path.join(root_p, name))
+
+                        if not output_files:
+                            raise Exception("Inference finished but no output media files were detected.")
+                        
+                        output_files.sort(key=os.path.getmtime)
+                        target_video_file = output_files[-1]
+                        saved_filename = os.path.basename(target_video_file)
+
+                        target_key = f"{date_folder}/generated clips/{int(time.time())}_{scene.get('name', 'clip')}_{saved_filename}"
+                        print(f"📤 Uploading Segment to R2: {target_key}")
+                        
+                        await asyncio.get_event_loop().run_in_executor(
+                            None, self.s3.upload_file, target_video_file, "video-asset-files-storage-workflow", target_key
+                        )
+
+                        public_path_url = f"https://pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev/{target_key}" 
+                        
+                        generated_outputs.append({
+                            "scene": scene.get("name", f"Clip_{idx+1}"),
+                            "status": "success",
+                            "file_key": target_key,
+                            "public_url": public_path_url,
+                            "filename": saved_filename
+                        })
+
+                        # BATCH SPEED RULE: Unload ONLY the activation footprint, KEEP the models loaded inside L40S RAM for the next loop.
+                        await self.clear_comfy_memory(session, unload_models=False)
                     
-                    # Run final cleanup once execution completes
-                    await self.clear_comfy_memory(session)
-
-                    output_files = []
-                    for root_p, _, filenames in os.walk(out_dir):
-                        for name in filenames:
-                            if name.endswith((".mp4", ".gif", ".webm")):
-                                output_files.append(os.path.join(root_p, name))
-
-                    if not output_files:
-                        raise Exception("Inference finished but no output media files were detected.")
-                    
-                    output_files.sort(key=os.path.getmtime)
-                    target_video_file = output_files[-1]
-                    saved_filename = os.path.basename(target_video_file)
-
-                    target_key = f"{date_folder}/generated clips/{int(time.time())}_{saved_filename}"
-                    print(f"📤 Uploading LTX 2.3 Output Video to R2: {target_key}")
-                    
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, self.s3.upload_file, target_video_file, "video-asset-files-storage-workflow", target_key
-                    )
-
-                    public_path_url = f"https://pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev/{target_key}" 
-                    
-                    return {
-                        "status": "success",
-                        "file_key": target_key,
-                        "public_url": public_path_url,
-                        "filename": saved_filename
-                    }
+                    # Yield final output block
+                    return generated_outputs
 
             finally:
                 ram_task.cancel()

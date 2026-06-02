@@ -455,7 +455,6 @@ NODE_CLASS_MAPPINGS = {
                         cam = scene.get("camera", "")
                         
                         # --- CAMERA LORA TRIGGER FIX (ADDED FROM VIDEO REFERENCE) ---
-                        # The 19B Camera LoRAs require EXACT trigger phrases in the prompt to activate.
                         camera_trigger_map = {
                             "dolly_in": "The Camera Movement is Dolly In.",
                             "dolly_out": "The Camera Movement is Dolly Out.",
@@ -480,7 +479,6 @@ NODE_CLASS_MAPPINGS = {
                         
                         local_prompts_list = []
                         for step_frame, action_text in zip(keyframe_steps, actions):
-                            # Injecting the exact trigger phrases required by the LoRAs directly into the prompt stream
                             fused_prompt = f"{action_text}. {cam_trigger_text} Cinematic environment and styling: {static_env}".strip()
                             local_prompts_list.append(f"{step_frame}: {fused_prompt}")
                             
@@ -499,7 +497,6 @@ NODE_CLASS_MAPPINGS = {
                     pass1_workflow = self.merge_overrides(pass1_workflow, overrides)
                     pass1_workflow = inject_model_paths(pass1_workflow)
 
-                    # Strip heavy execution layers to make Pass 1 exclusively a text/motion compiler
                     keys_to_delete = []
                     for node_id, node_data in pass1_workflow.items():
                         c_type = node_data.get("class_type", "")
@@ -512,7 +509,6 @@ NODE_CLASS_MAPPINGS = {
                     orig_46 = pass1_workflow.pop("46", None)
                     if not orig_46: raise Exception("LTXDirector node '46' not found in base workflow!")
 
-                    # Master Camera LoRA Registry map
                     camera_loras_map = {
                         "dolly_in": "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
                         "dolly_out": "ltx-2-19b-lora-camera-control-dolly-out.safetensors",
@@ -523,7 +519,6 @@ NODE_CLASS_MAPPINGS = {
                         "static": "ltx-2-19b-lora-camera-control-static.safetensors"
                     }
 
-                    # Map Director loops into RAM Caches with Dynamic Stacking
                     for idx, scene in enumerate(batch_scenes):
                         scene_46 = json.loads(json.dumps(orig_46))
                         scene_46["inputs"]["duration_frames"] = scene["_total_frames"]
@@ -531,12 +526,8 @@ NODE_CLASS_MAPPINGS = {
                         scene_46["inputs"]["timeline_data"] = scene["_timeline_data_str"]
                         scene_46["inputs"]["frame_rate"] = 24
                         
-                        # ----------------------------------------------------------------------
-                        # DYNAMIC LORA STACK BUILDING LOGIC (Using ModelOnly for safety)
-                        # ----------------------------------------------------------------------
                         current_model_link = orig_46["inputs"].get("model", ["100", 0])
                         
-                        # The Hardcoded Quality Foundation Layers
                         fixed_loras = [
                             ("VBVR-official-comfyui.safetensors", 0.7),
                             ("LTX_2.3_Soft_Enhance_Style_LoRa.safetensors", 0.5)
@@ -545,21 +536,17 @@ NODE_CLASS_MAPPINGS = {
                         active_cameras = []
                         cam_string = scene.get("camera", "")
                         
-                        # Parse dynamic intent payload for multi-axis triggers
                         if cam_string:
                             cams = [c.strip().lower() for c in cam_string.split("+")]
-                            for c in cams[:3]:  # Enforce absolute max 3 movements limit
+                            for c in cams[:3]:
                                 if c in camera_loras_map:
                                     active_cameras.append((camera_loras_map[c], 1.0))
                         
-                        # Safe fallback to static if no matches resolve
                         if not active_cameras:
                             active_cameras.append((camera_loras_map["static"], 1.0))
                             
-                        # Compile the final physical array
                         all_loras = fixed_loras + active_cameras
                         
-                        # Sequentially wire the graph connections programmatically
                         for lora_idx, (lora_name, strength) in enumerate(all_loras):
                             node_id = f"9000_lora_{idx}_{lora_idx}"
                             pass1_workflow[node_id] = {
@@ -572,9 +559,7 @@ NODE_CLASS_MAPPINGS = {
                             }
                             current_model_link = [node_id, 0]
                             
-                        # Snap the fully stacked chain back into the Director node
                         scene_46["inputs"]["model"] = current_model_link
-                        # ----------------------------------------------------------------------
                         
                         pass1_workflow[f"46_{idx}"] = scene_46
                         
@@ -619,8 +604,6 @@ NODE_CLASS_MAPPINGS = {
                             "inputs": {"scene_id": str(idx)}
                         }
 
-                        # Dynamically reroute execution nodes directly to RAM output ports
-                        # (The loaded RAM model already contains the full LoRA matrix applied in Pass 1)
                         for node_id, node_data in pass2_workflow.items():
                             if "inputs" in node_data:
                                 for input_name, input_val in node_data["inputs"].items():
@@ -629,27 +612,26 @@ NODE_CLASS_MAPPINGS = {
 
                         if "94:28" in pass2_workflow: pass2_workflow["94:28"]["inputs"]["noise_seed"] = scene["_seed"]
                         
-                        # --- AUDIO FIX INJECTION START ---
-                        # Prevent Latent Upscaler from deeply frying the pristine audio latent
                         if "94:16" in pass2_workflow:
                             if "inputs" in pass2_workflow["94:16"] and "samples" in pass2_workflow["94:16"]["inputs"]:
                                 pass2_workflow["94:16"]["inputs"]["samples"] = ["94:13", 1]
-                        # --- AUDIO FIX INJECTION END ---
 
                         keys = list(pass2_workflow.keys())
                         for node_id in keys:
                             node_info = pass2_workflow[node_id]
                             c_type = node_info.get("class_type", "")
                             
-                            # 1. AUDIO SYNC FIX: Link FPS directly to exact Director Float value to lock audio math
+                            # ✨ FIX APPLIED HERE: Intelligently routing 'fps' vs 'frame_rate'
                             if c_type in ["VHS_VideoCombine", "SaveVideo", "CreateVideo"]:
                                 if "inputs" in node_info:
-                                    node_info["inputs"]["frame_rate"] = [f"reader_{idx}", 5]
-                                    node_info["inputs"]["fps"] = [f"reader_{idx}", 5]
+                                    if c_type == "VHS_VideoCombine":
+                                        node_info["inputs"]["frame_rate"] = [f"reader_{idx}", 5]
+                                    else:
+                                        node_info["inputs"]["fps"] = [f"reader_{idx}", 5]
+                                        
                                     if "pingpong" in node_info["inputs"]:
                                         node_info["inputs"]["pingpong"] = False
 
-                            # 2. Color Fixer Injection
                             if c_type in ["VHS_VideoCombine", "SaveVideo", "CreateVideo"]:
                                 if "inputs" in node_info and "images" in node_info["inputs"]:
                                     original_image_source = node_info["inputs"]["images"]
@@ -662,7 +644,6 @@ NODE_CLASS_MAPPINGS = {
 
                         await self.execute_comfy_workflow(session, pass2_workflow)
 
-                        # Capture & Upload Final Processed Video
                         output_files = []
                         for root_p, _, filenames in os.walk(out_dir):
                             for name in filenames:
@@ -692,7 +673,6 @@ NODE_CLASS_MAPPINGS = {
                             "filename": saved_filename
                         })
 
-                        # BATCH SPEED RULE: Clean out active rendering cache but keep heavy UNET loaded.
                         await self.clear_comfy_memory(session, unload_models=False)
                     
                     return generated_outputs

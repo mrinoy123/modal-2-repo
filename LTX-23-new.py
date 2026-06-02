@@ -28,7 +28,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "220"  # Bumped to ensure a completely fresh image build layer
+    "FORCE_REBUILD_INDEX": "221"  # Bumped to ensure a completely fresh image build layer
 })
 
 # ==============================================================================
@@ -324,7 +324,7 @@ NODE_CLASS_MAPPINGS = {
             
             if incoming_image_urls:
                 if isinstance(incoming_image_urls, dict):
-                    # Parses {"0": "img1.jpg", "45": "img2.jpg"} to support uneven timelines natively
+                    # Parses {"0": "img1.png", "45": "img2.png"} to support uneven timelines natively
                     sorted_keys = sorted([k for k in incoming_image_urls.keys() if str(k).isdigit()], key=lambda x: int(x))
                     for k in sorted_keys:
                         v = incoming_image_urls[k]
@@ -342,12 +342,27 @@ NODE_CLASS_MAPPINGS = {
 
             async def download_one(session, url_str, target_dest, width, height):
                 try:
-                    async with session.get(url_str, timeout=120) as r:
-                        if r.status == 200:
-                            with open(target_dest, "wb") as f: f.write(await r.read())
-                            print(f"✅ Downloaded reference image: {url_str}")
-                        else:
-                            print(f"❌ HTTP ERROR {r.status} while downloading: {url_str}")
+                    # SECURE AUTHENTICATED BYPASS FOR PRIVATE R2 BUCKETS
+                    if "pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev" in url_str:
+                        s3_key = url_str.split(".dev/")[-1]
+                        print(f"🔐 Authenticating & Downloading PRIVATE Image from S3/R2: {s3_key}")
+                        loop = asyncio.get_event_loop()
+                        await loop.run_in_executor(
+                            None, 
+                            self.s3.download_file, 
+                            "video-asset-files-storage-workflow", 
+                            s3_key, 
+                            target_dest
+                        )
+                        print(f"✅ Successfully Downloaded Private Reference Image: {s3_key}")
+                    else:
+                        # Standard public download fallback
+                        async with session.get(url_str, timeout=120) as r:
+                            if r.status == 200:
+                                with open(target_dest, "wb") as f: f.write(await r.read())
+                                print(f"✅ Downloaded public reference image: {url_str}")
+                            else:
+                                print(f"❌ HTTP ERROR {r.status} while downloading: {url_str}")
                 except Exception as e:
                     print(f"❌ CONNECTION ERROR downloading {url_str}: {e}")
                 

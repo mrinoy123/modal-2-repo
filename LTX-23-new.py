@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "228"  # Bumped to ensure cache rebuilds with new fixed Custom Nodes
+    "FORCE_REBUILD_INDEX": "229"  # Bumped to build the VAE memory protection node
 })
 
 # ==============================================================================
@@ -118,13 +118,14 @@ class LTX23Engine:
     def start_comfy(self):
         import boto3
         
-        # 🔥 CUSTOM NODES: LTXColorFixer & TWO-PASS CACHE WRITERS/READERS 🔥
-        print("🎨 Injecting Smart Auto-Exposure & Two-Pass Caching Nodes...")
+        # 🔥 CUSTOM NODES: LTXColorFixer, Two-Pass Cache Writers & VAE Armor Patch 🔥
+        print("🎨 Injecting Smart Nodes, Caches & VAE Memory Protections...")
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline.py"
         with open(custom_nodes_path, "w") as f:
             f.write("""
 import torch
 import torchvision.transforms.functional as TF
+import nodes
 
 class LTXColorFixer:
     @classmethod
@@ -209,10 +210,21 @@ class MemoryCacheReader:
         print(f"\\n[Two-Pass System] 🚀 Bypassing Loaders: Loaded Pre-Cached Conditionings for Scene {scene_id}\\n")
         return (data["model"], data["positive"], data["video_latent"], data["audio_latent"], data["guide_data"], data["frame_rate"])
 
+# VAE Memory Armor Patch: Prevents massive allocations from dumping the UNet
+class FastVAEDecode(nodes.VAEDecode):
+    def decode(self, vae, samples):
+        print("\\n[Two-Pass System] 🛡️ Auto-Routing to Tiled VAE Decoding to protect 22B UNet VRAM state.\\n")
+        try:
+            return (vae.decode_tiled(samples["samples"], tile_x=512, tile_y=512), )
+        except Exception as e:
+            print(f"\\n[Two-Pass System] Tiled decode warning: {e}. Falling back to standard.\\n")
+            return super().decode(vae, samples)
+
 NODE_CLASS_MAPPINGS = {
     "LTXColorFixer": LTXColorFixer,
     "MemoryCacheWriter": MemoryCacheWriter,
-    "MemoryCacheReader": MemoryCacheReader
+    "MemoryCacheReader": MemoryCacheReader,
+    "VAEDecode": FastVAEDecode
 }
 """)
 
@@ -380,7 +392,7 @@ NODE_CLASS_MAPPINGS = {
                         custom_w = overrides["46"]["inputs"].get("custom_width", 576)
                         custom_h = overrides["46"]["inputs"].get("custom_height", 1024)
 
-                    # Dynamic Target Injector explicitly to fix the "Value not in list" errors
+                    # Dynamic Target Injector
                     def inject_model_paths(workflow):
                         if "98" in workflow: workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
                         if "100" in workflow: workflow["100"]["inputs"]["lora_name"] = "ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors"
@@ -520,7 +532,6 @@ NODE_CLASS_MAPPINGS = {
                         if os.path.exists(out_dir): shutil.rmtree(out_dir)
                         os.makedirs(out_dir)
 
-                        # Delete the Text Encoder & LTXDirector so ComfyUI doesn't reload them into VRAM
                         if "101" in pass2_workflow: del pass2_workflow["101"]
                         if "46" in pass2_workflow: del pass2_workflow["46"]
 
@@ -536,13 +547,22 @@ NODE_CLASS_MAPPINGS = {
                                     if isinstance(input_val, list) and len(input_val) == 2 and input_val[0] == "46":
                                         node_data["inputs"][input_name] = [f"reader_{idx}", input_val[1]]
 
-                        # General Overrides & Hook Color Fixer
                         if "94:28" in pass2_workflow: pass2_workflow["94:28"]["inputs"]["noise_seed"] = scene["_seed"]
                         
                         keys = list(pass2_workflow.keys())
                         for node_id in keys:
                             node_info = pass2_workflow[node_id]
-                            if node_info.get("class_type") == "CreateVideo":
+                            c_type = node_info.get("class_type", "")
+                            
+                            # 1. AUDIO SYNC FIX: Explicitly lock the MP4 compiler output to 24fps
+                            if c_type in ["VHS_VideoCombine", "SaveVideo", "CreateVideo"]:
+                                if "inputs" in node_info:
+                                    node_info["inputs"]["frame_rate"] = 24
+                                    if "pingpong" in node_info["inputs"]:
+                                        node_info["inputs"]["pingpong"] = False
+
+                            # 2. Color Fixer Injection
+                            if c_type in ["VHS_VideoCombine", "SaveVideo", "CreateVideo"]:
                                 if "inputs" in node_info and "images" in node_info["inputs"]:
                                     original_image_source = node_info["inputs"]["images"]
                                     fixer_id = f"9999_color_fixer_{idx}"

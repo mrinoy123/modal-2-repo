@@ -510,7 +510,7 @@ NODE_CLASS_MAPPINGS = {
 
                         # General Overrides & Hook Color Fixer
                         if "94:28" in pass2_workflow: pass2_workflow["94:28"]["inputs"]["noise_seed"] = scene["_seed"]
-                        if "98" in pass2_workflow: pass2_workflow["98"]["inputs"]["unet_name"] = "LTX-2.3-22B-Distilled-FP4ME.safetensors"
+                        if "98" in pass2_workflow: pass2_workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
                         if "100" in pass2_workflow: pass2_workflow["100"]["inputs"]["lora_name"] = "ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors"
                         if "97" in pass2_workflow: pass2_workflow["97"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                         if "103" in pass2_workflow: pass2_workflow["103"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"

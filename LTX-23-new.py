@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "222"  # Bumped to ensure a completely fresh image build layer
+    "FORCE_REBUILD_INDEX": "226"  # Bumped to ensure cache rebuilds with Two-Pass Nodes
 })
 
 # ==============================================================================
@@ -73,7 +73,6 @@ deps_image = clone_image.run_commands(
 )
 
 final_image = deps_image.run_commands(
-    "wget -qO /workspace/ComfyUI/ltxDirector_v10_api.json 'https://raw.githubusercontent.com/WhatDreamsCost/WhatDreamsCost-ComfyUI/main/workflows/LTX%20Director%20Example%20Workflow%20(Fixed).json' || true",
     "echo '' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     "echo 'sageattn_qk_int8_pv_fp16_triton = sageattn' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     env={
@@ -119,8 +118,8 @@ class LTX23Engine:
     def start_comfy(self):
         import boto3
         
-        # 🔥 CUSTOM NODES: LTXColorFixer & L40S Batch SubGraphIsolator 🔥
-        print("🎨 Injecting Smart Auto-Exposure & Batch SubGraph Nodes...")
+        # 🔥 CUSTOM NODES: LTXColorFixer & TWO-PASS CACHE WRITERS/READERS 🔥
+        print("🎨 Injecting Smart Auto-Exposure & Two-Pass Caching Nodes...")
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline.py"
         with open(custom_nodes_path, "w") as f:
             f.write("""
@@ -158,35 +157,52 @@ class LTXColorFixer:
             
         return (image,)
 
-class SubGraphIsolator:
+# High-Speed Python Dictionary serving as VRAM Cache Buffer
+LTX_CACHE = {}
+
+class MemoryCacheWriter:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
             "model": ("MODEL",),
             "positive": ("CONDITIONING",),
-            "negative": ("CONDITIONING",)
+            "negative": ("CONDITIONING",),
+            "scene_id": ("STRING", {"default": "0"})
         }}
-    
-    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING")
-    FUNCTION = "isolate_and_flush"
-    CATEGORY = "utils"
+    RETURN_TYPES = ()
+    OUTPUT_NODE = True
+    FUNCTION = "write_cache"
+    CATEGORY = "LTXBatch"
 
-    def isolate_and_flush(self, model, positive, negative):
-        import gc
-        import comfy.model_management
-        print("\\n[SubGraph System] 🛑 Pass 1 (Text Encoding) Complete. Isolating Conditionings.")
-        
-        # L40S Optimization: We clear PyTorch activation cache but KEEP models loaded in VRAM for speed
-        comfy.model_management.soft_empty_cache()
-        gc.collect()
-        torch.cuda.empty_cache()
-        
-        print("[SubGraph System] 🟢 Activation memory cleared. Handing Patched Data to KSampler.\\n")
-        return (model, positive, negative)
+    def write_cache(self, model, positive, negative, scene_id):
+        global LTX_CACHE
+        LTX_CACHE[str(scene_id)] = {"model": model, "positive": positive, "negative": negative}
+        print(f"\\n[Two-Pass System] 💾 Encoded & Saved Conditionings for Scene {scene_id} into RAM\\n")
+        return ()
+
+class MemoryCacheReader:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "scene_id": ("STRING", {"default": "0"})
+        }}
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING")
+    RETURN_NAMES = ("model", "positive", "negative")
+    FUNCTION = "read_cache"
+    CATEGORY = "LTXBatch"
+
+    def read_cache(self, scene_id):
+        global LTX_CACHE
+        data = LTX_CACHE.get(str(scene_id))
+        if data is None:
+            raise ValueError(f"Cache for Scene {scene_id} not found in RAM! Text Encoder Pass failed.")
+        print(f"\\n[Two-Pass System] 🚀 Bypassing Loaders: Loaded Pre-Cached Conditionings for Scene {scene_id}\\n")
+        return (data["model"], data["positive"], data["negative"])
 
 NODE_CLASS_MAPPINGS = {
     "LTXColorFixer": LTXColorFixer,
-    "SubGraphIsolator": SubGraphIsolator
+    "MemoryCacheWriter": MemoryCacheWriter,
+    "MemoryCacheReader": MemoryCacheReader
 }
 """)
 
@@ -219,7 +235,7 @@ NODE_CLASS_MAPPINGS = {
             region_name="auto"
         )
 
-        print("🚀 Launching Optimized LTX Server Engine on L40S GPU (48GB Native)...")
+        print("🚀 Launching Two-Pass Server Engine on L40S GPU (48GB Native)...")
         os.makedirs("/tmp/comfy_swap", exist_ok=True)
 
         env_vars = os.environ.copy()
@@ -254,10 +270,9 @@ NODE_CLASS_MAPPINGS = {
         if not comfy_ready:
             os._exit(1)
 
-        print("✅ Base pipeline active. Awaiting API Batch triggers.")
+        print("✅ Base pipeline active. Awaiting Two-Pass API Batch triggers.")
 
     async def clear_comfy_memory(self, session, unload_models=False):
-        # Optimized for Batching: Clears cache but KEEPS weights loaded between sequences
         try:
             async with session.post("http://127.0.0.1:8188/free", json={"unload_models": unload_models, "free_memory": True}) as r:
                 await r.read()
@@ -284,7 +299,6 @@ NODE_CLASS_MAPPINGS = {
             res = await r.json()
             prompt_id = res["prompt_id"]
 
-        print(f"⌛ Queued workflow. prompt_id: {prompt_id}. Polling state...")
         while True:
             async with session.get(f"http://127.0.0.1:8188/history/{prompt_id}") as r:
                 if r.status == 200:
@@ -316,7 +330,7 @@ NODE_CLASS_MAPPINGS = {
         return base_graph
 
     # ==============================================================================
-    # PART 6: MAIN HIGH-SPEED INTERNAL BATCH ENDPOINT
+    # PART 6: TWO-PASS HIGH-SPEED BATCH ENDPOINT
     # ==============================================================================
     @modal.fastapi_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
@@ -330,22 +344,10 @@ NODE_CLASS_MAPPINGS = {
 
         async def process_pipeline():
             date_folder = body.get("date_folder", time.strftime('%Y-%m-%d'))
-            workflow_url = body.get("workflow_url") 
-
-            # Normalize incoming payload to handle both flat fallback and advanced batch formats
             batch_scenes = body.get("batch_scenes", [])
+            
             if not batch_scenes:
-                print("⚠️ No batch_scenes array found. Falling back to legacy single-item format mapping.")
-                batch_scenes = [{
-                    "name": body.get("filename", "clip_output"),
-                    "image_url": body.get("image_url", ""),
-                    "kinetic_actions": [p for p in body.get("prompts", {}).values()] if isinstance(body.get("prompts"), dict) else body.get("prompts", []),
-                    "style": body.get("style_profile", ""),
-                    "subject": body.get("subject", ""),
-                    "background": body.get("background", ""),
-                    "lighting": body.get("lighting", ""),
-                    "camera": body.get("camera", "")
-                }]
+                raise HTTPException(status_code=400, detail="Missing batch_scenes array.")
 
             dynamic_guides_dir = "/workspace/ComfyUI/input/dynamic_guides"
             if os.path.exists(dynamic_guides_dir): shutil.rmtree(dynamic_guides_dir)
@@ -356,19 +358,11 @@ NODE_CLASS_MAPPINGS = {
 
             try:
                 async with aiohttp.ClientSession() as session:
-                    # 1. Fetch Master Workflow Template Once
-                    workflow_raw = body.get("workflow_json")
-                    if workflow_raw:
-                        base_workflow = json.loads(workflow_raw) if isinstance(workflow_raw, str) else workflow_raw
-                    elif workflow_url:
-                        async with session.get(workflow_url) as resp: base_workflow = await resp.json()
-                    else:
-                        try:
-                            with open("/workspace/ComfyUI/ltxDirector_v10_api.json", "r") as f: base_workflow = json.load(f)
-                        except FileNotFoundError:
-                            with open("ltxDirector_v10(modified-own)api.json", "r") as f: base_workflow = json.load(f)
+                    # 1. Base Workflow Extraction
+                    base_workflow = body.get("workflow_json")
+                    if isinstance(base_workflow, str):
+                        base_workflow = json.loads(base_workflow)
 
-                    # DYNAMIC RESOLUTION EXTRACTION: Defaults to 9:16 aspect ratio
                     custom_w = 576
                     custom_h = 1024
                     overrides = body.get("workflow_override", {})
@@ -377,20 +371,9 @@ NODE_CLASS_MAPPINGS = {
                         custom_h = overrides["46"]["inputs"].get("custom_height", 1024)
 
                     # ==============================================================================
-                    # 🚀 HIGH SPEED BATCH LOOP BEGINS HERE
+                    # PRE-COMPUTE: Download Images & Calculate Dimensions
                     # ==============================================================================
                     for idx, scene in enumerate(batch_scenes):
-                        print(f"\\n🎬 Preparing Batch Loop Sequence [{idx+1}/{len(batch_scenes)}]: {scene.get('name', 'Clip')}")
-                        
-                        workflow = json.loads(json.dumps(base_workflow)) # Fresh copy per loop
-                        workflow = self.merge_overrides(workflow, overrides)
-
-                        # A. Ensure Out Dir is fresh for this specific video execution
-                        out_dir = "/workspace/ComfyUI/output"
-                        if os.path.exists(out_dir): shutil.rmtree(out_dir)
-                        os.makedirs(out_dir)
-
-                        # B. Single-Image Downloader & Initializer
                         target_img_name = f"guide_anchor_{idx}.png"
                         target_path = os.path.join(dynamic_guides_dir, target_img_name)
                         
@@ -406,7 +389,6 @@ NODE_CLASS_MAPPINGS = {
                             from PIL import Image
                             Image.new('RGB', (custom_w, custom_h), color='black').save(target_path)
                             
-                        # Resize precisely to LTX Grid Constraints
                         from PIL import Image
                         img = Image.open(target_path).convert("RGB")
                         img = img.resize((custom_w, custom_h), Image.Resampling.LANCZOS)
@@ -419,16 +401,14 @@ NODE_CLASS_MAPPINGS = {
                                 segments.append({"frame": frame, "image": f"data:image/png;base64,{b64_img}"})
                         timeline_data_str = json.dumps({"segments": segments, "audioSegments": []})
 
-                        # C. ⚙️ AUTO FRAME CALCULATOR & 6-PART PROMPT FUSION ⚙️
                         actions = scene.get("kinetic_actions", [])
                         if not actions: actions = ["The subject moves dynamically across the cinematic scene."]
                         
-                        # Math Calculation Phase (130 WPM Pacing) -> Frames -> 8n+1 Grid Formatter
                         total_words = sum(len(str(a).split()) for a in actions)
-                        seconds = max(total_words / (130 / 60.0), 2.5)  # Strict minimum 2.5 sec buffer
+                        seconds = max(total_words / (130 / 60.0), 2.5)  
                         raw_frames = seconds * 24
                         total_frames = int(math.ceil((raw_frames - 1) / 8) * 8 + 1)
-                        total_frames = max(33, min(total_frames, 257))  # Hardware sanity clamp (1.3s to 10.7s)
+                        total_frames = max(33, min(total_frames, 257))
                         
                         num_actions = len(actions)
                         keyframe_steps = [int(i * (total_frames - 1) / max(1, num_actions - 1)) for i in range(num_actions)]
@@ -439,95 +419,134 @@ NODE_CLASS_MAPPINGS = {
                         light = scene.get("lighting", "")
                         cam = scene.get("camera", "")
                         
-                        # Unify the static parameters
                         static_env = f"{subject} {style} {bg} {light}".strip()
                         
                         local_prompts_list = []
                         for step_frame, action_text in zip(keyframe_steps, actions):
-                            # Master Grammar Alignment Equation
                             action_cam = f"{action_text} {cam}".strip()
                             fused_prompt = f"{action_cam}. Cinematic environment and styling: {static_env}"
                             local_prompts_list.append(f"{step_frame}: {fused_prompt}")
                             
                         local_prompts_str = "\n".join(local_prompts_list)
-                        print(f"📊 Auto-Calculated Math: {total_words} Words -> {seconds:.1f} Sec -> Locked exactly to {total_frames} Frames.")
+                        
+                        scene["_timeline_data_str"] = timeline_data_str
+                        scene["_local_prompts_str"] = local_prompts_str
+                        scene["_total_frames"] = total_frames
+                        scene["_seed"] = scene.get("seed", int(time.time() * 1000) % 1000000)
 
-                        # D. Core Parameter Injection
-                        if "46" in workflow:
-                            if "inputs" not in workflow["46"]: workflow["46"]["inputs"] = {}
-                            workflow["46"]["inputs"]["duration_frames"] = total_frames
-                            workflow["46"]["inputs"]["local_prompts"] = local_prompts_str
-                            workflow["46"]["inputs"]["timeline_data"] = timeline_data_str
-                            workflow["46"]["inputs"]["frame_rate"] = 24
+                    # ==============================================================================
+                    # PASS 1: THE TEXT ENCODING MARATHON
+                    # ==============================================================================
+                    print("\n[Two-Pass System] 🎬 PASS 1 START: Initiating Text Encoding Marathon...")
+                    pass1_workflow = json.loads(json.dumps(base_workflow))
+                    pass1_workflow = self.merge_overrides(pass1_workflow, overrides)
 
-                        if "98" in workflow: 
-                            workflow["98"]["inputs"]["unet_name"] = "LTX-2.3-22B-Distilled-FP4ME.safetensors"
-                        if "100" in workflow: workflow["100"]["inputs"]["lora_name"] = "ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors"
-                        if "101" in workflow:
-                            workflow["101"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
-                            workflow["101"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
-                        if "97" in workflow: workflow["97"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
-                        if "103" in workflow: workflow["103"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
-                        if "102" in workflow: workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
-                        if "94:105" in workflow: workflow["94:105"]["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
-                        if "94:28" in workflow and "seed" in scene: workflow["94:28"]["inputs"]["noise_seed"] = scene["seed"]
+                    # Strip heavy execution layers to make Pass 1 exclusively a text compiler
+                    keys_to_delete = []
+                    for node_id, node_data in pass1_workflow.items():
+                        c_type = node_data.get("class_type", "")
+                        if c_type in ["KSampler", "KSamplerAdvanced", "SamplerCustom", "SamplerCustomAdvanced", 
+                                      "VHS_VideoCombine", "SaveVideo", "VAEDecode", "LatentUpscale", 
+                                      "LTXVCropGuides", "CFGGuider", "BasicScheduler", "BasicGuider", "LatentInterpolate"]:
+                            keys_to_delete.append(node_id)
+                    for k in keys_to_delete: del pass1_workflow[k]
 
-                        # E. Dynamic SubGraph & Color Fixer Network Hooking
-                        keys = list(workflow.keys())
+                    orig_46 = pass1_workflow.pop("46", None)
+                    if not orig_46: raise Exception("LTXDirector node '46' not found in base workflow!")
+
+                    # Map Director loops into RAM Caches
+                    for idx, scene in enumerate(batch_scenes):
+                        scene_46 = json.loads(json.dumps(orig_46))
+                        scene_46["inputs"]["duration_frames"] = scene["_total_frames"]
+                        scene_46["inputs"]["local_prompts"] = scene["_local_prompts_str"]
+                        scene_46["inputs"]["timeline_data"] = scene["_timeline_data_str"]
+                        scene_46["inputs"]["frame_rate"] = 24
+                        pass1_workflow[f"46_{idx}"] = scene_46
+                        
+                        pass1_workflow[f"writer_{idx}"] = {
+                            "class_type": "MemoryCacheWriter",
+                            "inputs": {
+                                "model": [f"46_{idx}", 0],
+                                "positive": [f"46_{idx}", 1],
+                                "negative": [f"46_{idx}", 2],
+                                "scene_id": str(idx)
+                            }
+                        }
+
+                    print(f"🚀 Queuing Math Encoding Pass for {len(batch_scenes)} Scenes simultaneously...")
+                    await self.execute_comfy_workflow(session, pass1_workflow)
+                    await self.clear_comfy_memory(session, unload_models=False)
+
+                    # ==============================================================================
+                    # PASS 2: THE SAMPLING BLAST
+                    # ==============================================================================
+                    print("\n[Two-Pass System] 🚀 PASS 2 START: Initiating Pure Sampling Blast...")
+                    
+                    for idx, scene in enumerate(batch_scenes):
+                        print(f"\n🎬 Rendering Native Scene [{idx+1}/{len(batch_scenes)}]: {scene.get('name', 'Clip')}")
+                        
+                        pass2_workflow = json.loads(json.dumps(base_workflow))
+                        pass2_workflow = self.merge_overrides(pass2_workflow, overrides)
+
+                        out_dir = "/workspace/ComfyUI/output"
+                        if os.path.exists(out_dir): shutil.rmtree(out_dir)
+                        os.makedirs(out_dir)
+
+                        # Delete the Text Encoder & LTXDirector so ComfyUI doesn't reload them into VRAM
+                        if "101" in pass2_workflow: del pass2_workflow["101"]
+                        if "46" in pass2_workflow: del pass2_workflow["46"]
+
+                        pass2_workflow[f"reader_{idx}"] = {
+                            "class_type": "MemoryCacheReader",
+                            "inputs": {"scene_id": str(idx)}
+                        }
+
+                        # Dynamically reroute execution nodes directly to RAM output ports
+                        for node_id, node_data in pass2_workflow.items():
+                            if "inputs" in node_data:
+                                for input_name, input_val in node_data["inputs"].items():
+                                    if isinstance(input_val, list) and len(input_val) == 2 and input_val[0] == "46":
+                                        node_data["inputs"][input_name] = [f"reader_{idx}", input_val[1]]
+
+                        # General Overrides & Hook Color Fixer
+                        if "94:28" in pass2_workflow: pass2_workflow["94:28"]["inputs"]["noise_seed"] = scene["_seed"]
+                        if "98" in pass2_workflow: pass2_workflow["98"]["inputs"]["unet_name"] = "LTX-2.3-22B-Distilled-FP4ME.safetensors"
+                        if "100" in pass2_workflow: pass2_workflow["100"]["inputs"]["lora_name"] = "ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors"
+                        if "97" in pass2_workflow: pass2_workflow["97"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
+                        if "103" in pass2_workflow: pass2_workflow["103"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
+                        if "102" in pass2_workflow: pass2_workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
+                        if "94:105" in pass2_workflow: pass2_workflow["94:105"]["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+
+                        keys = list(pass2_workflow.keys())
                         for node_id in keys:
-                            node_info = workflow[node_id]
-                            
-                            # Wire Color Fixer
-                            if node_info.get("class_type") in ["VHS_VideoCombine", "SaveVideo"]:
+                            node_info = pass2_workflow[node_id]
+                            if node_info.get("class_type") == "CreateVideo":
                                 if "inputs" in node_info and "images" in node_info["inputs"]:
                                     original_image_source = node_info["inputs"]["images"]
                                     fixer_id = f"9999_color_fixer_{idx}"
-                                    workflow[fixer_id] = {
+                                    pass2_workflow[fixer_id] = {
                                         "class_type": "LTXColorFixer",
                                         "inputs": {"image": original_image_source, "target_brightness": 0.40, "max_boost": 2.0}
                                     }
                                     node_info["inputs"]["images"] = [fixer_id, 0]
 
-                            # Wire SubGraph Isolator inline before the primary Guider/Sampler kicks off UNet calculation
-                            if node_info.get("class_type") in ["KSampler", "KSamplerAdvanced", "SamplerCustom", "CFGGuider", "BasicGuider"]:
-                                if "model" in node_info.get("inputs", {}) and "positive" in node_info.get("inputs", {}):
-                                    orig_model = node_info["inputs"]["model"]
-                                    orig_pos = node_info["inputs"]["positive"]
-                                    orig_neg = node_info["inputs"]["negative"]
-                                    
-                                    isolator_id = f"9998_subgraph_isolator_{node_id}_{idx}"
-                                    workflow[isolator_id] = {
-                                        "class_type": "SubGraphIsolator",
-                                        "inputs": {
-                                            "model": orig_model,
-                                            "positive": orig_pos,
-                                            "negative": orig_neg
-                                        }
-                                    }
-                                    
-                                    node_info["inputs"]["model"] = [isolator_id, 0]
-                                    node_info["inputs"]["positive"] = [isolator_id, 1]
-                                    node_info["inputs"]["negative"] = [isolator_id, 2]
+                        await self.execute_comfy_workflow(session, pass2_workflow)
 
-                        print(f"🚀 Processing Sequence via L40S Server Matrix...")
-                        await self.execute_comfy_workflow(session, workflow)
-
-                        # F. File Capture and Upload Phase
+                        # Capture & Upload Final Processed Video
                         output_files = []
                         for root_p, _, filenames in os.walk(out_dir):
                             for name in filenames:
                                 if name.endswith((".mp4", ".gif", ".webm")):
                                     output_files.append(os.path.join(root_p, name))
 
-                        if not output_files:
-                            raise Exception("Inference finished but no output media files were detected.")
+                        if not output_files: raise Exception("Inference finished but no output media files were detected.")
                         
                         output_files.sort(key=os.path.getmtime)
                         target_video_file = output_files[-1]
                         saved_filename = os.path.basename(target_video_file)
 
                         target_key = f"{date_folder}/generated clips/{int(time.time())}_{scene.get('name', 'clip')}_{saved_filename}"
-                        print(f"📤 Uploading Segment to R2: {target_key}")
+                        print(f"📤 Syncing Finished Asset to R2: {target_key}")
                         
                         await asyncio.get_event_loop().run_in_executor(
                             None, self.s3.upload_file, target_video_file, "video-asset-files-storage-workflow", target_key
@@ -543,10 +562,9 @@ NODE_CLASS_MAPPINGS = {
                             "filename": saved_filename
                         })
 
-                        # BATCH SPEED RULE: Unload ONLY the activation footprint, KEEP the models loaded inside L40S RAM for the next loop.
+                        # BATCH SPEED RULE: Clean out active rendering cache but keep heavy UNET loaded.
                         await self.clear_comfy_memory(session, unload_models=False)
                     
-                    # Yield final output block
                     return generated_outputs
 
             finally:

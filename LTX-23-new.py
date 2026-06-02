@@ -118,21 +118,24 @@ class LTX23Engine:
     def start_comfy(self):
         import boto3
         
-        # 🔥 SMART AUTO-EXPOSURE & COLOR FIXER NODE 🔥
-        print("🎨 Injecting Smart Auto-Exposure LTX Color Fixer Node...")
-        color_node_path = "/workspace/ComfyUI/custom_nodes/LTXColorFixer.py"
-        with open(color_node_path, "w") as f:
+        # 🔥 SMART AUTO-EXPOSURE & SPLIT-GRAPH ISOLATOR CUSTOM NODES 🔥
+        print("🎨 Injecting Smart Auto-Exposure and Sub-Graph Isolator Nodes...")
+        custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline.py"
+        with open(custom_nodes_path, "w") as f:
             f.write("""
 import torch
 import torchvision.transforms.functional as TF
+import comfy.model_management
+import gc
+import os
 
 class LTXColorFixer:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
             "image": ("IMAGE",),
-            "target_brightness": ("FLOAT", {"default": 0.40, "min": 0.1, "max": 1.0, "step": 0.05, "tooltip": "Target average luminance (0.4 is good daylight)"}),
-            "max_boost": ("FLOAT", {"default": 1.6, "min": 1.0, "max": 3.0, "step": 0.1, "tooltip": "Maximum multiplier so dark scenes don't blow out completely"}),
+            "target_brightness": ("FLOAT", {"default": 0.40, "min": 0.1, "max": 1.0, "step": 0.05}),
+            "max_boost": ("FLOAT", {"default": 1.6, "min": 1.0, "max": 3.0, "step": 0.1}),
         }}
     
     RETURN_TYPES = ("IMAGE",)
@@ -140,46 +143,60 @@ class LTXColorFixer:
     CATEGORY = "image/postprocessing"
 
     def process(self, image, target_brightness, max_boost):
-        # Image shape from ComfyUI is (Batch/Frames, Height, Width, Channels RGB) [0.0 to 1.0]
-        
-        # 1. Calculate the real mean luminance (brightness) of the entire video batch
-        # ITU-R BT.601 formula for relative luminance
         r = image[:, :, :, 0]
         g = image[:, :, :, 1]
         b = image[:, :, :, 2]
         luminance = 0.299 * r + 0.587 * g + 0.114 * b
-        
         mean_lum = torch.mean(luminance).item()
         
-        # 2. Dynamic Logic Gate: Only trigger if the video is too dark
         if mean_lum < target_brightness and mean_lum > 0.01:
-            # Calculate exactly how much to multiply the pixels to reach the target
             boost = target_brightness / mean_lum
-            
-            # Clamp it to the safe maximum so we don't destroy contrast
             boost = min(boost, max_boost)
-            print(f"[LTX Smart Exposure] Video is dark (Luma: {mean_lum:.3f}). Applying Auto-Boost: {boost:.2f}x")
-            
-            # TF functions expect (B, C, H, W)
             img_t = image.permute(0, 3, 1, 2)
-            
-            # Apply dynamic brightness
             img_t = TF.adjust_brightness(img_t, boost)
-            
-            # Auto-compensate saturation (brighter pixels wash out, so we boost saturation slightly based on the brightness boost)
             sat_boost = 1.0 + ((boost - 1.0) * 0.4) 
             img_t = TF.adjust_saturation(img_t, sat_boost)
-            
-            # Convert back to ComfyUI standard shape (B, H, W, C)
             image = img_t.permute(0, 2, 3, 1)
-        else:
-            print(f"[LTX Smart Exposure] Video brightness is optimal (Luma: {mean_lum:.3f}). Bypassing adjustments.")
             
         return (image,)
 
-NODE_CLASS_MAPPINGS = {"LTXColorFixer": LTXColorFixer}
+class SubGraphIsolator:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {
+            "model": ("MODEL",),
+            "positive": ("CONDITIONING",),
+            "negative": ("CONDITIONING",)
+        }}
+    
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING")
+    FUNCTION = "isolate_and_flush"
+    CATEGORY = "utils"
+
+    def isolate_and_flush(self, model, positive, negative):
+        print("\\n[SubGraph System] 🛑 Pausing Pipeline: Pass 1 (Text Encoding) Complete.")
+        
+        # 1. Save Conditioning Data to Disk (Subgraph File Cache)
+        os.makedirs("/workspace/ComfyUI/output/conditioning_cache", exist_ok=True)
+        torch.save(positive, "/workspace/ComfyUI/output/conditioning_cache/cond_pos.pt")
+        torch.save(negative, "/workspace/ComfyUI/output/conditioning_cache/cond_neg.pt")
+        print("[SubGraph System] 💾 CONDITIONING payloads saved securely to disk cache.")
+        
+        # 2. Aggressive VRAM Flush (Evict Gemma-3 before KSampler begins)
+        print("[SubGraph System] 🧼 Aggressively flushing Gemma-3 Text Encoder from VRAM...")
+        comfy.model_management.unload_all_models()
+        comfy.model_management.soft_empty_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        print("[SubGraph System] 🟢 VRAM cleared. Handing Patched Model and Conditionings to Pass 2 (Sampler).\\n")
+        return (model, positive, negative)
+
+NODE_CLASS_MAPPINGS = {
+    "LTXColorFixer": LTXColorFixer,
+    "SubGraphIsolator": SubGraphIsolator
+}
 """)
-        # =====================================================================
 
         print("🔗 Running Atomic Model Folder Linker for LTX 2.3...")
         base_models_dir = "/workspace/ComfyUI/models"
@@ -210,21 +227,20 @@ NODE_CLASS_MAPPINGS = {"LTXColorFixer": LTXColorFixer}
             region_name="auto"
         )
 
-        print("🚀 Launching Monolithic LTX 2.3 Server Engine...")
+        print("🚀 Launching Split-Graph Optimized LTX Server Engine on L4 GPU...")
         os.makedirs("/tmp/comfy_swap", exist_ok=True)
 
         env_vars = os.environ.copy()
         env_vars["LD_PRELOAD"] = "/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4"
         env_vars["TORCH_NUM_THREADS"] = "1"
         env_vars["OMP_NUM_THREADS"] = "1"
-        
         env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:64"
         env_vars["CUDA_MODULE_LOADING"] = "LAZY" 
         
         self.process = subprocess.Popen([
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
             "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
-            "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-text-enc"
+            "--bf16-vae", "--use-sage-attention", "--lowvram"
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)
         
         self.t = threading.Thread(target=self._log_reader, daemon=True)
@@ -388,13 +404,11 @@ NODE_CLASS_MAPPINGS = {"LTXColorFixer": LTXColorFixer}
                     num_imgs = len(image_filenames)
                     
                     if isinstance(prompts_dict, dict) and any(str(k).isdigit() for k in prompts_dict.keys()):
-                        # Native Custom Timing: Maps exactly to the frame numbers you provided (e.g. 0, 50, 75)
                         sorted_keys = sorted(prompts_dict.keys(), key=lambda x: int(x) if str(x).isdigit() else -1)
                         valid_keys = [k for k in sorted_keys if str(k).isdigit() and str(prompts_dict[k]).strip()]
                         local_prompts_str = "\n".join([f"{k}: {prompts_dict[k].strip()}" for k in valid_keys])
                         num_prompts = len(valid_keys)
                     else:
-                        # Fallback for old simple arrays
                         if isinstance(prompts_dict, list):
                             prompts_list = [str(p).strip() for p in prompts_dict if str(p).strip()]
                         elif isinstance(prompts_dict, dict):
@@ -408,7 +422,6 @@ NODE_CLASS_MAPPINGS = {"LTXColorFixer": LTXColorFixer}
                             local_prompts_str = "\n".join([f"{frame}: {prompt}" for frame, prompt in zip(prompt_frames, prompts_list)])
                         else:
                             local_prompts_str = ""
-                    # ========================================================================
 
                     if num_imgs == 1:
                         custom_w = 1280
@@ -471,15 +484,16 @@ NODE_CLASS_MAPPINGS = {"LTXColorFixer": LTXColorFixer}
                     if "94:105" in workflow: workflow["94:105"]["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
 
                     # ==============================================================================
-                    # FIX 2: 🎨 DYNAMICALLY WIRE THE BRIGHTNESS / COLOR FIXER INTO THE WORKFLOW
+                    # SUB-GRAPH INJECTION: Dynamically wire the Isolator into the generation graph
                     # ==============================================================================
                     keys = list(workflow.keys())
                     for node_id in keys:
                         node_info = workflow[node_id]
+                        
+                        # 1. Wire the Color Fixer before saving
                         if node_info.get("class_type") in ["VHS_VideoCombine", "SaveVideo"]:
                             if "inputs" in node_info and "images" in node_info["inputs"]:
                                 original_image_source = node_info["inputs"]["images"]
-                                
                                 fixer_id = "9999_color_fixer"
                                 workflow[fixer_id] = {
                                     "class_type": "LTXColorFixer",
@@ -490,11 +504,35 @@ NODE_CLASS_MAPPINGS = {"LTXColorFixer": LTXColorFixer}
                                     }
                                 }
                                 node_info["inputs"]["images"] = [fixer_id, 0]
-                                print(f"🔗 Successfully wired LTXColorFixer before node {node_id}")
+                                
+                        # 2. Wire the VRAM SubGraph Isolator immediately before the KSampler begins
+                        if "inputs" in node_info and "model" in node_info["inputs"] and "positive" in node_info["inputs"]:
+                            if node_info.get("class_type") in ["KSampler", "KSamplerAdvanced", "SamplerCustom"]:
+                                original_model = node_info["inputs"]["model"]
+                                original_pos = node_info["inputs"]["positive"]
+                                original_neg = node_info["inputs"]["negative"]
+                                
+                                isolator_id = "9998_subgraph_isolator"
+                                workflow[isolator_id] = {
+                                    "class_type": "SubGraphIsolator",
+                                    "inputs": {
+                                        "model": original_model,
+                                        "positive": original_pos,
+                                        "negative": original_neg
+                                    }
+                                }
+                                
+                                # Reroute KSampler inputs to pull from the Isolator pass
+                                node_info["inputs"]["model"] = [isolator_id, 0]
+                                node_info["inputs"]["positive"] = [isolator_id, 1]
+                                node_info["inputs"]["negative"] = [isolator_id, 2]
+                                print(f"🔗 Successfully wired SubGraph Isolator inline before KSampler node {node_id}")
                     # ==============================================================================
 
-                    print(f"🚀 Executing Monolithic LTX 2.3 Director Generation ({num_imgs} Images, {num_prompts} Prompts)...")
+                    print(f"🚀 Executing Split-Graph LTX 2.3 Generation ({num_imgs} Images, {num_prompts} Prompts)...")
                     await self.execute_comfy_workflow(session, workflow)
+                    
+                    # Run final cleanup once execution completes
                     await self.clear_comfy_memory(session)
 
                     output_files = []

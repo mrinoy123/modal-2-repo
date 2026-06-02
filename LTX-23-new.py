@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "231"  # Bumped to fix the Model pickling serialization crash
+    "FORCE_REBUILD_INDEX": "231"  # Bumped to implement Hybrid Caching (RAM Pointer + NVMe Data)
 })
 
 # ==============================================================================
@@ -118,7 +118,7 @@ class LTX23Engine:
     def start_comfy(self):
         import boto3
         
-        print("🎨 Injecting NVMe Temp Drive Cache Writers & VAE Memory Protections...")
+        print("🎨 Injecting Hybrid Cache Writers & VAE Memory Protections...")
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline.py"
         with open(custom_nodes_path, "w") as f:
             f.write("""
@@ -154,9 +154,10 @@ class LTXColorFixer:
             image = img_t.permute(0, 2, 3, 1)
         return (image,)
 
-# High-Speed NVMe Directory mapping
+# High-Speed NVMe Directory mapping & RAM Global Pointer
 CACHE_DIR = "/tmp/ltx_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
+LTX_MODEL_CACHE = None  # Global lightweight pointer stored in RAM
 
 class MemoryCacheWriter:
     @classmethod
@@ -176,9 +177,11 @@ class MemoryCacheWriter:
     CATEGORY = "LTXBatch"
 
     def write_cache(self, model, positive, video_latent, audio_latent, guide_data, frame_rate, scene_id):
+        global LTX_MODEL_CACHE
+        LTX_MODEL_CACHE = model  # Store the lightweight object pointer in RAM
+        
         file_path = os.path.join(CACHE_DIR, f"scene_{scene_id}.pt")
-        # FIX: We drop the un-picklable `model` class entirely. 
-        # We only save the raw math tensors to the hard drive.
+        # Save only the massive math arrays to NVMe drive
         data_payload = {
             "positive": positive,
             "video_latent": video_latent,
@@ -187,14 +190,14 @@ class MemoryCacheWriter:
             "frame_rate": frame_rate
         }
         torch.save(data_payload, file_path)
-        print(f"\\n[Two-Pass System] 💾 Encoded & Saved Conditionings directly to NVMe disk for Scene {scene_id}\\n")
+        print(f"\\n[Two-Pass System] 💾 Saved Math to NVMe & Model Pointer to RAM for Scene {scene_id}\\n")
         return ()
 
 class MemoryCacheReader:
     @classmethod
     def INPUT_TYPES(s):
+        # We NO LONGER require model input from the graph, completely isolating Pass 2!
         return {"required": {
-            "model": ("MODEL",), # FIX: Accept the live model from pipeline memory
             "scene_id": ("STRING", {"default": "0"})
         }}
     RETURN_TYPES = ("MODEL", "CONDITIONING", "LATENT", "LATENT", "GUIDE_DATA", "FLOAT")
@@ -202,15 +205,20 @@ class MemoryCacheReader:
     FUNCTION = "read_cache"
     CATEGORY = "LTXBatch"
 
-    def read_cache(self, model, scene_id):
+    def read_cache(self, scene_id):
+        global LTX_MODEL_CACHE
+        if LTX_MODEL_CACHE is None:
+            raise ValueError(f"RAM Model Cache empty! Pass 1 failed to execute.")
+            
         file_path = os.path.join(CACHE_DIR, f"scene_{scene_id}.pt")
         if not os.path.exists(file_path):
-            raise ValueError(f"Disk Cache for Scene {scene_id} not found on NVMe at {file_path}! Pass 1 failed.")
+            raise ValueError(f"NVMe Data Cache for Scene {scene_id} not found at {file_path}!")
             
         data = torch.load(file_path, map_location="cpu")
-        print(f"\\n[Two-Pass System] 🚀 Streamed Pre-Cached Conditionings from NVMe for Scene {scene_id}\\n")
-        # Instantly merge the live model with the disk-loaded text math
-        return (model, data["positive"], data["video_latent"], data["audio_latent"], data["guide_data"], data["frame_rate"])
+        print(f"\\n[Two-Pass System] 🚀 Loaded Model from RAM & Data from NVMe for Scene {scene_id}\\n")
+        
+        # Merge RAM pointer and NVMe data seamlessly
+        return (LTX_MODEL_CACHE, data["positive"], data["video_latent"], data["audio_latent"], data["guide_data"], data["frame_rate"])
 
 # VAE Memory Armor Patch: Prevents massive allocations from dumping the UNet
 class FastVAEDecode(nodes.VAEDecode):
@@ -526,22 +534,20 @@ NODE_CLASS_MAPPINGS = {
                         if os.path.exists(out_dir): shutil.rmtree(out_dir)
                         os.makedirs(out_dir)
 
-                        if "101" in pass2_workflow: del pass2_workflow["101"]
-                        
-                        # Fix: Safely bridge the active pipeline model to the reader
-                        orig_46_pass2 = pass2_workflow.pop("46", None)
-                        model_source_link = ["100", 0] # default fallback
-                        if orig_46_pass2 and "inputs" in orig_46_pass2 and "model" in orig_46_pass2["inputs"]:
-                            model_source_link = orig_46_pass2["inputs"]["model"]
+                        # Completely isolate Pass 2 from ALL Model Loading & LoRA generation nodes
+                        loaders_to_purge = ["101", "100", "98", "46"]
+                        for node_purge in loaders_to_purge:
+                            if node_purge in pass2_workflow: 
+                                del pass2_workflow[node_purge]
 
                         pass2_workflow[f"reader_{idx}"] = {
                             "class_type": "MemoryCacheReader",
                             "inputs": {
-                                "model": model_source_link, 
                                 "scene_id": str(idx)
                             }
                         }
 
+                        # Dynamically reroute any node expecting input from 46 straight to the Reader
                         for node_id, node_data in pass2_workflow.items():
                             if "inputs" in node_data:
                                 for input_name, input_val in node_data["inputs"].items():

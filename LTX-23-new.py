@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "231"  # Bumped to implement Hybrid Caching (RAM Pointer + NVMe Data)
+    "FORCE_REBUILD_INDEX": "240"  # Bumped to implement Hybrid Caching (RAM Pointer + NVMe Data)
 })
 
 # ==============================================================================

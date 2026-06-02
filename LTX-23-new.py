@@ -454,7 +454,6 @@ NODE_CLASS_MAPPINGS = {
                         light = scene.get("lighting", "")
                         cam = scene.get("camera", "")
                         
-                        # --- CAMERA LORA TRIGGER FIX (ADDED FROM VIDEO REFERENCE) ---
                         camera_trigger_map = {
                             "dolly_in": "The Camera Movement is Dolly In.",
                             "dolly_out": "The Camera Movement is Dolly Out.",
@@ -473,7 +472,6 @@ NODE_CLASS_MAPPINGS = {
                                     cam_triggers.append(camera_trigger_map[c])
                         
                         cam_trigger_text = " ".join(cam_triggers)
-                        # -------------------------------------------------------------
                         
                         static_env = f"{subject} {style} {bg} {light}".strip()
                         
@@ -621,18 +619,21 @@ NODE_CLASS_MAPPINGS = {
                             node_info = pass2_workflow[node_id]
                             c_type = node_info.get("class_type", "")
                             
-                            # ✨ FIX APPLIED HERE: Intelligently routing 'fps' vs 'frame_rate'
-                            if c_type in ["VHS_VideoCombine", "SaveVideo", "CreateVideo"]:
+                            # ✨ FIXED ROUTING: Only inject what the nodes explicitly ask for.
+                            if c_type == "VHS_VideoCombine":
                                 if "inputs" in node_info:
-                                    if c_type == "VHS_VideoCombine":
-                                        node_info["inputs"]["frame_rate"] = [f"reader_{idx}", 5]
-                                    else:
-                                        node_info["inputs"]["fps"] = [f"reader_{idx}", 5]
-                                        
+                                    node_info["inputs"]["frame_rate"] = [f"reader_{idx}", 5]
                                     if "pingpong" in node_info["inputs"]:
                                         node_info["inputs"]["pingpong"] = False
+                                        
+                            elif c_type == "CreateVideo":
+                                if "inputs" in node_info:
+                                    node_info["inputs"]["fps"] = [f"reader_{idx}", 5]
 
-                            if c_type in ["VHS_VideoCombine", "SaveVideo", "CreateVideo"]:
+                            # Note: SaveVideo is INTENTIONALLY excluded here, it needs no fps/frame_rate injection!
+
+                            # Color Fixer Injection (Only for nodes that process raw "images")
+                            if c_type in ["VHS_VideoCombine", "CreateVideo"]:
                                 if "inputs" in node_info and "images" in node_info["inputs"]:
                                     original_image_source = node_info["inputs"]["images"]
                                     fixer_id = f"9999_color_fixer_{idx}"

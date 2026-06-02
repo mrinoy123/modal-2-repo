@@ -95,7 +95,7 @@ weights_volume = modal.Volume.from_name("Ltx-23-model-weights-new", create_if_mi
     volumes={"/mnt/weights": weights_volume},
     secrets=[modal.Secret.from_name("custom-secret")],
     memory=8192, 
-    scaledown_window=30,
+    scaledown_window=15,
     timeout=3600
 )
 class LTX23Engine:

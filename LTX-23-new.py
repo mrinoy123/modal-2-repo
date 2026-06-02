@@ -28,7 +28,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "215"  # Bumped to ensure a completely fresh image build layer
+    "FORCE_REBUILD_INDEX": "220"  # Bumped to ensure a completely fresh image build layer
 })
 
 # ==============================================================================
@@ -84,13 +84,13 @@ final_image = deps_image.run_commands(
 )
 
 # ==============================================================================
-# PART 5: MODAL APP CONFIGURATION & CLOUD VOLUMES (L4 GPU TARGET)
+# PART 5: MODAL APP CONFIGURATION & CLOUD VOLUMES (L40S GPU TARGET)
 # ==============================================================================
 app = modal.App("media-worker-ltx23")
 weights_volume = modal.Volume.from_name("Ltx-23-model-weights-new", create_if_missing=False)
 
 @app.cls(
-    gpu="L4", 
+    gpu="L40S", 
     image=final_image,
     volumes={"/mnt/weights": weights_volume},
     secrets=[modal.Secret.from_name("custom-secret")],
@@ -118,16 +118,13 @@ class LTX23Engine:
     def start_comfy(self):
         import boto3
         
-        # 🔥 SMART AUTO-EXPOSURE & SPLIT-GRAPH ISOLATOR CUSTOM NODES 🔥
-        print("🎨 Injecting Smart Auto-Exposure and Sub-Graph Isolator Nodes...")
+        # 🔥 SMART AUTO-EXPOSURE CUSTOM NODE 🔥
+        print("🎨 Injecting Smart Auto-Exposure Node...")
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline.py"
         with open(custom_nodes_path, "w") as f:
             f.write("""
 import torch
 import torchvision.transforms.functional as TF
-import comfy.model_management
-import gc
-import os
 
 class LTXColorFixer:
     @classmethod
@@ -160,41 +157,8 @@ class LTXColorFixer:
             
         return (image,)
 
-class SubGraphIsolator:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {"required": {
-            "model": ("MODEL",),
-            "positive": ("CONDITIONING",),
-            "negative": ("CONDITIONING",)
-        }}
-    
-    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING")
-    FUNCTION = "isolate_and_flush"
-    CATEGORY = "utils"
-
-    def isolate_and_flush(self, model, positive, negative):
-        print("\\n[SubGraph System] 🛑 Pausing Pipeline: Pass 1 (Text Encoding) Complete.")
-        
-        # 1. Save Conditioning Data to Disk (Subgraph File Cache)
-        os.makedirs("/workspace/ComfyUI/output/conditioning_cache", exist_ok=True)
-        torch.save(positive, "/workspace/ComfyUI/output/conditioning_cache/cond_pos.pt")
-        torch.save(negative, "/workspace/ComfyUI/output/conditioning_cache/cond_neg.pt")
-        print("[SubGraph System] 💾 CONDITIONING payloads saved securely to disk cache.")
-        
-        # 2. Aggressive VRAM Flush (Evict Gemma-3 before KSampler begins)
-        print("[SubGraph System] 🧼 Aggressively flushing Gemma-3 Text Encoder from VRAM...")
-        comfy.model_management.unload_all_models()
-        comfy.model_management.soft_empty_cache()
-        gc.collect()
-        torch.cuda.empty_cache()
-        
-        print("[SubGraph System] 🟢 VRAM cleared. Handing Patched Model and Conditionings to Pass 2 (Sampler).\\n")
-        return (model, positive, negative)
-
 NODE_CLASS_MAPPINGS = {
-    "LTXColorFixer": LTXColorFixer,
-    "SubGraphIsolator": SubGraphIsolator
+    "LTXColorFixer": LTXColorFixer
 }
 """)
 
@@ -227,7 +191,7 @@ NODE_CLASS_MAPPINGS = {
             region_name="auto"
         )
 
-        print("🚀 Launching Split-Graph Optimized LTX Server Engine on L4 GPU...")
+        print("🚀 Launching Optimized LTX Server Engine on L40S GPU (48GB Native)...")
         os.makedirs("/tmp/comfy_swap", exist_ok=True)
 
         env_vars = os.environ.copy()
@@ -344,9 +308,30 @@ NODE_CLASS_MAPPINGS = {
             date_folder = body.get("date_folder", time.strftime('%Y-%m-%d'))
             workflow_url = body.get("workflow_url") 
 
+            # DYNAMIC RESOLUTION EXTRACTION: Defaults to 9:16 aspect ratio (576x1024)
+            custom_w = 576
+            custom_h = 1024
+            overrides = body.get("workflow_override", {})
+            if "46" in overrides and "inputs" in overrides["46"]:
+                custom_w = overrides["46"]["inputs"].get("custom_width", 576)
+                custom_h = overrides["46"]["inputs"].get("custom_height", 1024)
+
+            # ==============================================================================
+            # IMAGE ROUTING: Detects explicit UNEVEN timing maps or falls back to flat lists
+            # ==============================================================================
             urls_to_download = []
+            target_image_frames = [] # Records exact uneven frame numbers if provided
+            
             if incoming_image_urls:
-                if isinstance(incoming_image_urls, list): 
+                if isinstance(incoming_image_urls, dict):
+                    # Parses {"0": "img1.jpg", "45": "img2.jpg"} to support uneven timelines natively
+                    sorted_keys = sorted([k for k in incoming_image_urls.keys() if str(k).isdigit()], key=lambda x: int(x))
+                    for k in sorted_keys:
+                        v = incoming_image_urls[k]
+                        if str(v).strip():
+                            target_image_frames.append(int(k))
+                            urls_to_download.append(str(v).strip())
+                elif isinstance(incoming_image_urls, list): 
                     urls_to_download = [str(u).strip() for u in incoming_image_urls if str(u).strip()]
                 elif isinstance(incoming_image_urls, str) and incoming_image_urls.strip():
                     urls_to_download = [u.strip() for u in incoming_image_urls.split(",") if u.strip()]
@@ -355,7 +340,7 @@ NODE_CLASS_MAPPINGS = {
             if os.path.exists(dynamic_guides_dir): shutil.rmtree(dynamic_guides_dir)
             os.makedirs(dynamic_guides_dir, exist_ok=True)
 
-            async def download_one(session, url_str, target_dest):
+            async def download_one(session, url_str, target_dest, width, height):
                 try:
                     async with session.get(url_str, timeout=120) as r:
                         if r.status == 200:
@@ -364,13 +349,13 @@ NODE_CLASS_MAPPINGS = {
                 
                 if not os.path.exists(target_dest):
                     from PIL import Image
-                    img = Image.new('RGB', (1280, 704), color='black') 
+                    img = Image.new('RGB', (width, height), color='black') 
                     img.save(target_dest)
 
             image_filenames = []
             if urls_to_download:
                 async with aiohttp.ClientSession() as download_session:
-                    tasks = [download_one(download_session, url, os.path.join(dynamic_guides_dir, f"guide_{i:04d}.png")) for i, url in enumerate(urls_to_download)]
+                    tasks = [download_one(download_session, url, os.path.join(dynamic_guides_dir, f"guide_{i:04d}.png"), custom_w, custom_h) for i, url in enumerate(urls_to_download)]
                     await asyncio.gather(*tasks)
                 image_filenames = [os.path.join(dynamic_guides_dir, f"guide_{i:04d}.png") for i in range(len(urls_to_download))]
 
@@ -399,7 +384,7 @@ NODE_CLASS_MAPPINGS = {
                     workflow = self.merge_overrides(workflow, body.get("workflow_override"))
 
                     # ========================================================================
-                    # CUSTOM TIMING FIX: Reads exact frame keys if a dict is passed from n8n
+                    # PROMPT TIMING FIX: Reads explicit uneven frame mapping
                     # ========================================================================
                     num_imgs = len(image_filenames)
                     
@@ -409,6 +394,7 @@ NODE_CLASS_MAPPINGS = {
                         local_prompts_str = "\n".join([f"{k}: {prompts_dict[k].strip()}" for k in valid_keys])
                         num_prompts = len(valid_keys)
                     else:
+                        # Fallback: Distribute evenly if sent as array
                         if isinstance(prompts_dict, list):
                             prompts_list = [str(p).strip() for p in prompts_dict if str(p).strip()]
                         elif isinstance(prompts_dict, dict):
@@ -423,48 +409,58 @@ NODE_CLASS_MAPPINGS = {
                         else:
                             local_prompts_str = ""
 
-                    if num_imgs == 1:
-                        custom_w = 1280
-                        custom_h = 704
-                        if "46" in workflow and "inputs" in workflow["46"]:
-                            custom_w = workflow["46"]["inputs"].get("custom_width", 1280)
-                            custom_h = workflow["46"]["inputs"].get("custom_height", 704)
-                        
-                        target_img_name = "guide_single_init.png"
-                        target_path = os.path.join("/workspace/ComfyUI/input", target_img_name)
-                        
+                    # ==============================================================================
+                    # MULTI-REFERENCE NORMALIZATION: Supports Explicit Uneven Timing
+                    # ==============================================================================
+                    if num_imgs > 0:
+                        # Uniformly resize all sequential guide images
                         from PIL import Image
-                        img = Image.open(image_filenames[0]).convert("RGB")
-                        img = img.resize((custom_w, custom_h), Image.Resampling.LANCZOS)
-                        img.save(target_path)
-                        
-                        segments = []
-                        for frame in [0, 1]:
+                        for img_path in image_filenames:
                             try:
-                                with open(image_filenames[0], "rb") as f:
-                                    b64_img = base64.b64encode(f.read()).decode("utf-8")
-                                    segments.append({
-                                        "frame": frame,
-                                        "image": f"data:image/png;base64,{b64_img}"
-                                    })
-                            except Exception:
-                                continue
-                        timeline_data_str = json.dumps({"segments": segments, "audioSegments": []})
-                            
-                    elif num_imgs > 1:
-                        img_frames = [int(i * (requested_length - 1) / max(1, num_imgs - 1)) for i in range(num_imgs)]
-                        segments = []
-                        for frame, img_path in zip(img_frames, image_filenames):
-                            try:
-                                with open(img_path, "rb") as f:
-                                    b64_img = base64.b64encode(f.read()).decode("utf-8")
-                                    segments.append({
-                                        "frame": frame,
-                                        "image": f"data:image/png;base64,{b64_img}"
-                                    })
-                            except Exception:
-                                continue
-                        timeline_data_str = json.dumps({"segments": segments, "audioSegments": []})
+                                img = Image.open(img_path).convert("RGB")
+                                img = img.resize((custom_w, custom_h), Image.Resampling.LANCZOS)
+                                img.save(img_path)
+                            except Exception as e:
+                                print(f"[Image PreProcessor] Minor warning on resize: {e}")
+                                
+                        # 3. Structural 1-Image vs. Multi-Image Conditional Routing
+                        if num_imgs == 1:
+                            # 1-Image Setup: Create a micro dropping anchor timeline (Frame 0 & Frame 1)
+                            # Respects dynamic base frame if provided by uneven dict mapping
+                            base_frame = target_image_frames[0] if target_image_frames else 0
+                            segments = []
+                            for frame in [base_frame, base_frame + 1]:
+                                try:
+                                    with open(image_filenames[0], "rb") as f:
+                                        b64_img = base64.b64encode(f.read()).decode("utf-8")
+                                        segments.append({
+                                            "frame": frame,
+                                            "image": f"data:image/png;base64,{b64_img}"
+                                        })
+                                except Exception:
+                                    continue
+                            timeline_data_str = json.dumps({"segments": segments, "audioSegments": []})
+                        else:
+                            # Multi-Reference Sequential Logic
+                            segments = []
+                            # Check if the user passed explicit uneven frames mapping (e.g. {"0":url, "45":url})
+                            if target_image_frames and len(target_image_frames) == num_imgs:
+                                img_frames = target_image_frames
+                            else:
+                                # Fallback: Scale linearly across the requested length
+                                img_frames = [int(i * (requested_length - 1) / max(1, num_imgs - 1)) for i in range(num_imgs)]
+                                
+                            for frame, img_path in zip(img_frames, image_filenames):
+                                try:
+                                    with open(img_path, "rb") as f:
+                                        b64_img = base64.b64encode(f.read()).decode("utf-8")
+                                        segments.append({
+                                            "frame": frame,
+                                            "image": f"data:image/png;base64,{b64_img}"
+                                        })
+                                except Exception:
+                                    continue
+                            timeline_data_str = json.dumps({"segments": segments, "audioSegments": []})
 
                     if "46" in workflow:
                         if "inputs" not in workflow["46"]: workflow["46"]["inputs"] = {}
@@ -473,7 +469,12 @@ NODE_CLASS_MAPPINGS = {
                         workflow["46"]["inputs"]["timeline_data"] = timeline_data_str
                         workflow["46"]["inputs"]["frame_rate"] = 24
 
-                    if "98" in workflow: workflow["98"]["inputs"]["unet_name"] = "LTX-2.3-22B-Distilled-FP4ME.safetensors"
+                    # ==============================================================================
+                    # MODEL WEIGHT INJECTIONS
+                    # ==============================================================================
+                    if "98" in workflow: 
+                        workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
+                        workflow["98"]["inputs"]["weight_dtype"] = "fp8_e4m3fn"
                     if "100" in workflow: workflow["100"]["inputs"]["lora_name"] = "ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors"
                     if "101" in workflow:
                         workflow["101"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
@@ -484,13 +485,12 @@ NODE_CLASS_MAPPINGS = {
                     if "94:105" in workflow: workflow["94:105"]["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
 
                     # ==============================================================================
-                    # SUB-GRAPH INJECTION: Dynamically wire the Isolator into the generation graph
+                    # COLOR FIXER INJECTION
                     # ==============================================================================
                     keys = list(workflow.keys())
                     for node_id in keys:
                         node_info = workflow[node_id]
                         
-                        # 1. Wire the Color Fixer before saving
                         if node_info.get("class_type") in ["VHS_VideoCombine", "SaveVideo"]:
                             if "inputs" in node_info and "images" in node_info["inputs"]:
                                 original_image_source = node_info["inputs"]["images"]
@@ -504,32 +504,8 @@ NODE_CLASS_MAPPINGS = {
                                     }
                                 }
                                 node_info["inputs"]["images"] = [fixer_id, 0]
-                                
-                        # 2. Wire the VRAM SubGraph Isolator immediately before the KSampler begins
-                        if "inputs" in node_info and "model" in node_info["inputs"] and "positive" in node_info["inputs"]:
-                            if node_info.get("class_type") in ["KSampler", "KSamplerAdvanced", "SamplerCustom"]:
-                                original_model = node_info["inputs"]["model"]
-                                original_pos = node_info["inputs"]["positive"]
-                                original_neg = node_info["inputs"]["negative"]
-                                
-                                isolator_id = "9998_subgraph_isolator"
-                                workflow[isolator_id] = {
-                                    "class_type": "SubGraphIsolator",
-                                    "inputs": {
-                                        "model": original_model,
-                                        "positive": original_pos,
-                                        "negative": original_neg
-                                    }
-                                }
-                                
-                                # Reroute KSampler inputs to pull from the Isolator pass
-                                node_info["inputs"]["model"] = [isolator_id, 0]
-                                node_info["inputs"]["positive"] = [isolator_id, 1]
-                                node_info["inputs"]["negative"] = [isolator_id, 2]
-                                print(f"🔗 Successfully wired SubGraph Isolator inline before KSampler node {node_id}")
-                    # ==============================================================================
 
-                    print(f"🚀 Executing Split-Graph LTX 2.3 Generation ({num_imgs} Images, {num_prompts} Prompts)...")
+                    print(f"🚀 Executing Native LTX 2.3 Generation ({num_imgs} Images, {num_prompts} Prompts)...")
                     await self.execute_comfy_workflow(session, workflow)
                     
                     # Run final cleanup once execution completes

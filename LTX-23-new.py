@@ -94,7 +94,7 @@ weights_volume = modal.Volume.from_name("Ltx-23-model-weights-new", create_if_mi
     image=final_image,
     volumes={"/mnt/weights": weights_volume},
     secrets=[modal.Secret.from_name("custom-secret")],
-    memory=8192, 
+    memory=8192,  # Keeping strict 8GB limit for cost-savings
     scaledown_window=12,
     timeout=3600
 )
@@ -214,7 +214,8 @@ class MemoryCacheReader:
         if not os.path.exists(file_path):
             raise ValueError(f"NVMe Data Cache for Scene {scene_id} not found at {file_path}!")
             
-        data = torch.load(file_path, map_location="cpu")
+        # weights_only=False explicitly required to squash warning during torch.load of dictionary with conditioning tensors
+        data = torch.load(file_path, map_location="cpu", weights_only=False)
         print(f"\\n[Two-Pass System] 🚀 Loaded Model from RAM & Data from NVMe for Scene {scene_id}\\n")
         
         # Merge RAM pointer and NVMe data seamlessly
@@ -273,7 +274,8 @@ NODE_CLASS_MAPPINGS = {
         env_vars["LD_PRELOAD"] = "/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4"
         env_vars["TORCH_NUM_THREADS"] = "1"
         env_vars["OMP_NUM_THREADS"] = "1"
-        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:64"
+        # FIX: Removed max_split_size_mb to avoid fragmentation errors during dynamic FP8 quantization inside comfy_kitchen
+        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
         env_vars["CUDA_MODULE_LOADING"] = "LAZY" 
         
         self.process = subprocess.Popen([
@@ -516,7 +518,10 @@ NODE_CLASS_MAPPINGS = {
 
                     print(f"🚀 Queuing Math Encoding Pass for {len(batch_scenes)} Scenes simultaneously...")
                     await self.execute_comfy_workflow(session, pass1_workflow)
-                    await self.clear_comfy_memory(session, unload_models=False)
+                    
+                    # FIX: Aggressively PURGE the +25GB Text Encoders from VRAM before spawning UNet Sampling!
+                    # This guarantees the 48GB GPU is completely empty and ready for the LoRA matrix quantizations
+                    await self.clear_comfy_memory(session, unload_models=True)
 
                     # ==============================================================================
                     # PASS 2: THE SAMPLING BLAST 
@@ -608,6 +613,7 @@ NODE_CLASS_MAPPINGS = {
                             "filename": saved_filename
                         })
 
+                        # Keep the UNet populated safely between individual scene rendering loops
                         await self.clear_comfy_memory(session, unload_models=False)
                         
                         temp_file = f"/tmp/ltx_cache/scene_{idx}.pt"

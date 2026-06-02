@@ -84,13 +84,13 @@ final_image = deps_image.run_commands(
 )
 
 # ==============================================================================
-# PART 5: MODAL APP CONFIGURATION & CLOUD VOLUMES (8GB SYSTEM RAM LIMIT)
+# PART 5: MODAL APP CONFIGURATION & CLOUD VOLUMES (L4 GPU TARGET)
 # ==============================================================================
 app = modal.App("media-worker-ltx23")
 weights_volume = modal.Volume.from_name("Ltx-23-model-weights-new", create_if_missing=False)
 
 @app.cls(
-    gpu="L40S", 
+    gpu="L4", 
     image=final_image,
     volumes={"/mnt/weights": weights_volume},
     secrets=[modal.Secret.from_name("custom-secret")],
@@ -224,7 +224,7 @@ NODE_CLASS_MAPPINGS = {"LTXColorFixer": LTXColorFixer}
         self.process = subprocess.Popen([
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
             "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
-            "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-unet", "--fp8_e4m3fn-text-enc"
+            "--bf16-vae", "--use-sage-attention", "--fp8_e4m3fn-text-enc"
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)
         
         self.t = threading.Thread(target=self._log_reader, daemon=True)
@@ -246,31 +246,7 @@ NODE_CLASS_MAPPINGS = {"LTXColorFixer": LTXColorFixer}
         if not comfy_ready:
             os._exit(1)
 
-        print("🔥 Running Ghost Load to build mmap pointers and stream weights directly to GPU...")
-        try:
-            # FIX: Swapped to native 'VAELoader' to completely bypass KJNodes validation errors!
-            # Removed 'device' arguments as native nodes do not require them.
-            prewarm_payload = {
-                "prompt": {
-                    "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors", "weight_dtype": "fp8_e4m3fn"}},
-                    "2": {"class_type": "VAELoader", "inputs": {"vae_name": "LTX23_video_vae_bf16.safetensors"}},
-                    "3": {"class_type": "DualCLIPLoader", "inputs": {"clip_name1": "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors", "clip_name2": "ltx-2.3_text_projection_bf16.safetensors", "type": "ltxv"}},
-                    "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "prewarm system", "clip": ["3", 0]}},
-                    "5": {"class_type": "EmptyLatentImage", "inputs": {"width": 128, "height": 128, "batch_size": 1}},
-                    "6": {"class_type": "KSampler", "inputs": {
-                        "seed": 0, "steps": 1, "cfg": 1.0, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0,
-                        "model": ["1", 0], "positive": ["4", 0], "negative": ["4", 0], "latent_image": ["5", 0]
-                    }},
-                    "7": {"class_type": "VAEDecode", "inputs": {"samples": ["6", 0], "vae": ["2", 0]}},
-                    "8": {"class_type": "SaveImage", "inputs": {"filename_prefix": "ghost_load", "images": ["7", 0]}}
-                }
-            }
-            req = urllib.request.Request("http://127.0.0.1:8188/prompt", data=json.dumps(prewarm_payload).encode('utf-8'), headers={'Content-Type': 'application/json'})
-            urllib.request.urlopen(req, timeout=300) 
-            time.sleep(10)
-            print("✅ Ghost Load complete. System is prepared for n8n API.")
-        except Exception as e:
-            print(f"⚠️ Ghost Load skipped: {e}")
+        print("✅ Base pipeline active. Awaiting API triggers.")
 
     async def clear_comfy_memory(self, session):
         try:
@@ -484,7 +460,7 @@ NODE_CLASS_MAPPINGS = {"LTXColorFixer": LTXColorFixer}
                         workflow["46"]["inputs"]["timeline_data"] = timeline_data_str
                         workflow["46"]["inputs"]["frame_rate"] = 24
 
-                    if "98" in workflow: workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-1.1_transformer_only_fp8_scaled.safetensors"
+                    if "98" in workflow: workflow["98"]["inputs"]["unet_name"] = "LTX-2.3-22B-Distilled-FP4ME.safetensors"
                     if "100" in workflow: workflow["100"]["inputs"]["lora_name"] = "ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors"
                     if "101" in workflow:
                         workflow["101"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"

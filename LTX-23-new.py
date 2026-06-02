@@ -454,12 +454,34 @@ NODE_CLASS_MAPPINGS = {
                         light = scene.get("lighting", "")
                         cam = scene.get("camera", "")
                         
+                        # --- CAMERA LORA TRIGGER FIX (ADDED FROM VIDEO REFERENCE) ---
+                        # The 19B Camera LoRAs require EXACT trigger phrases in the prompt to activate.
+                        camera_trigger_map = {
+                            "dolly_in": "The Camera Movement is Dolly In.",
+                            "dolly_out": "The Camera Movement is Dolly Out.",
+                            "dolly_left": "The Camera Movement is Dolly Left.",
+                            "dolly_right": "The Camera Movement is Dolly Right.",
+                            "jib_up": "The Camera Movement is Jib Up.",
+                            "jib_down": "The Camera Movement is Jib Down.",
+                            "static": "The Camera Movement is Static."
+                        }
+                        
+                        cam_triggers = []
+                        if cam:
+                            cams = [c.strip().lower() for c in cam.split("+")]
+                            for c in cams[:3]:
+                                if c in camera_trigger_map:
+                                    cam_triggers.append(camera_trigger_map[c])
+                        
+                        cam_trigger_text = " ".join(cam_triggers)
+                        # -------------------------------------------------------------
+                        
                         static_env = f"{subject} {style} {bg} {light}".strip()
                         
                         local_prompts_list = []
                         for step_frame, action_text in zip(keyframe_steps, actions):
-                            action_cam = f"{action_text} {cam}".strip()
-                            fused_prompt = f"{action_cam}. Cinematic environment and styling: {static_env}"
+                            # Injecting the exact trigger phrases required by the LoRAs directly into the prompt stream
+                            fused_prompt = f"{action_text}. {cam_trigger_text} Cinematic environment and styling: {static_env}".strip()
                             local_prompts_list.append(f"{step_frame}: {fused_prompt}")
                             
                         local_prompts_str = "\n".join(local_prompts_list)
@@ -619,11 +641,11 @@ NODE_CLASS_MAPPINGS = {
                             node_info = pass2_workflow[node_id]
                             c_type = node_info.get("class_type", "")
                             
-                            # 1. AUDIO SYNC FIX: Explicitly lock the MP4 compiler output to 24fps
+                            # 1. AUDIO SYNC FIX: Link FPS directly to exact Director Float value to lock audio math
                             if c_type in ["VHS_VideoCombine", "SaveVideo", "CreateVideo"]:
                                 if "inputs" in node_info:
-                                    node_info["inputs"]["frame_rate"] = 24
-                                    node_info["inputs"]["fps"] = 24 # Added fps override for VideoCombine compatibility
+                                    node_info["inputs"]["frame_rate"] = [f"reader_{idx}", 5]
+                                    node_info["inputs"]["fps"] = [f"reader_{idx}", 5]
                                     if "pingpong" in node_info["inputs"]:
                                         node_info["inputs"]["pingpong"] = False
 

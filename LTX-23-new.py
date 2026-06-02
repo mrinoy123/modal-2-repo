@@ -345,9 +345,14 @@ NODE_CLASS_MAPPINGS = {
                     async with session.get(url_str, timeout=120) as r:
                         if r.status == 200:
                             with open(target_dest, "wb") as f: f.write(await r.read())
-                except Exception: pass
+                            print(f"✅ Downloaded reference image: {url_str}")
+                        else:
+                            print(f"❌ HTTP ERROR {r.status} while downloading: {url_str}")
+                except Exception as e:
+                    print(f"❌ CONNECTION ERROR downloading {url_str}: {e}")
                 
                 if not os.path.exists(target_dest):
+                    print(f"⚠️ WARNING: Falling back to BLANK BLACK IMAGE because {url_str} could not be downloaded!")
                     from PIL import Image
                     img = Image.new('RGB', (width, height), color='black') 
                     img.save(target_dest)

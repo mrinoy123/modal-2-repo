@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "231"  # Bumped for Unified NVMe temp drive logic
+    "FORCE_REBUILD_INDEX": "231"  # Bumped to fix the Model pickling serialization crash
 })
 
 # ==============================================================================
@@ -118,7 +118,6 @@ class LTX23Engine:
     def start_comfy(self):
         import boto3
         
-        # 🔥 CUSTOM NODES: NVMe Disk Caching, FastVAEDecode & ColorFixer 🔥
         print("🎨 Injecting NVMe Temp Drive Cache Writers & VAE Memory Protections...")
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline.py"
         with open(custom_nodes_path, "w") as f:
@@ -178,15 +177,15 @@ class MemoryCacheWriter:
 
     def write_cache(self, model, positive, video_latent, audio_latent, guide_data, frame_rate, scene_id):
         file_path = os.path.join(CACHE_DIR, f"scene_{scene_id}.pt")
+        # FIX: We drop the un-picklable `model` class entirely. 
+        # We only save the raw math tensors to the hard drive.
         data_payload = {
-            "model": model, 
             "positive": positive,
             "video_latent": video_latent,
             "audio_latent": audio_latent,
             "guide_data": guide_data,
             "frame_rate": frame_rate
         }
-        # Dump structurally heavy arrays instantly to NVMe to keep 8GB RAM at 0%
         torch.save(data_payload, file_path)
         print(f"\\n[Two-Pass System] 💾 Encoded & Saved Conditionings directly to NVMe disk for Scene {scene_id}\\n")
         return ()
@@ -194,20 +193,24 @@ class MemoryCacheWriter:
 class MemoryCacheReader:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {"scene_id": ("STRING", {"default": "0"})}}
+        return {"required": {
+            "model": ("MODEL",), # FIX: Accept the live model from pipeline memory
+            "scene_id": ("STRING", {"default": "0"})
+        }}
     RETURN_TYPES = ("MODEL", "CONDITIONING", "LATENT", "LATENT", "GUIDE_DATA", "FLOAT")
     RETURN_NAMES = ("model", "positive", "video_latent", "audio_latent", "guide_data", "frame_rate")
     FUNCTION = "read_cache"
     CATEGORY = "LTXBatch"
 
-    def read_cache(self, scene_id):
+    def read_cache(self, model, scene_id):
         file_path = os.path.join(CACHE_DIR, f"scene_{scene_id}.pt")
         if not os.path.exists(file_path):
             raise ValueError(f"Disk Cache for Scene {scene_id} not found on NVMe at {file_path}! Pass 1 failed.")
             
         data = torch.load(file_path, map_location="cpu")
         print(f"\\n[Two-Pass System] 🚀 Streamed Pre-Cached Conditionings from NVMe for Scene {scene_id}\\n")
-        return (data["model"], data["positive"], data["video_latent"], data["audio_latent"], data["guide_data"], data["frame_rate"])
+        # Instantly merge the live model with the disk-loaded text math
+        return (model, data["positive"], data["video_latent"], data["audio_latent"], data["guide_data"], data["frame_rate"])
 
 # VAE Memory Armor Patch: Prevents massive allocations from dumping the UNet
 class FastVAEDecode(nodes.VAEDecode):
@@ -267,8 +270,8 @@ NODE_CLASS_MAPPINGS = {
         
         self.process = subprocess.Popen([
             "python3.12", "main.py", "--listen", "127.0.0.1", "--port", "8188",
-            "--mmap-torch-files", "--cache-none", "--temp-directory", "/tmp/comfy_swap", 
-            "--bf16-vae", "--use-sage-attention"
+            "--mmap-torch-files", "--temp-directory", "/tmp/comfy_swap", 
+            "--bf16-vae", "--use-sage-attention", "--reserve-vram-mb", "3072"
         ], cwd="/workspace/ComfyUI", stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=env_vars)
         
         self.t = threading.Thread(target=self._log_reader, daemon=True)
@@ -367,7 +370,6 @@ NODE_CLASS_MAPPINGS = {
             if os.path.exists(dynamic_guides_dir): shutil.rmtree(dynamic_guides_dir)
             os.makedirs(dynamic_guides_dir, exist_ok=True)
             
-            # Ensure NVMe drive cache is clean before starting batch
             if os.path.exists("/tmp/ltx_cache"):
                 shutil.rmtree("/tmp/ltx_cache")
             os.makedirs("/tmp/ltx_cache", exist_ok=True)
@@ -377,7 +379,6 @@ NODE_CLASS_MAPPINGS = {
 
             try:
                 async with aiohttp.ClientSession() as session:
-                    # 1. Base Workflow Extraction
                     base_workflow = body.get("workflow_json")
                     if isinstance(base_workflow, str):
                         base_workflow = json.loads(base_workflow)
@@ -389,7 +390,6 @@ NODE_CLASS_MAPPINGS = {
                         custom_w = overrides["46"]["inputs"].get("custom_width", 576)
                         custom_h = overrides["46"]["inputs"].get("custom_height", 1024)
 
-                    # Dynamic Target Injector
                     def inject_model_paths(workflow):
                         if "98" in workflow: workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
                         if "100" in workflow: workflow["100"]["inputs"]["lora_name"] = "ltx-2.3-22b-distilled-1.1_lora-dynamic_fro09_avg_rank_111_bf16.safetensors"
@@ -402,9 +402,6 @@ NODE_CLASS_MAPPINGS = {
                             workflow["101"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
                         return workflow
 
-                    # ==============================================================================
-                    # PRE-COMPUTE: Download Images & Calculate Dimensions
-                    # ==============================================================================
                     for idx, scene in enumerate(batch_scenes):
                         target_img_name = f"guide_anchor_{idx}.png"
                         target_path = os.path.join(dynamic_guides_dir, target_img_name)
@@ -433,7 +430,6 @@ NODE_CLASS_MAPPINGS = {
                                 segments.append({"frame": frame, "image": f"data:image/png;base64,{b64_img}"})
                         timeline_data_str = json.dumps({"segments": segments, "audioSegments": []})
 
-                        # Use dynamic duration if provided by n8n scene, otherwise calculate fallback
                         total_frames = scene.get("calculated_frames")
                         actions = scene.get("kinetic_actions", [])
                         
@@ -470,14 +466,13 @@ NODE_CLASS_MAPPINGS = {
                         scene["_seed"] = scene.get("seed", int(time.time() * 1000) % 1000000)
 
                     # ==============================================================================
-                    # PASS 1: THE TEXT ENCODING MARATHON (Unified + NVMe Offload)
+                    # PASS 1: THE TEXT ENCODING MARATHON 
                     # ==============================================================================
                     print("\n[Two-Pass System] 🎬 PASS 1 START: Initiating Unified Text Encoding Marathon...")
                     pass1_workflow = json.loads(json.dumps(base_workflow))
                     pass1_workflow = self.merge_overrides(pass1_workflow, overrides)
                     pass1_workflow = inject_model_paths(pass1_workflow)
 
-                    # Strip heavy execution layers to make Pass 1 exclusively a text compiler
                     keys_to_delete = []
                     for node_id, node_data in pass1_workflow.items():
                         c_type = node_data.get("class_type", "")
@@ -490,7 +485,6 @@ NODE_CLASS_MAPPINGS = {
                     orig_46 = pass1_workflow.pop("46", None)
                     if not orig_46: raise Exception("LTXDirector node '46' not found in base workflow!")
 
-                    # Map Director loops into Disk Caches (Executes entirely in ONE fast run)
                     for idx, scene in enumerate(batch_scenes):
                         scene_46 = json.loads(json.dumps(orig_46))
                         scene_46["inputs"]["duration_frames"] = scene["_total_frames"]
@@ -517,7 +511,7 @@ NODE_CLASS_MAPPINGS = {
                     await self.clear_comfy_memory(session, unload_models=False)
 
                     # ==============================================================================
-                    # PASS 2: THE SAMPLING BLAST (Sequential NVMe Streaming)
+                    # PASS 2: THE SAMPLING BLAST 
                     # ==============================================================================
                     print("\n[Two-Pass System] 🚀 PASS 2 START: Initiating Pure Sampling Blast...")
                     
@@ -533,14 +527,21 @@ NODE_CLASS_MAPPINGS = {
                         os.makedirs(out_dir)
 
                         if "101" in pass2_workflow: del pass2_workflow["101"]
-                        if "46" in pass2_workflow: del pass2_workflow["46"]
+                        
+                        # Fix: Safely bridge the active pipeline model to the reader
+                        orig_46_pass2 = pass2_workflow.pop("46", None)
+                        model_source_link = ["100", 0] # default fallback
+                        if orig_46_pass2 and "inputs" in orig_46_pass2 and "model" in orig_46_pass2["inputs"]:
+                            model_source_link = orig_46_pass2["inputs"]["model"]
 
                         pass2_workflow[f"reader_{idx}"] = {
                             "class_type": "MemoryCacheReader",
-                            "inputs": {"scene_id": str(idx)}
+                            "inputs": {
+                                "model": model_source_link, 
+                                "scene_id": str(idx)
+                            }
                         }
 
-                        # Dynamically reroute execution nodes directly to NVMe output ports
                         for node_id, node_data in pass2_workflow.items():
                             if "inputs" in node_data:
                                 for input_name, input_val in node_data["inputs"].items():
@@ -554,14 +555,12 @@ NODE_CLASS_MAPPINGS = {
                             node_info = pass2_workflow[node_id]
                             c_type = node_info.get("class_type", "")
                             
-                            # 1. AUDIO SYNC FIX: Explicitly lock the MP4 compiler output to 24fps
                             if c_type in ["VHS_VideoCombine", "SaveVideo", "CreateVideo"]:
                                 if "inputs" not in node_info: node_info["inputs"] = {}
                                 node_info["inputs"]["frame_rate"] = 24
                                 if "pingpong" in node_info["inputs"]:
                                     node_info["inputs"]["pingpong"] = False
 
-                            # 2. Color Fixer Injection
                             if c_type in ["VHS_VideoCombine", "SaveVideo", "CreateVideo"]:
                                 if "inputs" in node_info and "images" in node_info["inputs"]:
                                     original_image_source = node_info["inputs"]["images"]
@@ -574,7 +573,6 @@ NODE_CLASS_MAPPINGS = {
 
                         await self.execute_comfy_workflow(session, pass2_workflow)
 
-                        # Capture & Upload Final Processed Video
                         output_files = []
                         for root_p, _, filenames in os.walk(out_dir):
                             for name in filenames:
@@ -604,10 +602,8 @@ NODE_CLASS_MAPPINGS = {
                             "filename": saved_filename
                         })
 
-                        # BATCH SPEED RULE: Clean out active rendering cache but keep heavy UNET loaded.
                         await self.clear_comfy_memory(session, unload_models=False)
                         
-                        # THE JANITOR PROTOCOL: Delete the NVMe temp file to keep drive completely clean
                         temp_file = f"/tmp/ltx_cache/scene_{idx}.pt"
                         if os.path.exists(temp_file):
                             os.remove(temp_file)

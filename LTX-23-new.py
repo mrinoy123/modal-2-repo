@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "311"  
+    "FORCE_REBUILD_INDEX": "350"  
 })
 
 # ==============================================================================
@@ -63,7 +63,7 @@ clone_image = torch_image.run_commands(
     "GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 https://github.com/Lightricks/ComfyUI-LTXVideo.git /workspace/ComfyUI/custom_nodes/ComfyUI-LTXVideo",
     "git clone --depth 1 https://github.com/WhatDreamsCost/WhatDreamsCost-ComfyUI.git /workspace/ComfyUI/custom_nodes/WhatDreamsCost-ComfyUI",
     "git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git /workspace/ComfyUI/custom_nodes/ComfyUI-KJNodes",
-    "git clone --depth 1 https://github.com/Deno2026/comfyui-deno-custom-nodes.git /workspace/ComfyUI/custom_nodes/comfyui-deno-custom-nodes"
+    "git clone --depth 1 https://github.com/Deno2/deno-custom-nodes.git /workspace/ComfyUI/custom_nodes/deno-custom-nodes"
 )
 
 deps_image = clone_image.run_commands(
@@ -119,6 +119,7 @@ class LTX23Engine:
     def start_comfy(self):
         import boto3
         
+        # 🔥 CUSTOM NODES: LTXColorFixer, Two-Pass Cache Writers & VAE Armor Patch 🔥
         print("🎨 Injecting Smart Nodes, Caches & VAE Memory Protections...")
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline.py"
         with open(custom_nodes_path, "w") as f:
@@ -167,7 +168,7 @@ class MemoryCacheWriter:
         return {"required": {
             "model": ("MODEL",),
             "positive": ("CONDITIONING",),
-            "negative": ("CONDITIONING",), 
+            "negative": ("CONDITIONING",),
             "video_latent": ("LATENT",),
             "audio_latent": ("LATENT",),
             "guide_data": ("GUIDE_DATA",),
@@ -184,13 +185,13 @@ class MemoryCacheWriter:
         LTX_CACHE[str(scene_id)] = {
             "model": model, 
             "positive": positive,
-            "negative": negative, 
+            "negative": negative,
             "video_latent": video_latent,
             "audio_latent": audio_latent,
             "guide_data": guide_data,
             "frame_rate": frame_rate
         }
-        print(f"\\n[Two-Pass System] 💾 Encoded & Saved Conditionings (Pos+Neg) for Scene {scene_id} into RAM\\n")
+        print(f"\\n[Two-Pass System] 💾 Encoded & Saved Conditionings for Scene {scene_id} into RAM\\n")
         return ()
 
 class MemoryCacheReader:
@@ -209,17 +210,15 @@ class MemoryCacheReader:
         data = LTX_CACHE.get(str(scene_id))
         if data is None:
             raise ValueError(f"Cache for Scene {scene_id} not found in RAM! Text Encoder Pass failed.")
-        print(f"\\n[Two-Pass System] 🚀 Bypassing Loaders: Loaded Pre-Cached Conditionings (Pos+Neg) for Scene {scene_id}\\n")
+        print(f"\\n[Two-Pass System] 🚀 Loaded Pre-Cached Conditionings for Scene {scene_id}\\n")
         return (data["model"], data["positive"], data["negative"], data["video_latent"], data["audio_latent"], data["guide_data"], data["frame_rate"])
 
-# VAE Memory Armor Patch
 class FastVAEDecode(nodes.VAEDecode):
     def decode(self, vae, samples):
         print("\\n[Two-Pass System] 🛡️ Auto-Routing to Tiled VAE Decoding to protect 22B UNet VRAM state.\\n")
         try:
             return (vae.decode_tiled(samples["samples"], tile_x=512, tile_y=512), )
         except Exception as e:
-            print(f"\\n[Two-Pass System] Tiled decode warning: {e}. Falling back to standard.\\n")
             return super().decode(vae, samples)
 
 NODE_CLASS_MAPPINGS = {
@@ -340,19 +339,6 @@ NODE_CLASS_MAPPINGS = {
                 
             await asyncio.sleep(1)
 
-    def merge_overrides(self, base_graph, override_graph):
-        if not override_graph: return base_graph
-        if isinstance(override_graph, str):
-            try: override_graph = json.loads(override_graph)
-            except Exception: return base_graph
-        for node_id, node_data in override_graph.items():
-            if node_id in base_graph:
-                if "inputs" in node_data and "inputs" in base_graph[node_id]:
-                    base_graph[node_id]["inputs"].update(node_data["inputs"])
-                else: base_graph[node_id].update(node_data)
-            else: base_graph[node_id] = node_data
-        return base_graph
-
     # ==============================================================================
     # PART 6: TWO-PASS HIGH-SPEED BATCH ENDPOINT
     # ==============================================================================
@@ -370,8 +356,12 @@ NODE_CLASS_MAPPINGS = {
             date_folder = body.get("date_folder", time.strftime('%Y-%m-%d'))
             batch_scenes = body.get("batch_scenes", [])
             
-            if not batch_scenes:
-                raise HTTPException(status_code=400, detail="Missing batch_scenes array.")
+            # API NOW EXPECTS BOTH SUBGRAPHS DIRECTLY
+            subgraph_1 = body.get("subgraph_1")
+            subgraph_2 = body.get("subgraph_2")
+
+            if not batch_scenes: raise HTTPException(status_code=400, detail="Missing batch_scenes array.")
+            if not subgraph_1 or not subgraph_2: raise HTTPException(status_code=400, detail="Missing Subgraph definitions.")
 
             dynamic_guides_dir = "/workspace/ComfyUI/input/dynamic_guides"
             if os.path.exists(dynamic_guides_dir): shutil.rmtree(dynamic_guides_dir)
@@ -382,29 +372,8 @@ NODE_CLASS_MAPPINGS = {
 
             try:
                 async with aiohttp.ClientSession() as session:
-                    # 1. Base Workflow Extraction
-                    base_workflow = body.get("workflow_json")
-                    if isinstance(base_workflow, str):
-                        base_workflow = json.loads(base_workflow)
-
-                    custom_w = 576
-                    custom_h = 1024
-                    overrides = body.get("workflow_override", {})
-                    if "46" in overrides and "inputs" in overrides["46"]:
-                        custom_w = overrides["46"]["inputs"].get("custom_width", 576)
-                        custom_h = overrides["46"]["inputs"].get("custom_height", 1024)
-
-                    # Dynamic Target Injector
-                    def inject_model_paths(workflow):
-                        if "98" in workflow: workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
-                        if "97" in workflow: workflow["97"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
-                        if "103" in workflow: workflow["103"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
-                        if "102" in workflow: workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
-                        if "94:105" in workflow: workflow["94:105"]["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
-                        if "101" in workflow: 
-                            workflow["101"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
-                            workflow["101"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
-                        return workflow
+                    custom_w = body.get("custom_width", 576)
+                    custom_h = body.get("custom_height", 1024)
 
                     # ==============================================================================
                     # PRE-COMPUTE: Download Images & Calculate Dimensions
@@ -455,9 +424,6 @@ NODE_CLASS_MAPPINGS = {
                         light = scene.get("lighting", "")
                         cam = scene.get("camera", "")
                         
-                        negative_prompt = scene.get("negative_prompt", "")
-                        scene["_negative_prompt"] = negative_prompt
-                        
                         static_env = f"{subject} {style} {bg} {light}".strip()
                         
                         local_prompts_list = []
@@ -474,215 +440,155 @@ NODE_CLASS_MAPPINGS = {
                         scene["_seed"] = scene.get("seed", int(time.time() * 1000) % 1000000)
 
                     # ==============================================================================
-                    # PASS 1: THE TEXT ENCODING MARATHON & LORA MATRIX INJECTION
+                    # PASS 1: TEXT ENCODING & DYNAMIC LORA MATRIX BATCHING
                     # ==============================================================================
-                    print("\n[Two-Pass System] 🎬 PASS 1 START: Initiating Text Encoding & Multi-LoRA Structure...")
-                    pass1_workflow = json.loads(json.dumps(base_workflow))
-                    pass1_workflow = self.merge_overrides(pass1_workflow, overrides)
-                    pass1_workflow = inject_model_paths(pass1_workflow)
-
-                    # Capture essential routing templates before purging them
-                    orig_46 = pass1_workflow.get("46")
-                    if not orig_46: raise Exception("LTXDirector node '46' not found in base workflow!")
-                    orig_neg = pass1_workflow.get("94:8")
+                    print("\n[Two-Pass System] 🎬 PASS 1 START: Initiating Text Encoding & LoRA Multiplier Matrix...")
+                    pass1_workflow = json.loads(json.dumps(subgraph_1))
                     
-                    orig_multi_lora_id = None
-                    for nid, ndata in pass1_workflow.items():
-                        if ndata.get("class_type") == "DenoLTXMultiLoraLoader":
-                            orig_multi_lora_id = nid
-                            break
+                    if "98" in pass1_workflow: pass1_workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
+                    if "97" in pass1_workflow: pass1_workflow["97"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
+                    if "102" in pass1_workflow: pass1_workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
+                    if "101" in pass1_workflow: 
+                        pass1_workflow["101"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
+                        pass1_workflow["101"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
 
-                    # AGGRESSIVE PRUNING: Ensure Pass 1 is mathematically clean and has no orphaned node links
-                    keys_to_delete = ["46"]
-                    if orig_neg: keys_to_delete.append("94:8")
-                    if orig_multi_lora_id: keys_to_delete.append(orig_multi_lora_id)
+                    # Pop out the template nodes so we can clone them dynamically for every scene
+                    tpl_107 = pass1_workflow.pop("107", None)
+                    tpl_200 = pass1_workflow.pop("200", None)
+                    tpl_46 = pass1_workflow.pop("46", None)
+                    tpl_94_5 = pass1_workflow.pop("94:5", None)
+                    tpl_300 = pass1_workflow.pop("300", None)
 
-                    for node_id, node_data in pass1_workflow.items():
-                        c_type = node_data.get("class_type", "")
-                        if c_type in ["KSampler", "KSamplerAdvanced", "SamplerCustom", "SamplerCustomAdvanced", 
-                                      "VHS_VideoCombine", "SaveVideo", "VAEDecode", "LatentUpscale", 
-                                      "LTXVCropGuides", "CFGGuider", "BasicScheduler", "BasicGuider", "LatentInterpolate",
-                                      "LTXVConcatAVLatent", "LTXVSeparateAVLatent", "LTXVConditioning"]:
-                            keys_to_delete.append(node_id)
-                        elif "inputs" in node_data:
-                            # Catch and remove any stray nodes still looking for the deleted node '46'
-                            for v in node_data["inputs"].values():
-                                if isinstance(v, list) and len(v) == 2 and v[0] == "46":
-                                    keys_to_delete.append(node_id)
-                                    
-                    for k in set(keys_to_delete):
-                        if k in pass1_workflow:
-                            del pass1_workflow[k]
+                    camera_loras_map = {
+                        "dolly_in": "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
+                        "dolly_out": "ltx-2-19b-lora-camera-control-dolly-out.safetensors",
+                        "dolly_left": "ltx-2-19b-lora-camera-control-dolly-left.safetensors",
+                        "dolly_right": "ltx-2-19b-lora-camera-control-dolly-right.safetensors",
+                        "jib_up": "ltx-2-19b-lora-camera-control-jib-up.safetensors",
+                        "jib_down": "ltx-2-19b-lora-camera-control-jib-down.safetensors",
+                        "static": "ltx-2-19b-lora-camera-control-static.safetensors"
+                    }
 
                     for idx, scene in enumerate(batch_scenes):
-                        scene_46 = json.loads(json.dumps(orig_46))
+                        # 1. Deno Multi Lora Loader (Node 107) - Hardcoded Styles + Dynamic Cameras
+                        scene_107 = json.loads(json.dumps(tpl_107))
+                        scene_107["inputs"]["lora_1"] = "LTX_2.3_Crisp_Enhance_Style_LoRa.safetensors"
+                        scene_107["inputs"]["strength_1"] = 0.5
+                        scene_107["inputs"]["lora_2"] = "VBVR-official-comfyui.safetensors"
+                        scene_107["inputs"]["strength_2"] = 0.7
+                        scene_107["inputs"]["lora_3"] = "LTX_2.3_Soft_Enhance_Style_LoRa.safetensors"
+                        scene_107["inputs"]["strength_3"] = 0.5
+
+                        active_cameras = []
+                        cam_string = scene.get("camera", "")
+                        if cam_string:
+                            cams = [c.strip().lower() for c in cam_string.split("+")]
+                            for c in cams[:3]:
+                                if c in camera_loras_map:
+                                    active_cameras.append(camera_loras_map[c])
+                        
+                        if not active_cameras:
+                            active_cameras.append(camera_loras_map["static"])
+
+                        # Map up to 3 camera LoRAs to slots 4, 5, 6
+                        for i in range(3):
+                            slot = i + 4
+                            if i < len(active_cameras):
+                                scene_107["inputs"][f"lora_{slot}"] = active_cameras[i]
+                                scene_107["inputs"][f"strength_{slot}"] = 1.0
+                                scene_107["inputs"][f"enabled_{slot}"] = True
+                            else:
+                                scene_107["inputs"][f"lora_{slot}"] = "__none__"
+                                scene_107["inputs"][f"strength_{slot}"] = 0.0
+                                scene_107["inputs"][f"enabled_{slot}"] = False
+                                
+                        pass1_workflow[f"107_{idx}"] = scene_107
+
+                        # 2. Negative Prompt Encoder (Node 200)
+                        scene_200 = json.loads(json.dumps(tpl_200))
+                        default_neg = "no humans, bad quality, distorted, blurry, watermark"
+                        scene_200["inputs"]["text"] = scene.get("negative_prompt", default_neg)
+                        scene_200["inputs"]["clip"] = [f"107_{idx}", 1]
+                        pass1_workflow[f"200_{idx}"] = scene_200
+
+                        # 3. LTX Director (Node 46)
+                        scene_46 = json.loads(json.dumps(tpl_46))
                         scene_46["inputs"]["duration_frames"] = scene["_total_frames"]
                         scene_46["inputs"]["local_prompts"] = scene["_local_prompts_str"]
                         scene_46["inputs"]["timeline_data"] = scene["_timeline_data_str"]
-                        scene_46["inputs"]["frame_rate"] = 24
-                        
-                        # Fix negative encoder logic: dynamically map it to the cloned '46'
-                        if orig_neg: 
-                            neg_encoder_id = f"neg_encoder_{idx}"
-                            pass1_workflow[neg_encoder_id] = json.loads(json.dumps(orig_neg))
-                            pass1_workflow[neg_encoder_id]["inputs"]["text"] = scene.get("_negative_prompt", "")
-                            for k, v in pass1_workflow[neg_encoder_id]["inputs"].items():
-                                if isinstance(v, list) and len(v) == 2 and v[0] == "46":
-                                    pass1_workflow[neg_encoder_id]["inputs"][k] = [f"46_{idx}", v[1]]
-                                    
-                        # ----------------------------------------------------------------------
-                        # DYNAMIC MULTI-LORA (DENO) STACK BUILDING LOGIC 
-                        # ----------------------------------------------------------------------
-                        # FIX: Bypass missing '107' node and link directly to UNET (Node 98)
-                        current_model_link = ["98", 0]
-
-                        lora_inputs = {
-                            "active_loras": 8,
-                            "model": current_model_link
-                        }
-
-                        for i in range(1, 9):
-                            lora_inputs[f"enabled_{i}"] = False
-                            lora_inputs[f"lora_{i}"] = "__none__"
-                            lora_inputs[f"strength_{i}"] = 0.0
-                            lora_inputs[f"audio_{i}"] = 1.0
-                            lora_inputs[f"video_{i}"] = 1.0
-                            lora_inputs[f"trigger_{i}"] = ""
-                            lora_inputs[f"description_{i}"] = ""
-                            
-                        slot_idx = 1
-                        
-                        # Load calibrated foundation styles globally
-                        fixed_styles = [
-                            ("VBVR-official-comfyui.safetensors", 1.0),
-                            ("LTX_2.3_Soft_Enhance_Style_LoRa.safetensors", 0.4),
-                            ("LTX_2.3_Crisp_Enhance_Style_LoRa.safetensors", 0.4)
-                        ]
-                        
-                        for lora_name, strength in fixed_styles:
-                            lora_inputs[f"enabled_{slot_idx}"] = True
-                            lora_inputs[f"lora_{slot_idx}"] = lora_name
-                            lora_inputs[f"strength_{slot_idx}"] = strength
-                            slot_idx += 1
-                            
-                        # Toggle camera control dynamically based on parsed scene request
-                        cam_string = scene.get("camera", "").lower()
-                        active_cams = []
-                        
-                        if "in" in cam_string and "dolly" in cam_string: active_cams.append("ltx-2-19b-lora-camera-control-dolly-in.safetensors")
-                        if "left" in cam_string and "dolly" in cam_string: active_cams.append("ltx-2-19b-lora-camera-control-dolly-left.safetensors")
-                        if "out" in cam_string and "dolly" in cam_string: active_cams.append("ltx-2-19b-lora-camera-control-dolly-out.safetensors")
-                        if "right" in cam_string and "dolly" in cam_string: active_cams.append("ltx-2-19b-lora-camera-control-dolly-right.safetensors")
-                        if "down" in cam_string and "jib" in cam_string: active_cams.append("ltx-2-19b-lora-camera-control-jib-down.safetensors")
-                        if "up" in cam_string and "jib" in cam_string: active_cams.append("ltx-2-19b-lora-camera-control-jib-up.safetensors")
-                        
-                        if len(active_cams) == 0 or "static" in cam_string:
-                            active_cams.append("ltx-2-19b-lora-camera-control-static.safetensors")
-                            
-                        for lora_name in active_cams:
-                            if slot_idx <= 8:
-                                lora_inputs[f"enabled_{slot_idx}"] = True
-                                lora_inputs[f"lora_{slot_idx}"] = lora_name
-                                lora_inputs[f"strength_{slot_idx}"] = 1.0
-                                slot_idx += 1
-                                
-                        # Inject the configured Multi-LoRA Deno node cleanly into the pipeline graph
-                        multi_lora_id = f"9000_multi_lora_{idx}"
-                        pass1_workflow[multi_lora_id] = {
-                            "class_type": "DenoLTXMultiLoraLoader",
-                            "inputs": lora_inputs
-                        }
-                        
-                        # Snap the fully stacked chain back into the Director node
-                        scene_46["inputs"]["model"] = [multi_lora_id, 0]
+                        scene_46["inputs"]["model"] = [f"107_{idx}", 0]
+                        scene_46["inputs"]["clip"] = [f"107_{idx}", 1]
                         pass1_workflow[f"46_{idx}"] = scene_46
-                        
-                        # Cache the exact array structure required for Phase 2
-                        pass1_workflow[f"writer_{idx}"] = {
-                            "class_type": "MemoryCacheWriter",
-                            "inputs": {
-                                "model": [f"46_{idx}", 0],
-                                "positive": [f"neg_encoder_{idx}", 0] if orig_neg else [f"46_{idx}", 1],
-                                "negative": [f"neg_encoder_{idx}", 1] if orig_neg else [f"46_{idx}", 1],
-                                "video_latent": [f"46_{idx}", 2],
-                                "audio_latent": [f"46_{idx}", 3],
-                                "guide_data": [f"46_{idx}", 4],
-                                "frame_rate": [f"46_{idx}", 5],
-                                "scene_id": str(idx)
-                            }
-                        }
+
+                        # 4. Conditioning Matrix (Node 94:5)
+                        scene_94_5 = json.loads(json.dumps(tpl_94_5))
+                        scene_94_5["inputs"]["positive"] = [f"46_{idx}", 1]
+                        scene_94_5["inputs"]["negative"] = [f"200_{idx}", 0]
+                        scene_94_5["inputs"]["frame_rate"] = [f"46_{idx}", 5]
+                        pass1_workflow[f"94:5_{idx}"] = scene_94_5
+
+                        # 5. Memory Writer (Node 300) - Saves Pos & Neg to RAM
+                        scene_300 = json.loads(json.dumps(tpl_300))
+                        scene_300["inputs"]["model"] = [f"46_{idx}", 0]
+                        scene_300["inputs"]["positive"] = [f"94:5_{idx}", 0]
+                        scene_300["inputs"]["negative"] = [f"94:5_{idx}", 1]
+                        scene_300["inputs"]["video_latent"] = [f"46_{idx}", 2]
+                        scene_300["inputs"]["audio_latent"] = [f"46_{idx}", 3]
+                        scene_300["inputs"]["guide_data"] = [f"46_{idx}", 4]
+                        scene_300["inputs"]["frame_rate"] = [f"46_{idx}", 5]
+                        scene_300["inputs"]["scene_id"] = str(idx)
+                        pass1_workflow[f"300_{idx}"] = scene_300
 
                     print(f"🚀 Queuing Math Encoding Pass for {len(batch_scenes)} Scenes simultaneously...")
                     await self.execute_comfy_workflow(session, pass1_workflow)
                     await self.clear_comfy_memory(session, unload_models=False)
 
                     # ==============================================================================
-                    # PASS 2: THE SAMPLING BLAST
+                    # PASS 2: THE SAMPLING BLAST (Iterative per scene)
                     # ==============================================================================
                     print("\n[Two-Pass System] 🚀 PASS 2 START: Initiating Pure Sampling Blast...")
                     
                     for idx, scene in enumerate(batch_scenes):
                         print(f"\n🎬 Rendering Native Scene [{idx+1}/{len(batch_scenes)}]: {scene.get('name', 'Clip')}")
                         
-                        pass2_workflow = json.loads(json.dumps(base_workflow))
-                        pass2_workflow = self.merge_overrides(pass2_workflow, overrides)
-                        pass2_workflow = inject_model_paths(pass2_workflow)
+                        pass2_workflow = json.loads(json.dumps(subgraph_2))
 
                         out_dir = "/workspace/ComfyUI/output"
                         if os.path.exists(out_dir): shutil.rmtree(out_dir)
                         os.makedirs(out_dir)
 
-                        if "101" in pass2_workflow: del pass2_workflow["101"]
-                        if "46" in pass2_workflow: del pass2_workflow["46"]
-                        if "94:8" in pass2_workflow: del pass2_workflow["94:8"] 
-                        if orig_multi_lora_id and orig_multi_lora_id in pass2_workflow: del pass2_workflow[orig_multi_lora_id]
+                        # Inject Models
+                        if "103" in pass2_workflow: pass2_workflow["103"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
+                        if "102" in pass2_workflow: pass2_workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
+                        if "94:105" in pass2_workflow: pass2_workflow["94:105"]["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
 
-                        pass2_workflow[f"reader_{idx}"] = {
-                            "class_type": "MemoryCacheReader",
-                            "inputs": {"scene_id": str(idx)}
-                        }
+                        # Set target Scene ID for Memory Cache Reader
+                        if "400" in pass2_workflow: pass2_workflow["400"]["inputs"]["scene_id"] = str(idx)
 
-                        # Intelligently route samplers and conditioning to the cached Reader index slots
-                        for node_id, node_data in pass2_workflow.items():
-                            if "inputs" in node_data:
-                                for input_name, input_val in node_data["inputs"].items():
-                                    if isinstance(input_val, list) and len(input_val) == 2:
-                                        if input_val[0] == "46":
-                                            # Match the exact Director pin to the Reader output index mapping
-                                            mapping = {0:0, 1:1, 2:3, 3:4, 4:5, 5:6}
-                                            if input_val[1] in mapping:
-                                                pass2_workflow[node_id]["inputs"][input_name] = [f"reader_{idx}", mapping[input_val[1]]]
-                                        elif input_val[0] == "94:8":
-                                            if input_val[1] == 0:
-                                                pass2_workflow[node_id]["inputs"][input_name] = [f"reader_{idx}", 1] # Positive pin
-                                            elif input_val[1] == 1:
-                                                pass2_workflow[node_id]["inputs"][input_name] = [f"reader_{idx}", 2] # Negative pin
+                        # Set Noise Seeds
+                        scene_seed = scene["_seed"]
+                        if "94:28" in pass2_workflow: pass2_workflow["94:28"]["inputs"]["noise_seed"] = scene_seed
+                        if "94:108" in pass2_workflow: pass2_workflow["94:108"]["inputs"]["noise_seed"] = scene_seed
 
-                        if "94:28" in pass2_workflow: pass2_workflow["94:28"]["inputs"]["noise_seed"] = scene["_seed"]
-                        
-                        keys = list(pass2_workflow.keys())
-                        for node_id in keys:
-                            node_info = pass2_workflow[node_id]
-                            c_type = node_info.get("class_type", "")
-                            
-                            if c_type == "VHS_VideoCombine":
-                                if "inputs" in node_info:
-                                    node_info["inputs"]["frame_rate"] = 24
-                                    node_info["inputs"]["format"] = "video/mp4"
-                                    if "pingpong" in node_info["inputs"]: node_info["inputs"]["pingpong"] = False
-                                    
-                                    # Merge Color Fixer directly into VHS input
-                                    if "images" in node_info["inputs"]:
-                                        original_image_source = node_info["inputs"]["images"]
-                                        fixer_id = f"9999_color_fixer_{idx}"
-                                        pass2_workflow[fixer_id] = {
-                                            "class_type": "LTXColorFixer",
-                                            "inputs": {"image": original_image_source, "target_brightness": 0.40, "max_boost": 2.0}
-                                        }
-                                        node_info["inputs"]["images"] = [fixer_id, 0]
+                        # 1. AUDIO SYNC FIX: Explicitly lock the MP4 compiler output to 24fps
+                        if "109" in pass2_workflow:
+                            pass2_workflow["109"]["inputs"]["frame_rate"] = 24
+                            if "pingpong" in pass2_workflow["109"]["inputs"]:
+                                pass2_workflow["109"]["inputs"]["pingpong"] = False
+
+                        # 2. Dynamic Color Fixer Injection
+                        if "109" in pass2_workflow and "images" in pass2_workflow["109"]["inputs"]:
+                            original_image_source = pass2_workflow["109"]["inputs"]["images"]
+                            fixer_id = f"9999_color_fixer_{idx}"
+                            pass2_workflow[fixer_id] = {
+                                "class_type": "LTXColorFixer",
+                                "inputs": {"image": original_image_source, "target_brightness": 0.40, "max_boost": 2.0}
+                            }
+                            pass2_workflow["109"]["inputs"]["images"] = [fixer_id, 0]
 
                         await self.execute_comfy_workflow(session, pass2_workflow)
 
+                        # Capture & Upload Final Processed Video
                         output_files = []
                         for root_p, _, filenames in os.walk(out_dir):
                             for name in filenames:
@@ -712,6 +618,7 @@ NODE_CLASS_MAPPINGS = {
                             "filename": saved_filename
                         })
 
+                        # BATCH SPEED RULE: Clean out active rendering cache but keep heavy UNET loaded.
                         await self.clear_comfy_memory(session, unload_models=False)
                     
                     return generated_outputs

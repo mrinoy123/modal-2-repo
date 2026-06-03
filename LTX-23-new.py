@@ -383,7 +383,18 @@ NODE_CLASS_MAPPINGS = {
 
                     custom_w = 576
                     custom_h = 1024
+                    
                     overrides = body.get("workflow_override", {})
+                    
+                    # --- CRITICAL FIX ---
+                    # Intercept and explicitly pop the custom negative prompt payload out of the overrides.
+                    # This prevents `merge_overrides` from blindly injecting it into the graph as a corrupted node ID.
+                    neg_override_data = overrides.pop("negative_prompt_override", {})
+                    global_neg_text = neg_override_data.get(
+                        "text", 
+                        "human, person, man, woman, face, skin, crowd, civilian, soldier, body proportions, hand, foot, organic curves, portrait, blurry, low quality, deformed geometry"
+                    )
+                    
                     if "46" in overrides and "inputs" in overrides["46"]:
                         custom_w = overrides["46"]["inputs"].get("custom_width", 576)
                         custom_h = overrides["46"]["inputs"].get("custom_height", 1024)
@@ -556,15 +567,12 @@ NODE_CLASS_MAPPINGS = {
                                     if isinstance(input_val, list) and len(input_val) == 2 and input_val[0] == "46":
                                         node_data["inputs"][input_name] = [f"reader_{idx}", input_val[1]]
 
-                        # 2. Inject Dedicated Negative Conditioner for Human Traits Blocker
-                        neg_text = body.get("workflow_override", {}).get("negative_prompt_override", {}).get(
-                            "text", "human, person, man, woman, face, skin, crowd, civilian, soldier, body proportions, hand, foot, organic curves, portrait, blurry, low quality, deformed geometry"
-                        )
+                        # 2. Inject Dedicated Negative Conditioner for Human Traits Blocker (Using the safely extracted string)
                         neg_node_id = f"9999_negative_human_blocker_{idx}"
                         pass2_workflow[neg_node_id] = {
                             "class_type": "CLIPTextEncode",
                             "inputs": {
-                                "text": neg_text,
+                                "text": global_neg_text,
                                 "clip": ["101", 0]  # Wires to existing dual text projection loaders
                             }
                         }

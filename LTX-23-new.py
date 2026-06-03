@@ -67,8 +67,6 @@ clone_image = torch_image.run_commands(
     "git clone --depth 1 https://github.com/Deno2026/comfyui-deno-custom-nodes.git /workspace/ComfyUI/custom_nodes/comfyui-deno-custom-nodes"
 )
 
-
-
 deps_image = clone_image.run_commands(
     "sed -i '/torch/d' /workspace/ComfyUI/requirements.txt",
     r"find /workspace/ComfyUI/custom_nodes -name 'requirements.txt' -exec sed -i '/torch/d' {} \;",
@@ -572,6 +570,46 @@ NODE_CLASS_MAPPINGS = {
                         scene_seed = scene["_seed"]
                         if "94:28" in pass2_workflow: pass2_workflow["94:28"]["inputs"]["noise_seed"] = scene_seed
                         if "94:108" in pass2_workflow: pass2_workflow["94:108"]["inputs"]["noise_seed"] = scene_seed
+
+                        # ==============================================================================
+                        # 🌟 DYNAMIC CONFIGURATION FIX: PREVENT DEEP-FRIED CORRUPTED VIDEO
+                        # ==============================================================================
+                        # When graphs are separated, Upsampler denoise often defaults to 1.0.
+                        # This completely overwrites the base video with pure noise. We force proper 
+                        # step ratios and denoise values to protect the generation.
+
+                        # --- Base Video Generator ---
+                        if "94:11" in pass2_workflow:
+                            pass2_workflow["94:11"]["inputs"]["steps"] = 12
+                            if "denoise" in pass2_workflow["94:11"]["inputs"]:
+                                pass2_workflow["94:11"]["inputs"]["denoise"] = 1.0
+                        
+                        # --- Upsampler ---
+                        if "94:54" in pass2_workflow:
+                            pass2_workflow["94:54"]["inputs"]["steps"] = 16
+                            # CRITICAL: If denoise is 1.0 here, the video is completely ruined.
+                            pass2_workflow["94:54"]["inputs"]["denoise"] = 0.42
+                            
+                        if "94:49" in pass2_workflow:  # Upsampler Guider
+                            if "cfg" in pass2_workflow["94:49"]["inputs"]:
+                                pass2_workflow["94:49"]["inputs"]["cfg"] = 1.5
+
+                        # --- Dynamic Schedulers Fallback (If node IDs change) ---
+                        for node_id, node_data in pass2_workflow.items():
+                            c_type = node_data.get("class_type", "")
+                            if c_type in ["BasicScheduler", "SDTurboScheduler", "AlignYourStepsScheduler", "KSampler", "KSamplerAdvanced"]:
+                                if node_id not in ["94:11", "94:54"]:
+                                    if "denoise" in node_data["inputs"]:
+                                        current_denoise = node_data["inputs"]["denoise"]
+                                        # If denoise was already set to < 1.0, treat it as an Upsampler
+                                        if current_denoise < 1.0:
+                                            node_data["inputs"]["steps"] = 16
+                                            node_data["inputs"]["denoise"] = 0.42
+                                        else:
+                                            node_data["inputs"]["steps"] = 12
+                                    else:
+                                        node_data["inputs"]["steps"] = 12
+                        # ==============================================================================
 
                         # 1. AUDIO SYNC FIX: Explicitly lock the MP4 compiler output to 24fps
                         if "109" in pass2_workflow:

@@ -586,7 +586,7 @@ NODE_CLASS_MAPPINGS = {
                             c_type = pass2_workflow[k].get("class_type", "")
                             if c_type in ["UNETLoader", "LoraLoaderModelOnly", "CLIPTextEncode", "DualCLIPLoader", "LTXDirector"]:
                                 del pass2_workflow[k]
-                            elif "loader" in c_type.lower() and c_type not in ["VAELoader", "VAELoaderKJ"]:
+                            elif "loader" in c_type.lower() and c_type not in ["VAELoader", "VAELoaderKJ", "LatentUpscaleModelLoader"]:
                                 del pass2_workflow[k]
                         if "46" in pass2_workflow: del pass2_workflow["46"]
 

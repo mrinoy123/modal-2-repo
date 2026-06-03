@@ -502,7 +502,7 @@ NODE_CLASS_MAPPINGS = {
                     
                     orig_multi_lora_id = None
                     for nid, ndata in pass1_workflow.items():
-                        if ndata.get("class_type") == "LTXMultiLoRALoader":
+                        if ndata.get("class_type") == "MultiLoraLoaderDeno":
                             orig_multi_lora_id = nid
                             break
                             

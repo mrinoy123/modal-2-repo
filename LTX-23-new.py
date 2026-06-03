@@ -1,5 +1,7 @@
 # ==============================================================================
 # PART 1: IMPORTS & ENVIRONMENT SETUP
+# Purpose: Imports necessary standard libraries and external packages like Modal, 
+# FastAPI, and async utilities to handle server requests and OS-level operations.
 # ==============================================================================
 import modal
 import subprocess
@@ -20,6 +22,8 @@ from typing import Optional
 
 # ==============================================================================
 # PART 2: BASE IMAGE & OS CONFIGURATION
+# Purpose: Sets up the base Ubuntu/CUDA image on Modal, installing system-level 
+# dependencies like git, ffmpeg, build tools, and performance allocation libraries.
 # ==============================================================================
 base_image = modal.Image.from_registry(
     "nvidia/cuda:12.5.1-devel-ubuntu24.04",
@@ -34,6 +38,8 @@ base_image = modal.Image.from_registry(
 
 # ==============================================================================
 # PART 3: CORE PYTHON DEPENDENCIES & ENVIRONMENT VARIABLES
+# Purpose: Configures CUDA paths, compilation limits, and installs foundational 
+# scientific and ML Python packages necessary for handling tensors and APIs.
 # ==============================================================================
 build_image = base_image.env({
     "CUDA_HOME": "/usr/local/cuda",
@@ -50,6 +56,8 @@ build_image = base_image.env({
 
 # ==============================================================================
 # PART 4: COMFYUI & CUSTOM NODES CLONING
+# Purpose: Installs PyTorch for CU124, clones ComfyUI and required custom nodes 
+# (VHS, LTXVideo, etc.), strips conflicting torch requirements, and patches Attention.
 # ==============================================================================
 torch_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124",
@@ -85,6 +93,8 @@ final_image = deps_image.run_commands(
 
 # ==============================================================================
 # PART 5: MODAL APP CONFIGURATION & CLOUD VOLUMES (L40S GPU TARGET)
+# Purpose: Defines the Modal application, mounts the external weights volume, 
+# injects memory caches/custom Python nodes, and manages ComfyUI process lifecycle.
 # ==============================================================================
 app = modal.App("media-worker-ltx23")
 weights_volume = modal.Volume.from_name("Ltx-23-model-weights-new", create_if_missing=False)
@@ -352,6 +362,9 @@ NODE_CLASS_MAPPINGS = {
 
     # ==============================================================================
     # PART 6: TWO-PASS HIGH-SPEED BATCH ENDPOINT
+    # Purpose: Main execution pipeline. Handles parameter compilation, splits the run 
+    # into Pass 1 (Encoders/LoRAs) and Pass 2 (Sampling/Decoders), executes the
+    # recursive graph purge for pass 2 stability, and uploads the output to R2.
     # ==============================================================================
     @modal.fastapi_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
@@ -403,9 +416,6 @@ NODE_CLASS_MAPPINGS = {
                             workflow["101"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
                         return workflow
 
-                    # ==============================================================================
-                    # PRE-COMPUTE: Download Images & Calculate Dimensions
-                    # ==============================================================================
                     for idx, scene in enumerate(batch_scenes):
                         target_img_name = f"guide_anchor_{idx}.png"
                         target_path = os.path.join(dynamic_guides_dir, target_img_name)
@@ -465,22 +475,18 @@ NODE_CLASS_MAPPINGS = {
                         scene["_total_frames"] = total_frames
                         scene["_seed"] = scene.get("seed", int(time.time() * 1000) % 1000000)
 
-                    # ==============================================================================
-                    # PASS 1: PARALLEL TEXT ENCODING & LORA MATRIX BAKING 
-                    # ==============================================================================
                     print("\n[Two-Pass System] 🎬 PASS 1 START: Baking Camera LoRAs & Contexts...")
                     pass1_workflow = json.loads(json.dumps(base_workflow))
                     pass1_workflow = self.merge_overrides(pass1_workflow, overrides)
                     pass1_workflow = inject_model_paths(pass1_workflow)
 
-                    # Clean Pass 1 of heavy Samplers & Video Decoders
                     keys_to_delete = []
                     for node_id, node_data in pass1_workflow.items():
                         c_type = node_data.get("class_type", "")
                         if c_type in ["KSampler", "KSamplerAdvanced", "SamplerCustom", "SamplerCustomAdvanced", 
                                       "VHS_VideoCombine", "SaveVideo", "VAEDecode", "LatentUpscale", 
                                       "LTXVCropGuides", "CFGGuider", "BasicScheduler", "BasicGuider", "LatentInterpolate"]:
-                            if node_id == "94:10": continue  # Retain audio sync protection layout
+                            if node_id == "94:10": continue  
                             keys_to_delete.append(node_id)
                     for k in keys_to_delete: del pass1_workflow[k]
 
@@ -503,7 +509,6 @@ NODE_CLASS_MAPPINGS = {
                     ]
 
                     for idx, scene in enumerate(batch_scenes):
-                        # Construct Dynamic Scene-Specific Negative Prompt
                         neg_text = scene.get("negative_prompt", "human, person, man, woman, face, skin, crowd, civilian, soldier, body proportions, hand, foot, organic curves, portrait, blurry, low quality, deformed geometry")
                         neg_node_id = f"9999_neg_{idx}"
                         pass1_workflow[neg_node_id] = {
@@ -511,7 +516,6 @@ NODE_CLASS_MAPPINGS = {
                             "inputs": {"text": neg_text, "clip": ["101", 0]}
                         }
 
-                        # Construct Isolated Camera-LoRA stack for this Scene
                         current_model_link = ["100", 0]
                         active_cameras = []
                         cam_string = scene.get("camera", "")
@@ -530,7 +534,6 @@ NODE_CLASS_MAPPINGS = {
                             }
                             current_model_link = [node_id, 0]
 
-                        # Plumb the pre-patched model into LTXDirector and inject Explicit Audio Prompt
                         scene_46 = json.loads(json.dumps(orig_46))
                         scene_46["inputs"]["model"] = current_model_link
                         scene_46["inputs"]["duration_frames"] = scene["_total_frames"]
@@ -538,7 +541,6 @@ NODE_CLASS_MAPPINGS = {
                         scene_46["inputs"]["timeline_data"] = scene["_timeline_data_str"]
                         scene_46["inputs"]["frame_rate"] = 24
                         
-                        # Fix Audio Target Conditioning
                         audio_context = scene.get("audio_prompt", "")
                         base_static_env = f"{scene.get('subject', '')} {scene.get('style', '')} {scene.get('background', '')}".strip()
                         if audio_context:
@@ -548,7 +550,6 @@ NODE_CLASS_MAPPINGS = {
 
                         pass1_workflow[f"46_{idx}"] = scene_46
                         
-                        # Save the baked model, text vectors, dynamic negative, and audio latent into RAM
                         pass1_workflow[f"writer_{idx}"] = {
                             "class_type": "MemoryCacheWriter",
                             "inputs": {
@@ -567,9 +568,6 @@ NODE_CLASS_MAPPINGS = {
                     await self.execute_comfy_workflow(session, pass1_workflow)
                     await self.clear_comfy_memory(session, unload_models=False)
 
-                    # ==============================================================================
-                    # PASS 2: RAW LOADER-FREE SAMPLING (Instant Speed)
-                    # ==============================================================================
                     print("\n[Two-Pass System] 🚀 PASS 2 START: Loader-Free Sampling Phase...")
                     
                     for idx, scene in enumerate(batch_scenes):
@@ -583,7 +581,6 @@ NODE_CLASS_MAPPINGS = {
                         if os.path.exists(out_dir): shutil.rmtree(out_dir)
                         os.makedirs(out_dir)
 
-                        # Eradicate ALL Loaders & Extractors. The VRAM is fully locked now.
                         keys = list(pass2_workflow.keys())
                         for k in keys:
                             c_type = pass2_workflow[k].get("class_type", "")
@@ -593,28 +590,23 @@ NODE_CLASS_MAPPINGS = {
                                 del pass2_workflow[k]
                         if "46" in pass2_workflow: del pass2_workflow["46"]
 
-                        # Inject the RAM Reader
                         pass2_workflow[f"reader_{idx}"] = {
                             "class_type": "MemoryCacheReader",
                             "inputs": {"scene_id": str(idx)}
                         }
 
-                        # Wire the memory outputs dynamically across the workflow matrix
-                        # 46 original indexes: 0:model, 1:pos, 2:vid_lat, 3:aud_lat, 4:guide, 5:fps
-                        # Reader indexes:      0:model, 1:pos, 2:neg, 3:vid_lat, 4:aud_lat, 5:guide, 6:fps
                         idx_map = {0: 0, 1: 1, 2: 3, 3: 4, 4: 5, 5: 6}
                         
                         for node_id, node_data in pass2_workflow.items():
                             if "inputs" in node_data:
                                 for input_name, input_val in node_data["inputs"].items():
-                                    if isinstance(input_val, list) and len(input_val) == 2 and input_val[0] == "46":
+                                    if isinstance(input_val, list) and len(input_val) == 2 and str(input_val[0]) == "46":
                                         old_idx = input_val[1]
                                         if old_idx in idx_map:
                                             node_data["inputs"][input_name] = [f"reader_{idx}", idx_map[old_idx]]
 
                             c_type = node_data.get("class_type", "")
                             
-                            # Lock exact Negative Conditionings & Models to Samplers
                             if c_type in ["BasicGuider", "CFGGuider", "SamplerCustomAdvanced", "LTXVCropGuides"]:
                                 if "negative" in node_data["inputs"]:
                                     node_data["inputs"]["negative"] = [f"reader_{idx}", 2]
@@ -637,9 +629,30 @@ NODE_CLASS_MAPPINGS = {
 
                         if "94:28" in pass2_workflow: pass2_workflow["94:28"]["inputs"]["noise_seed"] = scene["_seed"]
                         
+                        # ==============================================================================
+                        # FIX: RECURSIVE GRAPH PURGE
+                        # Scans graph to delete dangling nodes whose upstream inputs point to nodes 
+                        # we deleted. Repeats until the graph structure stabilizes. 
+                        # ==============================================================================
+                        while True:
+                            nodes_to_delete = []
+                            existing_nodes = set(pass2_workflow.keys())
+                            for node_id, node_data in pass2_workflow.items():
+                                if "inputs" in node_data:
+                                    for input_name, input_val in node_data["inputs"].items():
+                                        if isinstance(input_val, list) and len(input_val) == 2:
+                                            ref_id = str(input_val[0])
+                                            if ref_id not in existing_nodes:
+                                                nodes_to_delete.append(node_id)
+                                                break
+                            if not nodes_to_delete:
+                                break
+                            for node_id in nodes_to_delete:
+                                del pass2_workflow[node_id]
+                        # ==============================================================================
+
                         await self.execute_comfy_workflow(session, pass2_workflow)
 
-                        # Capture & Upload Final Processed Video
                         output_files = []
                         for root_p, _, filenames in os.walk(out_dir):
                             for name in filenames:

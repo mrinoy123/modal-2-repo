@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "400"  # Bumped to force image rebuild
+    "FORCE_REBUILD_INDEX": "310"  
 })
 
 # ==============================================================================
@@ -57,7 +57,6 @@ torch_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir sageattention==1.0.6"
 )
 
-
 clone_image = torch_image.run_commands(
     "git clone --depth 1 https://github.com/comfyanonymous/ComfyUI /workspace/ComfyUI",
     "GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git /workspace/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite",
@@ -66,8 +65,6 @@ clone_image = torch_image.run_commands(
     "git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git /workspace/ComfyUI/custom_nodes/ComfyUI-KJNodes",
     "git clone --depth 1 https://github.com/Deno2026/comfyui-deno-custom-nodes.git /workspace/ComfyUI/custom_nodes/comfyui-deno-custom-nodes"
 )
-
-
 
 deps_image = clone_image.run_commands(
     "sed -i '/torch/d' /workspace/ComfyUI/requirements.txt",
@@ -122,8 +119,6 @@ class LTX23Engine:
     def start_comfy(self):
         import boto3
         
-        # 🔥 CUSTOM NODES: LTXColorFixer, Two-Pass Cache Writers & VAE Armor Patch 🔥
-        # UPDATED: Added negative conditioning to the Cache Reader/Writer
         print("🎨 Injecting Smart Nodes, Caches & VAE Memory Protections...")
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline.py"
         with open(custom_nodes_path, "w") as f:
@@ -172,7 +167,7 @@ class MemoryCacheWriter:
         return {"required": {
             "model": ("MODEL",),
             "positive": ("CONDITIONING",),
-            "negative": ("CONDITIONING",), # NEW: Capture Negative Prompts
+            "negative": ("CONDITIONING",), 
             "video_latent": ("LATENT",),
             "audio_latent": ("LATENT",),
             "guide_data": ("GUIDE_DATA",),
@@ -189,7 +184,7 @@ class MemoryCacheWriter:
         LTX_CACHE[str(scene_id)] = {
             "model": model, 
             "positive": positive,
-            "negative": negative, # Save negative data
+            "negative": negative, 
             "video_latent": video_latent,
             "audio_latent": audio_latent,
             "guide_data": guide_data,
@@ -460,7 +455,6 @@ NODE_CLASS_MAPPINGS = {
                         light = scene.get("lighting", "")
                         cam = scene.get("camera", "")
                         
-                        # Generate the negative prompt dynamically
                         negative_prompt = scene.get("negative_prompt", "")
                         scene["_negative_prompt"] = negative_prompt
                         
@@ -487,7 +481,6 @@ NODE_CLASS_MAPPINGS = {
                     pass1_workflow = self.merge_overrides(pass1_workflow, overrides)
                     pass1_workflow = inject_model_paths(pass1_workflow)
 
-                    # Strip heavy execution layers to make Pass 1 exclusively a text/motion compiler
                     keys_to_delete = []
                     for node_id, node_data in pass1_workflow.items():
                         c_type = node_data.get("class_type", "")
@@ -502,14 +495,14 @@ NODE_CLASS_MAPPINGS = {
                     
                     orig_multi_lora_id = None
                     for nid, ndata in pass1_workflow.items():
-                        if ndata.get("class_type") == "MultiLoraLoaderDeno":
+                        # Fixed: Detect the exact class name loaded from the JSON
+                        if ndata.get("class_type") == "DenoLTXMultiLoraLoader":
                             orig_multi_lora_id = nid
                             break
                             
                     if orig_multi_lora_id:
                         del pass1_workflow[orig_multi_lora_id]
 
-                    # Map Director loops into RAM Caches with the New Multi-LoRA Logic
                     for idx, scene in enumerate(batch_scenes):
                         scene_46 = json.loads(json.dumps(orig_46))
                         scene_46["inputs"]["duration_frames"] = scene["_total_frames"]
@@ -517,7 +510,6 @@ NODE_CLASS_MAPPINGS = {
                         scene_46["inputs"]["timeline_data"] = scene["_timeline_data_str"]
                         scene_46["inputs"]["frame_rate"] = 24
                         
-                        # NEW: Inject dynamic negative prompt handling into Director
                         if "94:8" in pass1_workflow: 
                             neg_encoder_id = f"neg_encoder_{idx}"
                             pass1_workflow[neg_encoder_id] = json.loads(json.dumps(pass1_workflow["94:8"]))
@@ -527,47 +519,63 @@ NODE_CLASS_MAPPINGS = {
                         # ----------------------------------------------------------------------
                         current_model_link = orig_46["inputs"].get("model", ["98", 0])
 
-                        # Set default values for the 10 slots with correct calibrated weights
+                        # Base configuration matching the DenoLTXMultiLoraLoader schema
                         lora_inputs = {
-                            "model": current_model_link,
-                            # Fixed Style LoRAs (Permanent on 8, 9, 10)
-                            "lora_8_name": "VBVR-official-comfyui.safetensors",
-                            "lora_8_strength": 1.0,  
-                            "lora_9_name": "LTX_2.3_Soft_Enhance_Style_LoRa.safetensors",
-                            "lora_9_strength": 0.4,  
-                            "lora_10_name": "LTX_2.3_Crisp_Enhance_Style_LoRa.safetensors",
-                            "lora_10_strength": 0.4, 
-                            
-                            # Camera Control Dictionary mapping
-                            "lora_1_name": "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
-                            "lora_2_name": "ltx-2-19b-lora-camera-control-dolly-left.safetensors",
-                            "lora_3_name": "ltx-2-19b-lora-camera-control-dolly-out.safetensors",
-                            "lora_4_name": "ltx-2-19b-lora-camera-control-dolly-right.safetensors",
-                            "lora_5_name": "ltx-2-19b-lora-camera-control-jib-down.safetensors",
-                            "lora_6_name": "ltx-2-19b-lora-camera-control-jib-up.safetensors",
-                            "lora_7_name": "ltx-2-19b-lora-camera-control-static.safetensors"
+                            "active_loras": 8,
+                            "model": current_model_link
                         }
 
-                        # Initialize camera strengths to 0.0
-                        for i in range(1, 8):
-                            lora_inputs[f"lora_{i}_strength"] = 0.0
+                        # Initialize all 8 slots to default/empty values
+                        for i in range(1, 9):
+                            lora_inputs[f"enabled_{i}"] = False
+                            lora_inputs[f"lora_{i}"] = "__none__"
+                            lora_inputs[f"strength_{i}"] = 0.0
+                            lora_inputs[f"audio_{i}"] = 1.0
+                            lora_inputs[f"video_{i}"] = 1.0
+                            lora_inputs[f"trigger_{i}"] = ""
+                            lora_inputs[f"description_{i}"] = ""
                             
-                        # Toggle camera control dynamically based on parsed scene request
+                        slot_idx = 1
+                        
+                        # 1. Load Fixed Styles
+                        fixed_styles = [
+                            ("VBVR-official-comfyui.safetensors", 1.0),
+                            ("LTX_2.3_Soft_Enhance_Style_LoRa.safetensors", 0.4),
+                            ("LTX_2.3_Crisp_Enhance_Style_LoRa.safetensors", 0.4)
+                        ]
+                        
+                        for lora_name, strength in fixed_styles:
+                            lora_inputs[f"enabled_{slot_idx}"] = True
+                            lora_inputs[f"lora_{slot_idx}"] = lora_name
+                            lora_inputs[f"strength_{slot_idx}"] = strength
+                            slot_idx += 1
+                            
+                        # 2. Toggle camera control dynamically based on parsed scene request
                         cam_string = scene.get("camera", "").lower()
-                        active_slots = 0
-
-                        if "in" in cam_string and "dolly" in cam_string: lora_inputs["lora_1_strength"] = 1.0; active_slots+=1
-                        if "left" in cam_string and "dolly" in cam_string: lora_inputs["lora_2_strength"] = 1.0; active_slots+=1
-                        if "out" in cam_string and "dolly" in cam_string: lora_inputs["lora_3_strength"] = 1.0; active_slots+=1
-                        if "right" in cam_string and "dolly" in cam_string: lora_inputs["lora_4_strength"] = 1.0; active_slots+=1
-                        if "down" in cam_string and "jib" in cam_string: lora_inputs["lora_5_strength"] = 1.0; active_slots+=1
-                        if "up" in cam_string and "jib" in cam_string: lora_inputs["lora_6_strength"] = 1.0; active_slots+=1
-                        if "static" in cam_string or active_slots == 0: lora_inputs["lora_7_strength"] = 1.0
-
+                        active_cams = []
+                        
+                        if "in" in cam_string and "dolly" in cam_string: active_cams.append("ltx-2-19b-lora-camera-control-dolly-in.safetensors")
+                        if "left" in cam_string and "dolly" in cam_string: active_cams.append("ltx-2-19b-lora-camera-control-dolly-left.safetensors")
+                        if "out" in cam_string and "dolly" in cam_string: active_cams.append("ltx-2-19b-lora-camera-control-dolly-out.safetensors")
+                        if "right" in cam_string and "dolly" in cam_string: active_cams.append("ltx-2-19b-lora-camera-control-dolly-right.safetensors")
+                        if "down" in cam_string and "jib" in cam_string: active_cams.append("ltx-2-19b-lora-camera-control-jib-down.safetensors")
+                        if "up" in cam_string and "jib" in cam_string: active_cams.append("ltx-2-19b-lora-camera-control-jib-up.safetensors")
+                        
+                        if len(active_cams) == 0 or "static" in cam_string:
+                            active_cams.append("ltx-2-19b-lora-camera-control-static.safetensors")
+                            
+                        # Inject cameras into remaining open slots
+                        for lora_name in active_cams:
+                            if slot_idx <= 8:
+                                lora_inputs[f"enabled_{slot_idx}"] = True
+                                lora_inputs[f"lora_{slot_idx}"] = lora_name
+                                lora_inputs[f"strength_{slot_idx}"] = 1.0
+                                slot_idx += 1
+                                
                         # Inject the configured Multi-LoRA Deno node cleanly into the pipeline graph
                         multi_lora_id = f"9000_multi_lora_{idx}"
                         pass1_workflow[multi_lora_id] = {
-                            "class_type": "MultiLoraLoaderDeno",
+                            "class_type": "DenoLTXMultiLoraLoader",
                             "inputs": lora_inputs
                         }
                         
@@ -582,9 +590,9 @@ NODE_CLASS_MAPPINGS = {
                             "inputs": {
                                 "model": [f"46_{idx}", 0],
                                 "positive": [f"46_{idx}", 1],
-                                "negative": [f"neg_encoder_{idx}" if "94:8" in pass1_workflow else f"46_{idx}", 1], 
+                                "negative": [f"neg_encoder_{idx}" if "94:8" in pass1_workflow else "46_{idx}", 1],
                                 "video_latent": [f"46_{idx}", 2],
-                                "audio_latent": [f"46_{idx}", 3], 
+                                "audio_latent": [f"46_{idx}", 3],
                                 "guide_data": [f"46_{idx}", 4],
                                 "frame_rate": [f"46_{idx}", 5],
                                 "scene_id": str(idx)
@@ -614,7 +622,6 @@ NODE_CLASS_MAPPINGS = {
                         if "101" in pass2_workflow: del pass2_workflow["101"]
                         if "46" in pass2_workflow: del pass2_workflow["46"]
                         
-                        # Remove text encoders in pass 2 since they are cached
                         if "94:8" in pass2_workflow: del pass2_workflow["94:8"] 
                         if orig_multi_lora_id and orig_multi_lora_id in pass2_workflow: del pass2_workflow[orig_multi_lora_id]
 
@@ -623,7 +630,6 @@ NODE_CLASS_MAPPINGS = {
                             "inputs": {"scene_id": str(idx)}
                         }
 
-                        # Dynamically reroute execution nodes directly to RAM output ports
                         for node_id, node_data in pass2_workflow.items():
                             if "inputs" in node_data:
                                 for input_name, input_val in node_data["inputs"].items():
@@ -646,7 +652,6 @@ NODE_CLASS_MAPPINGS = {
                                     node_info["inputs"]["format"] = "video/mp4"
                                     if "pingpong" in node_info["inputs"]: node_info["inputs"]["pingpong"] = False
 
-                            # Color Fixer Injection
                             if c_type == "VHS_VideoCombine":
                                 if "inputs" in node_info and "images" in node_info["inputs"]:
                                     original_image_source = node_info["inputs"]["images"]
@@ -659,7 +664,6 @@ NODE_CLASS_MAPPINGS = {
 
                         await self.execute_comfy_workflow(session, pass2_workflow)
 
-                        # Capture & Upload Final Processed Video
                         output_files = []
                         for root_p, _, filenames in os.walk(out_dir):
                             for name in filenames:

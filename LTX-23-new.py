@@ -57,7 +57,6 @@ torch_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir sageattention==1.0.6"
 )
 
-
 clone_image = torch_image.run_commands(
     "git clone --depth 1 https://github.com/comfyanonymous/ComfyUI /workspace/ComfyUI",
     "GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git /workspace/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite",
@@ -572,43 +571,39 @@ NODE_CLASS_MAPPINGS = {
                         if "94:108" in pass2_workflow: pass2_workflow["94:108"]["inputs"]["noise_seed"] = scene_seed
 
                         # ==============================================================================
-                        # 🌟 DYNAMIC CONFIGURATION FIX: PREVENT DEEP-FRIED CORRUPTED VIDEO
+                        # 🌟 PASS 2 PRECISION FIXES: PREVENT CORRUPTION & TEXT RECALCULATION
                         # ==============================================================================
-                        # When graphs are separated, Upsampler denoise often defaults to 1.0.
-                        # This completely overwrites the base video with pure noise. We force proper 
-                        # step ratios and denoise values to protect the generation.
+                        
+                        # 1. THE CACHE INTERCEPTOR (Fixes the 13-second text delay permanently)
+                        # When the subgraph was saved, Upsamplers/Guiders were left hard-wired to the local 
+                        # Conditioning Matrix ("94:8" or "94:5") causing heavy text-encoder loops. 
+                        # This safely snips those links and forces them to pull from the RAM Cache ("400") instead.
+                        for n_id, n_data in pass2_workflow.items():
+                            if "inputs" in n_data:
+                                for i_name, i_val in n_data["inputs"].items():
+                                    if isinstance(i_val, list) and len(i_val) == 2:
+                                        if i_val[0] in ["94:8", "94:5"]:
+                                            if i_val[1] == 0:    # Output 0 is Positive Conditioning
+                                                n_data["inputs"][i_name] = ["400", 1]
+                                            elif i_val[1] == 1:  # Output 1 is Negative Conditioning
+                                                n_data["inputs"][i_name] = ["400", 2]
 
-                        # --- Base Video Generator ---
-                        if "94:11" in pass2_workflow:
+                        # 2. STRICT SCHEDULER LOCKS BY ID (Fixes deep-fried video)
+                        # Base Video Generation Path (12 Steps)
+                        if "94:11" in pass2_workflow and "inputs" in pass2_workflow["94:11"]:
                             pass2_workflow["94:11"]["inputs"]["steps"] = 12
                             if "denoise" in pass2_workflow["94:11"]["inputs"]:
                                 pass2_workflow["94:11"]["inputs"]["denoise"] = 1.0
                         
-                        # --- Upsampler ---
-                        if "94:54" in pass2_workflow:
+                        # High-Speed Upsampler Path (16 Steps)
+                        if "94:54" in pass2_workflow and "inputs" in pass2_workflow["94:54"]:
                             pass2_workflow["94:54"]["inputs"]["steps"] = 16
-                            # CRITICAL: If denoise is 1.0 here, the video is completely ruined.
-                            pass2_workflow["94:54"]["inputs"]["denoise"] = 0.42
+                            if "denoise" in pass2_workflow["94:54"]["inputs"]:
+                                pass2_workflow["94:54"]["inputs"]["denoise"] = 0.42
                             
-                        if "94:49" in pass2_workflow:  # Upsampler Guider
+                        if "94:49" in pass2_workflow and "inputs" in pass2_workflow["94:49"]: 
                             if "cfg" in pass2_workflow["94:49"]["inputs"]:
                                 pass2_workflow["94:49"]["inputs"]["cfg"] = 1.5
-
-                        # --- Dynamic Schedulers Fallback (If node IDs change) ---
-                        for node_id, node_data in pass2_workflow.items():
-                            c_type = node_data.get("class_type", "")
-                            if c_type in ["BasicScheduler", "SDTurboScheduler", "AlignYourStepsScheduler", "KSampler", "KSamplerAdvanced"]:
-                                if node_id not in ["94:11", "94:54"]:
-                                    if "denoise" in node_data["inputs"]:
-                                        current_denoise = node_data["inputs"]["denoise"]
-                                        # If denoise was already set to < 1.0, treat it as an Upsampler
-                                        if current_denoise < 1.0:
-                                            node_data["inputs"]["steps"] = 16
-                                            node_data["inputs"]["denoise"] = 0.42
-                                        else:
-                                            node_data["inputs"]["steps"] = 12
-                                    else:
-                                        node_data["inputs"]["steps"] = 12
                         # ==============================================================================
 
                         # 1. AUDIO SYNC FIX: Explicitly lock the MP4 compiler output to 24fps

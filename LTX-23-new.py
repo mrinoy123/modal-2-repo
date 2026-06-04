@@ -447,7 +447,7 @@ NODE_CLASS_MAPPINGS = {
                     
                     if "98" in pass1_workflow: 
                         pass1_workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
-                        pass1_workflow["98"]["inputs"]["weight_dtype"] = "bf16" # 🛡️ FORCES SAGEATTENTION/FLASHATTENTION TO PREVENT THE 15-SECOND BUGS
+                        pass1_workflow["98"]["inputs"]["weight_dtype"] = "default" # 🛡️ FORCES SAGEATTENTION/FLASHATTENTION TO PREVENT THE 15-SECOND BUGS
                         
                     if "97" in pass1_workflow: pass1_workflow["97"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                     if "102" in pass1_workflow: pass1_workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"

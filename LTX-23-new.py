@@ -368,7 +368,6 @@ NODE_CLASS_MAPPINGS = {
                     # PRE-COMPUTE: Download ALL Reference Images & Calculate Dimensions
                     # ==============================================================================
                     for idx, scene in enumerate(batch_scenes):
-                        # 🛡️ FIX 1: Create a strictly RELATIVE path for ComfyUI's input directory rules
                         relative_scene_dir = f"dynamic_guides/scene_{idx}"
                         scene_img_dir = os.path.join("/workspace/ComfyUI/input", relative_scene_dir)
                         os.makedirs(scene_img_dir, exist_ok=True)
@@ -378,22 +377,25 @@ NODE_CLASS_MAPPINGS = {
                             image_urls = [scene.get("image_url")]
 
                         segments = []
+                        valid_relative_paths = []  # 🛡️ THE FIX: Array to store exact file paths
 
                         if not image_urls:
                             target_path = os.path.join(scene_img_dir, "default.png")
+                            rel_path = f"{relative_scene_dir}/default.png"
                             from PIL import Image
                             Image.new('RGB', (custom_w, custom_h), color='black').save(target_path)
                             segments = [{"frame": 0, "image": ""}, {"frame": 1, "image": ""}]
+                            valid_relative_paths.append(rel_path)
                         else:
                             for img_i, url_str in enumerate(image_urls):
                                 target_path = os.path.join(scene_img_dir, f"img_{img_i}.png")
+                                rel_path = f"{relative_scene_dir}/img_{img_i}.png" # Exact relative file path
+                                
                                 try:
-                                    # 🛡️ FIX 2: Auto-correct .jpg/.jpeg to .png to prevent the 404 error
                                     if url_str.lower().endswith((".jpg", ".jpeg")):
                                         url_str = url_str.rsplit(".", 1)[0] + ".png"
                                         
                                     parsed = urlparse(url_str)
-                                    # 🛡️ AUTHENTICATED DOWNLOAD MANAGER FOR CLOUDFLARE R2
                                     if "r2.cloudflarestorage.com" in url_str or "pub-" in url_str or parsed.netloc == "" or not parsed.scheme:
                                         file_key = parsed.path.lstrip('/')
                                         while "//" in file_key: file_key = file_key.replace("//", "/")
@@ -417,7 +419,6 @@ NODE_CLASS_MAPPINGS = {
                                 except Exception as e:
                                     print(f"[Warning] Unexpected error downloading {url_str}: {e}")
                                 
-                                # 🛡️ IRONCLAD VALIDATION SAFETY NET: Generate placeholder image if download failed
                                 if not os.path.exists(target_path) or os.path.getsize(target_path) == 0:
                                     from PIL import Image
                                     Image.new('RGB', (custom_w, custom_h), color='black').save(target_path)
@@ -432,6 +433,10 @@ NODE_CLASS_MAPPINGS = {
                                         print(f"PIL processing failed, reverting to placeholder: {img_err}")
                                         from PIL import Image
                                         Image.new('RGB', (custom_w, custom_h), color='black').save(target_path)
+
+                                # Add to valid paths if it was successfully written
+                                if os.path.exists(target_path):
+                                    valid_relative_paths.append(rel_path)
 
                                 if img_i == 0 and os.path.exists(target_path):
                                     with open(target_path, "rb") as f:
@@ -476,14 +481,13 @@ NODE_CLASS_MAPPINGS = {
                             
                         local_prompts_str = "\n".join(local_prompts_list)
                         
-                        # Store in dict for next pass
                         scene["_timeline_data_str"] = timeline_data_str
                         scene["_local_prompts_str"] = local_prompts_str
                         scene["_total_frames"] = total_frames
                         scene["_msr_frames"] = msr_frames
                         
-                        # 🛡️ FIX 3: Pass ONLY the relative directory to ComfyUI to satisfy the strict validator!
-                        scene["_img_dir"] = relative_scene_dir  
+                        # 🛡️ THE CRITICAL FIX: Join the actual file paths with newlines!
+                        scene["_image_paths_str"] = "\n".join(valid_relative_paths)
                         
                         scene["_seed"] = scene.get("seed", int(time.time() * 1000) % 1000000)
                     # ==============================================================================
@@ -585,7 +589,7 @@ NODE_CLASS_MAPPINGS = {
                         pass1_workflow[f"46_{idx}"] = scene_46
 
                         scene_351 = json.loads(json.dumps(tpl_351))
-                        scene_351["inputs"]["image_paths"] = scene["_img_dir"]  
+                        scene_351["inputs"]["image_paths"] = scene["_image_paths_str"]   
                         scene_351["inputs"]["width"] = custom_w
                         scene_351["inputs"]["height"] = custom_h
                         pass1_workflow[f"351_{idx}"] = scene_351

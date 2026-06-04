@@ -372,6 +372,13 @@ NODE_CLASS_MAPPINGS = {
                         scene_img_dir = os.path.join("/workspace/ComfyUI/input", relative_scene_dir)
                         os.makedirs(scene_img_dir, exist_ok=True)
                         
+                        # 🛡️ THE FIX 1: Generate a pure black image for the background!
+                        # This satisfies the node's requirement but lets the AI hallucinate the background from the prompt.
+                        bg_path = os.path.join(scene_img_dir, "black_bg.png")
+                        from PIL import Image
+                        Image.new('RGB', (custom_w, custom_h), color='black').save(bg_path)
+                        scene["_bg_img_path"] = f"{relative_scene_dir}/black_bg.png"
+                        
                         image_urls = scene.get("image_urls", [])
                         if not image_urls and scene.get("image_url"):
                             image_urls = [scene.get("image_url")]
@@ -600,11 +607,19 @@ NODE_CLASS_MAPPINGS = {
                         scene_94_5["inputs"]["frame_rate"] = [f"46_{idx}", 5]
                         pass1_workflow[f"94:5_{idx}"] = scene_94_5
 
+                         # 🛡️ THE FIX 2: Inject a LoadImage node for our black background canvas
+                        bg_loader_id = f"998_bg_{idx}"
+                        pass1_workflow[bg_loader_id] = {
+                            "class_type": "LoadImage",
+                            "inputs": {"image": scene["_bg_img_path"]}
+                        }
+
                         scene_320 = json.loads(json.dumps(tpl_320))
                         scene_320["inputs"]["1"] = [f"351_{idx}", 0]
                         scene_320["inputs"]["2"] = [f"351_{idx}", 0]
                         scene_320["inputs"]["3"] = [f"351_{idx}", 0]
                         scene_320["inputs"]["4"] = [f"351_{idx}", 0]
+                        scene_320["inputs"]["background"] = [bg_loader_id, 0]
                         scene_320["inputs"]["width"] = custom_w
                         scene_320["inputs"]["height"] = custom_h
                         scene_320["inputs"]["frame_count"] = scene["_msr_frames"]

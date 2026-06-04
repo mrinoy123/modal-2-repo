@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "362"  # Bumping this forces Modal to rebuild and apply the final fix
+    "FORCE_REBUILD_INDEX": "364"  # Bumping ensures invalidation of the old transformers installation
 })
 
 # ==============================================================================
@@ -53,14 +53,15 @@ build_image = base_image.env({
 # ==============================================================================
 torch_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124",
-    "python3.12 -m pip install --no-cache-dir diffusers accelerate transformers==4.47.1 torchsde numpy==1.26.4 kornia==0.7.3",
+    # 🛡️ THE FIX: Allow transformers >= 4.49.0 to get Gemma3Config support for LTX-Video 2.3
+    "python3.12 -m pip install --no-cache-dir diffusers accelerate transformers>=4.49.0 torchsde numpy==1.26.4 kornia==0.7.3",
     "python3.12 -m pip install --no-cache-dir sageattention==1.0.6"
 )
 
 clone_image = torch_image.run_commands(
     "git clone --depth 1 https://github.com/comfyanonymous/ComfyUI /workspace/ComfyUI",
     "GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git /workspace/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite",
-    "GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 https://github.com/Lightricks/ComfyUI-LTXVideo.git /workspace/ComfyUI/custom_nodes/ComfyUI-LTXVideo",
+    "git clone --depth 1 https://github.com/Lightricks/ComfyUI-LTXVideo.git /workspace/ComfyUI/custom_nodes/ComfyUI-LTXVideo",
     "git clone --depth 1 https://github.com/WhatDreamsCost/WhatDreamsCost-ComfyUI.git /workspace/ComfyUI/custom_nodes/WhatDreamsCost-ComfyUI",
     "git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git /workspace/ComfyUI/custom_nodes/ComfyUI-KJNodes",
     "git clone --depth 1 https://github.com/Deno2026/comfyui-deno-custom-nodes.git /workspace/ComfyUI/custom_nodes/comfyui-deno-custom-nodes",
@@ -72,9 +73,7 @@ deps_image = clone_image.run_commands(
     "sed -i '/torch/d' /workspace/ComfyUI/requirements.txt",
     r"find /workspace/ComfyUI/custom_nodes -name 'requirements.txt' -exec sed -i '/torch/d' {} \;",
     "python3.12 -m pip install --no-cache-dir -r /workspace/ComfyUI/requirements.txt",
-    r"find /workspace/ComfyUI/custom_nodes -name 'requirements.txt' -exec python3.12 -m pip install --no-cache-dir -r {} \;",
-    # 🛡️ THE FIX: Forcefully revert transformers back to 4.47.1 after custom nodes try to upgrade it!
-    "python3.12 -m pip install --no-cache-dir transformers==4.47.1"
+    r"find /workspace/ComfyUI/custom_nodes -name 'requirements.txt' -exec python3.12 -m pip install --no-cache-dir -r {} \;"
 )
 
 final_image = deps_image.run_commands(
@@ -122,7 +121,12 @@ class LTX23Engine:
     @modal.enter()
     def start_comfy(self):
         import boto3
+        import torch
         
+        # 🛡️ SYSTEM FIX: Hotfix container memory space before imports trigger
+        if not hasattr(torch, 'float8_e8m0fnu'):
+            torch.float8_e8m0fnu = torch.int8
+
         # 🔥 CUSTOM NODES: LTXColorFixer, Two-Pass Cache Writers & VAE Armor Patch 🔥
         print("🎨 Injecting Smart Nodes, Caches & VAE Memory Protections...")
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline.py"
@@ -264,6 +268,18 @@ NODE_CLASS_MAPPINGS = {
 
         print("🚀 Launching Two-Pass Server Engine on L40S GPU (48GB Native)...")
         os.makedirs("/tmp/comfy_swap", exist_ok=True)
+
+        # 🛡️ THE NATIVE HOTFIX: Force-inject the float8 attribute directly into main.py before launching subprocess
+        # This protects the subprocess from crashing while keeping Gemma 3 compatible via latest transformers
+        main_py_path = "/workspace/ComfyUI/main.py"
+        if os.path.exists(main_py_path):
+            with open(main_py_path, "r") as f:
+                main_content = f.read()
+            if "float8_e8m0fnu" not in main_content:
+                patch_code = "import torch\nif not hasattr(torch, 'float8_e8m0fnu'): torch.float8_e8m0fnu = torch.int8\n"
+                with open(main_py_path, "w") as f:
+                    f.write(patch_code + main_content)
+                print("⚡ Dynamic Transformers crash protection injected into main.py safely.")
 
         env_vars = os.environ.copy()
         env_vars["LD_PRELOAD"] = "/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4"

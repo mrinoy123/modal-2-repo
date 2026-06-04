@@ -391,7 +391,6 @@ NODE_CLASS_MAPPINGS = {
                                     if url_str.lower().endswith((".jpg", ".jpeg")):
                                         url_str = url_str.rsplit(".", 1)[0] + ".png"
 
-                                try:
                                     parsed = urlparse(url_str)
                                     # 🛡️ AUTHENTICATED DOWNLOAD MANAGER FOR CLOUDFLARE R2
                                     if "r2.cloudflarestorage.com" in url_str or "pub-" in url_str or parsed.netloc == "" or not parsed.scheme:
@@ -685,7 +684,7 @@ NODE_CLASS_MAPPINGS = {
                         print(f"📤 Syncing Finished Asset to R2: {target_key}")
                         
                         await asyncio.get_event_loop().run_in_executor(
-                            None, self.s3.upload_file, target_video_file, "video-asset-files-storage-workflow", target_key
+                             None, self.s3.upload_file, target_video_file, "video-asset-files-storage-workflow", target_key
                         )
 
                         public_path_url = f"https://pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev/{target_key}" 

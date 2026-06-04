@@ -67,6 +67,7 @@ clone_image = torch_image.run_commands(
     "git clone --depth 1 https://github.com/Deno2026/comfyui-deno-custom-nodes.git /workspace/ComfyUI/custom_nodes/comfyui-deno-custom-nodes",
     "git clone --depth 1 https://github.com/liconstudio/ComfyUI-Licon-MSR /workspace/ComfyUI/custom_nodes/ComfyUI-Licon-MSR",
     "git clone --depth 1 https://github.com/regiellis/ComfyUI-EasyColorCorrector /workspace/ComfyUI/custom_nodes/ComfyUI-EasyColorCorrector",
+    
     # Specific Dependencies for the New Workflow
     "git clone --depth 1 https://github.com/kijai/ComfyUI-MelBandRoformer.git /workspace/ComfyUI/custom_nodes/ComfyUI-MelBandRoformer",
     "git clone --depth 1 https://github.com/yolain/ComfyUI-Easy-Use.git /workspace/ComfyUI/custom_nodes/ComfyUI-Easy-Use",
@@ -74,7 +75,10 @@ clone_image = torch_image.run_commands(
     "git clone --depth 1 https://github.com/cubiq/ComfyUI_essentials.git /workspace/ComfyUI/custom_nodes/ComfyUI_essentials",
     "git clone --depth 1 https://github.com/ltdrdata/ComfyUI-Impact-Pack.git /workspace/ComfyUI/custom_nodes/ComfyUI-Impact-Pack",
     "git clone --depth 1 https://github.com/pythongosssss/ComfyUI-Custom-Scripts.git /workspace/ComfyUI/custom_nodes/ComfyUI-Custom-Scripts",
-    "git clone --depth 1 https://github.com/twardowski/comfyui-resolution-master.git /workspace/ComfyUI/custom_nodes/comfyui-resolution-master",
+    
+    # [FIXED URL] Corrected author to Azornes
+    "git clone --depth 1 https://github.com/Azornes/Comfyui-Resolution-Master.git /workspace/ComfyUI/custom_nodes/comfyui-resolution-master",
+    
     "git clone --depth 1 https://github.com/Fannovel16/comfyui_controlnet_aux.git /workspace/ComfyUI/custom_nodes/comfyui_controlnet_aux",
     "git clone --depth 1 https://github.com/chflame163/ComfyUI_LayerStyle.git /workspace/ComfyUI/custom_nodes/ComfyUI_LayerStyle",
     "git clone --depth 1 https://github.com/Suzie1/ComfyUI_ListHelper.git /workspace/ComfyUI/custom_nodes/ComfyUI_ListHelper"

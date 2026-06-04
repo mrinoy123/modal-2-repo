@@ -387,6 +387,11 @@ NODE_CLASS_MAPPINGS = {
                             for img_i, url_str in enumerate(image_urls):
                                 target_path = os.path.join(scene_img_dir, f"img_{img_i}.png")
                                 try:
+                                    # 🛡️ FIX 2: Auto-correct .jpg/.jpeg to .png to prevent the 404 error
+                                    if url_str.lower().endswith((".jpg", ".jpeg")):
+                                        url_str = url_str.rsplit(".", 1)[0] + ".png"
+
+                                try:
                                     parsed = urlparse(url_str)
                                     # 🛡️ AUTHENTICATED DOWNLOAD MANAGER FOR CLOUDFLARE R2
                                     if "r2.cloudflarestorage.com" in url_str or "pub-" in url_str or parsed.netloc == "" or not parsed.scheme:

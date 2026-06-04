@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "350"  
+    "FORCE_REBUILD_INDEX": "400"  
 })
 
 # ==============================================================================
@@ -356,7 +356,6 @@ NODE_CLASS_MAPPINGS = {
             date_folder = body.get("date_folder", time.strftime('%Y-%m-%d'))
             batch_scenes = body.get("batch_scenes", [])
             
-            # API NOW EXPECTS BOTH SUBGRAPHS DIRECTLY
             subgraph_1 = body.get("subgraph_1")
             subgraph_2 = body.get("subgraph_2")
 
@@ -445,14 +444,16 @@ NODE_CLASS_MAPPINGS = {
                     print("\n[Two-Pass System] 🎬 PASS 1 START: Initiating Text Encoding & LoRA Multiplier Matrix...")
                     pass1_workflow = json.loads(json.dumps(subgraph_1))
                     
-                    if "98" in pass1_workflow: pass1_workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
+                    if "98" in pass1_workflow: 
+                        pass1_workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
+                        pass1_workflow["98"]["inputs"]["weight_dtype"] = "bf16" # 🛡️ FORCES SAGEATTENTION/FLASHATTENTION TO PREVENT THE 15-SECOND BUGS
+                        
                     if "97" in pass1_workflow: pass1_workflow["97"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                     if "102" in pass1_workflow: pass1_workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
                     if "101" in pass1_workflow: 
                         pass1_workflow["101"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
                         pass1_workflow["101"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
 
-                    # Pop out the template nodes so we can clone them dynamically for every scene
                     tpl_107 = pass1_workflow.pop("107", None)
                     tpl_200 = pass1_workflow.pop("200", None)
                     tpl_46 = pass1_workflow.pop("46", None)
@@ -511,13 +512,18 @@ NODE_CLASS_MAPPINGS = {
                         scene_200["inputs"]["clip"] = [f"107_{idx}", 1]
                         pass1_workflow[f"200_{idx}"] = scene_200
 
-                        # 3. LTX Director (Node 46)
+                        # 3. LTX Director (Node 46) 
                         scene_46 = json.loads(json.dumps(tpl_46))
                         scene_46["inputs"]["duration_frames"] = scene["_total_frames"]
                         scene_46["inputs"]["local_prompts"] = scene["_local_prompts_str"]
                         scene_46["inputs"]["timeline_data"] = scene["_timeline_data_str"]
                         scene_46["inputs"]["model"] = [f"107_{idx}", 0]
                         scene_46["inputs"]["clip"] = [f"107_{idx}", 1]
+                        
+                        # 🛡️ INJECTS YOUTUBE SHORTS (9:16) DIMENSIONS SO IT STAYS FAST
+                        scene_46["inputs"]["custom_width"] = custom_w
+                        scene_46["inputs"]["custom_height"] = custom_h
+                        
                         pass1_workflow[f"46_{idx}"] = scene_46
 
                         # 4. Conditioning Matrix (Node 94:5)
@@ -570,32 +576,12 @@ NODE_CLASS_MAPPINGS = {
                         if "94:28" in pass2_workflow: pass2_workflow["94:28"]["inputs"]["noise_seed"] = scene_seed
                         if "94:108" in pass2_workflow: pass2_workflow["94:108"]["inputs"]["noise_seed"] = scene_seed
 
-                        # ==============================================================================
-                        # 🌟 PASS 2 PRECISION FIXES: PREVENT CORRUPTION & TEXT RECALCULATION
-                        # ==============================================================================
-                        
-                        # 1. THE CACHE INTERCEPTOR (Fixes the 13-second text delay permanently)
-                        # When the subgraph was saved, Upsamplers/Guiders were left hard-wired to the local 
-                        # Conditioning Matrix ("94:8" or "94:5") causing heavy text-encoder loops. 
-                        # This safely snips those links and forces them to pull from the RAM Cache ("400") instead.
-                        for n_id, n_data in pass2_workflow.items():
-                            if "inputs" in n_data:
-                                for i_name, i_val in n_data["inputs"].items():
-                                    if isinstance(i_val, list) and len(i_val) == 2:
-                                        if i_val[0] in ["94:8", "94:5"]:
-                                            if i_val[1] == 0:    # Output 0 is Positive Conditioning
-                                                n_data["inputs"][i_name] = ["400", 1]
-                                            elif i_val[1] == 1:  # Output 1 is Negative Conditioning
-                                                n_data["inputs"][i_name] = ["400", 2]
-
-                        # 2. STRICT SCHEDULER LOCKS BY ID (Fixes deep-fried video)
-                        # Base Video Generation Path (12 Steps)
+                        # 1. STRICT SCHEDULER LOCKS BY ID
                         if "94:11" in pass2_workflow and "inputs" in pass2_workflow["94:11"]:
                             pass2_workflow["94:11"]["inputs"]["steps"] = 12
                             if "denoise" in pass2_workflow["94:11"]["inputs"]:
                                 pass2_workflow["94:11"]["inputs"]["denoise"] = 1.0
                         
-                        # High-Speed Upsampler Path (16 Steps)
                         if "94:54" in pass2_workflow and "inputs" in pass2_workflow["94:54"]:
                             pass2_workflow["94:54"]["inputs"]["steps"] = 16
                             if "denoise" in pass2_workflow["94:54"]["inputs"]:
@@ -604,15 +590,14 @@ NODE_CLASS_MAPPINGS = {
                         if "94:49" in pass2_workflow and "inputs" in pass2_workflow["94:49"]: 
                             if "cfg" in pass2_workflow["94:49"]["inputs"]:
                                 pass2_workflow["94:49"]["inputs"]["cfg"] = 1.5
-                        # ==============================================================================
 
-                        # 1. AUDIO SYNC FIX: Explicitly lock the MP4 compiler output to 24fps
+                        # 2. AUDIO SYNC FIX
                         if "109" in pass2_workflow:
                             pass2_workflow["109"]["inputs"]["frame_rate"] = 24
                             if "pingpong" in pass2_workflow["109"]["inputs"]:
                                 pass2_workflow["109"]["inputs"]["pingpong"] = False
 
-                        # 2. Dynamic Color Fixer Injection
+                        # 3. Dynamic Color Fixer Injection
                         if "109" in pass2_workflow and "images" in pass2_workflow["109"]["inputs"]:
                             original_image_source = pass2_workflow["109"]["inputs"]["images"]
                             fixer_id = f"9999_color_fixer_{idx}"

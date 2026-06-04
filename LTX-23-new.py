@@ -30,7 +30,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "368"  # Bumping for fresh build
+    "FORCE_REBUILD_INDEX": "380"  # Bumping for fresh build
 })
 
 # ==============================================================================
@@ -124,14 +124,11 @@ class LTX23Engine:
         import boto3
         
         # 🛡️ THE MASTER FIX: Monkey-patch LiconMSR to remove the 41-frame limit!
-        # By converting the hardcoded combo box [17, 25, 33, 41] into an unbounded "INT",
-        # the node will accept our full 257+ frames perfectly.
         msr_path = "/workspace/ComfyUI/custom_nodes/ComfyUI-Licon-MSR/licon_msr.py"
         if os.path.exists(msr_path):
             try:
                 with open(msr_path, "r") as f:
                     content = f.read()
-                # Replace exact match of the list with "INT"
                 content = re.sub(r'\[\s*17\s*,\s*25\s*,\s*33\s*,\s*41\s*\]', '"INT"', content)
                 with open(msr_path, "w") as f:
                     f.write(content)
@@ -473,7 +470,6 @@ NODE_CLASS_MAPPINGS = {
                         seconds = max(total_words / (130 / 60.0), 2.5)  
                         raw_frames = seconds * 24
                         total_frames = int(math.ceil((raw_frames - 1) / 8) * 8 + 1)
-                        # 🛡️ THE FIX: Unlock the video limit up to 257 frames! (10.7 seconds)
                         total_frames = max(33, min(total_frames, 257))
                         
                         num_actions = len(actions)
@@ -497,39 +493,41 @@ NODE_CLASS_MAPPINGS = {
                         
                         scene["_timeline_data_str"] = timeline_data_str
                         scene["_local_prompts_str"] = local_prompts_str
-                        # 🛡️ THE FIX: Pass the exact same frame count to BOTH Director and MSR!
                         scene["_total_frames"] = total_frames
                         
                         scene["_image_paths_str"] = "\n".join(valid_relative_paths)
                         scene["_seed"] = scene.get("seed", int(time.time() * 1000) % 1000000)
 
                     # ==============================================================================
-                    # PASS 1: TEXT ENCODING, IC-LORAS & DYNAMIC LORA MATRIX BATCHING
+                    # PASS 1: DYNAMIC GRAPH TOPOLOGY BATCHING (Unbreakable Links)
                     # ==============================================================================
-                    print("\n[Two-Pass System] 🎬 PASS 1 START: Initiating Text Encoding, IC-LoRAs & Matrix Mapping...")
-                    pass1_workflow = json.loads(json.dumps(subgraph_1))
+                    print("\n[Two-Pass System] 🎬 PASS 1 START: Deploying Dynamic Scene Duplicator Mapping...")
                     
-                    if "98" in pass1_workflow: 
-                        pass1_workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
-                        pass1_workflow["98"]["inputs"]["weight_dtype"] = "fp8_e4m3fn"
-                    if "97" in pass1_workflow: pass1_workflow["97"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
-                    if "102" in pass1_workflow: pass1_workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
-                    if "101" in pass1_workflow: 
-                        pass1_workflow["101"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
-                        pass1_workflow["101"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
-
-                    tpl_107 = pass1_workflow.pop("107", None)
-                    tpl_200 = pass1_workflow.pop("200", None)
-                    tpl_46 = pass1_workflow.pop("46", None)
-                    tpl_94_5 = pass1_workflow.pop("94:5", None)
-                    tpl_300 = pass1_workflow.pop("300", None)
-                    tpl_351 = pass1_workflow.pop("351", None)
-                    tpl_352 = pass1_workflow.pop("352", None)
-                    tpl_353 = pass1_workflow.pop("353", None)
-                    tpl_354 = pass1_workflow.pop("354", None)
-                    tpl_320 = pass1_workflow.pop("320", None)
-                    tpl_330 = pass1_workflow.pop("330", None)
-
+                    global_nodes = {}
+                    scene_template = {}
+                    for n_id, n_data in subgraph_1.items():
+                        c_type = n_data.get("class_type")
+                        if c_type in ["UNETLoader", "VAELoaderKJ", "DualCLIPLoader"]:
+                            global_nodes[n_id] = n_data
+                        else:
+                            scene_template[n_id] = n_data
+                            
+                    pass1_workflow = {}
+                    
+                    # 1. Setup Global Loaders once
+                    for n_id, n_data in global_nodes.items():
+                        pass1_workflow[n_id] = json.loads(json.dumps(n_data))
+                        if pass1_workflow[n_id].get("class_type") == "UNETLoader":
+                            pass1_workflow[n_id]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
+                            pass1_workflow[n_id]["inputs"]["weight_dtype"] = "fp8_e4m3fn"
+                        elif pass1_workflow[n_id].get("class_type") == "VAELoaderKJ":
+                            # Safe assumptions based on IDs
+                            if n_id == "97": pass1_workflow[n_id]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
+                            if n_id == "102": pass1_workflow[n_id]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
+                        elif pass1_workflow[n_id].get("class_type") == "DualCLIPLoader":
+                            pass1_workflow[n_id]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
+                            pass1_workflow[n_id]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
+                            
                     camera_loras_map = {
                         "dolly_in": "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
                         "dolly_out": "ltx-2-19b-lora-camera-control-dolly-out.safetensors",
@@ -540,122 +538,90 @@ NODE_CLASS_MAPPINGS = {
                         "static": "ltx-2-19b-lora-camera-control-static.safetensors"
                     }
 
+                    # 2. Deep Copy and Link Subgraphs dynamically per Scene
                     for idx, scene in enumerate(batch_scenes):
-                        scene_107 = json.loads(json.dumps(tpl_107))
-                        scene_107["inputs"]["lora_1"] = "LTX_2.3_Crisp_Enhance_Style_LoRa.safetensors"
-                        scene_107["inputs"]["strength_1"] = 0.5
-                        scene_107["inputs"]["lora_2"] = "VBVR-official-comfyui.safetensors"
-                        scene_107["inputs"]["strength_2"] = 0.7
-                        scene_107["inputs"]["lora_3"] = "LTX_2.3_Soft_Enhance_Style_LoRa.safetensors"
-                        scene_107["inputs"]["strength_3"] = 0.5
-                        scene_107["inputs"]["lora_4"] = "LTX-2.3_Cinematic_hardcut.safetensors"
-                        scene_107["inputs"]["strength_4"] = 0.75 
-                        scene_107["inputs"]["enabled_4"] = True
-
-                        active_cameras = []
-                        cam_string = scene.get("camera", "")
-                        if cam_string:
-                            cams = [c.strip().lower() for c in cam_string.split("+")]
-                            for c in cams[:3]:
-                                if c in camera_loras_map:
-                                    active_cameras.append(camera_loras_map[c])
-                        if not active_cameras: active_cameras.append(camera_loras_map["static"])
-
-                        for i in range(3):
-                            slot = i + 5
-                            if i < len(active_cameras):
-                                scene_107["inputs"][f"lora_{slot}"] = active_cameras[i]
-                                scene_107["inputs"][f"strength_{slot}"] = 1.0
-                                scene_107["inputs"][f"enabled_{slot}"] = True
-                            else:
-                                scene_107["inputs"][f"lora_{slot}"] = "__none__"
-                                scene_107["inputs"][f"strength_{slot}"] = 0.0
-                                scene_107["inputs"][f"enabled_{slot}"] = False
-                        pass1_workflow[f"107_{idx}"] = scene_107
-
-                        scene_200 = json.loads(json.dumps(tpl_200))
-                        scene_200["inputs"]["text"] = scene.get("negative_prompt", "no humans, bad quality, distorted, blurry, watermark")
-                        scene_200["inputs"]["clip"] = [f"107_{idx}", 1]
-                        pass1_workflow[f"200_{idx}"] = scene_200
-
-                        scene_353 = json.loads(json.dumps(tpl_353))
-                        scene_353["inputs"]["model"] = [f"107_{idx}", 0]
-                        scene_353["inputs"]["lora_name"] = "ltx-2.3-22b-ic-lora-refocus.safetensors"
-                        scene_353["inputs"]["strength_model"] = 1.0
-                        pass1_workflow[f"353_{idx}"] = scene_353
-
-                        scene_354 = json.loads(json.dumps(tpl_354))
-                        scene_354["inputs"]["model"] = [f"353_{idx}", 0]
-                        scene_354["inputs"]["lora_name"] = "LTX2.3-Licon-MSR-test_version.safetensors"
-                        scene_354["inputs"]["strength_model"] = 1.0
-                        pass1_workflow[f"354_{idx}"] = scene_354
-
-                        scene_46 = json.loads(json.dumps(tpl_46))
-                        # 🛡️ THE FIX: Unlock length passed to the generator!
-                        scene_46["inputs"]["duration_frames"] = scene["_total_frames"]
-                        scene_46["inputs"]["local_prompts"] = scene["_local_prompts_str"]
-                        scene_46["inputs"]["timeline_data"] = scene["_timeline_data_str"]
-                        scene_46["inputs"]["model"] = [f"354_{idx}", 0]
-                        scene_46["inputs"]["clip"] = [f"107_{idx}", 1]
-                        scene_46["inputs"]["custom_width"] = custom_w
-                        scene_46["inputs"]["custom_height"] = custom_h
-                        scene_46["inputs"]["frame_rate"] = 24 
-                        pass1_workflow[f"46_{idx}"] = scene_46
-
-                        scene_351 = json.loads(json.dumps(tpl_351))
-                        scene_351["inputs"]["image_paths"] = scene["_image_paths_str"]   
-                        scene_351["inputs"]["width"] = custom_w
-                        scene_351["inputs"]["height"] = custom_h
-                        pass1_workflow[f"351_{idx}"] = scene_351
-
-                        scene_94_5 = json.loads(json.dumps(tpl_94_5))
-                        scene_94_5["inputs"]["positive"] = [f"46_{idx}", 1]
-                        scene_94_5["inputs"]["negative"] = [f"200_{idx}", 0]
-                        scene_94_5["inputs"]["frame_rate"] = [f"46_{idx}", 5]
-                        pass1_workflow[f"94:5_{idx}"] = scene_94_5
-
                         bg_loader_id = f"998_bg_{idx}"
                         pass1_workflow[bg_loader_id] = {
                             "class_type": "LoadImage",
                             "inputs": {"image": scene["_bg_img_path"]}
                         }
 
-                        scene_320 = json.loads(json.dumps(tpl_320))
-                        scene_320["inputs"]["1"] = [f"351_{idx}", 0]
-                        scene_320["inputs"]["2"] = [f"351_{idx}", 0]
-                        scene_320["inputs"]["3"] = [f"351_{idx}", 0]
-                        scene_320["inputs"]["4"] = [f"351_{idx}", 0]
-                        scene_320["inputs"]["background"] = [bg_loader_id, 0]
-                        scene_320["inputs"]["width"] = custom_w
-                        scene_320["inputs"]["height"] = custom_h
-                        # 🛡️ THE FIX: Unlock length passed to the MSR node (Thanks to our hack!)
-                        scene_320["inputs"]["frame_count"] = scene["_total_frames"]
-                        pass1_workflow[f"320_{idx}"] = scene_320
-
-                        scene_330 = json.loads(json.dumps(tpl_330))
-                        scene_330["inputs"]["positive"] = [f"94:5_{idx}", 0]
-                        scene_330["inputs"]["negative"] = [f"94:5_{idx}", 1]
-                        scene_330["inputs"]["latent"] = [f"46_{idx}", 2]
-                        scene_330["inputs"]["image"] = [f"320_{idx}", 0]
-                        pass1_workflow[f"330_{idx}"] = scene_330
-
-                        scene_352 = json.loads(json.dumps(tpl_352))
-                        scene_352["inputs"]["positive"] = [f"330_{idx}", 0]
-                        scene_352["inputs"]["negative"] = [f"330_{idx}", 1]
-                        scene_352["inputs"]["latent"] = [f"330_{idx}", 2]
-                        scene_352["inputs"]["multi_input"] = [f"351_{idx}", 0]
-                        pass1_workflow[f"352_{idx}"] = scene_352
-
-                        scene_300 = json.loads(json.dumps(tpl_300))
-                        scene_300["inputs"]["model"] = [f"46_{idx}", 0]
-                        scene_300["inputs"]["positive"] = [f"352_{idx}", 0]
-                        scene_300["inputs"]["negative"] = [f"352_{idx}", 1]
-                        scene_300["inputs"]["video_latent"] = [f"352_{idx}", 2]
-                        scene_300["inputs"]["audio_latent"] = [f"46_{idx}", 3]
-                        scene_300["inputs"]["guide_data"] = [f"46_{idx}", 4]
-                        scene_300["inputs"]["frame_rate"] = [f"46_{idx}", 5]
-                        scene_300["inputs"]["scene_id"] = str(idx)
-                        pass1_workflow[f"300_{idx}"] = scene_300
+                        for n_id, n_data in scene_template.items():
+                            new_id = f"{n_id}_{idx}"
+                            new_node = json.loads(json.dumps(n_data))
+                            
+                            # Preserve and rename internal link matrices natively
+                            for in_key, in_val in new_node.get("inputs", {}).items():
+                                if isinstance(in_val, list) and len(in_val) == 2 and isinstance(in_val[0], str):
+                                    target_id = in_val[0]
+                                    if target_id in scene_template:
+                                        new_node["inputs"][in_key] = [f"{target_id}_{idx}", in_val[1]]
+                                    elif target_id in global_nodes:
+                                        new_node["inputs"][in_key] = [target_id, in_val[1]]
+                                        
+                            # Safely inject parameters by Class Type (ID agnostic)
+                            c_type = new_node.get("class_type")
+                            
+                            if c_type == "LTXDirector":
+                                new_node["inputs"]["duration_frames"] = scene["_total_frames"]
+                                new_node["inputs"]["local_prompts"] = scene["_local_prompts_str"]
+                                new_node["inputs"]["timeline_data"] = scene["_timeline_data_str"]
+                                new_node["inputs"]["custom_width"] = custom_w
+                                new_node["inputs"]["custom_height"] = custom_h
+                                new_node["inputs"]["frame_rate"] = 24
+                                
+                            elif c_type == "MemoryCacheWriter":
+                                new_node["inputs"]["scene_id"] = str(idx)
+                                
+                            elif c_type == "DenoMultiImageLoader":
+                                new_node["inputs"]["image_paths"] = scene["_image_paths_str"]
+                                new_node["inputs"]["width"] = custom_w
+                                new_node["inputs"]["height"] = custom_h
+                                
+                            elif c_type == "LiconMSR":
+                                new_node["inputs"]["background"] = [bg_loader_id, 0]
+                                new_node["inputs"]["frame_count"] = scene["_total_frames"]
+                                # 🛡️ CRITICAL FIX: Respect dynamic topological linkage - prevent masking crash
+                                if not isinstance(new_node["inputs"].get("width"), list):
+                                    new_node["inputs"]["width"] = custom_w
+                                if not isinstance(new_node["inputs"].get("height"), list):
+                                    new_node["inputs"]["height"] = custom_h
+                                    
+                            elif c_type == "CLIPTextEncode" and (n_id == "200" or "no humans" in str(new_node.get("inputs", {}).get("text", ""))):
+                                new_node["inputs"]["text"] = scene.get("negative_prompt", "no humans, bad quality, distorted, blurry, watermark")
+                                
+                            elif c_type == "CR LoRA Stack" or n_id == "107":
+                                new_node["inputs"]["lora_1"] = "LTX_2.3_Crisp_Enhance_Style_LoRa.safetensors"
+                                new_node["inputs"]["strength_1"] = 0.5
+                                new_node["inputs"]["lora_2"] = "VBVR-official-comfyui.safetensors"
+                                new_node["inputs"]["strength_2"] = 0.7
+                                new_node["inputs"]["lora_3"] = "LTX_2.3_Soft_Enhance_Style_LoRa.safetensors"
+                                new_node["inputs"]["strength_3"] = 0.5
+                                new_node["inputs"]["lora_4"] = "LTX-2.3_Cinematic_hardcut.safetensors"
+                                new_node["inputs"]["strength_4"] = 0.75 
+                                new_node["inputs"]["enabled_4"] = True
+                                
+                                active_cameras = []
+                                cam_string = scene.get("camera", "")
+                                if cam_string:
+                                    cams = [c.strip().lower() for c in cam_string.split("+")]
+                                    for c in cams[:3]:
+                                        if c in camera_loras_map:
+                                            active_cameras.append(camera_loras_map[c])
+                                if not active_cameras: active_cameras.append(camera_loras_map["static"])
+                        
+                                for i in range(3):
+                                    slot = i + 5
+                                    if i < len(active_cameras):
+                                        new_node["inputs"][f"lora_{slot}"] = active_cameras[i]
+                                        new_node["inputs"][f"strength_{slot}"] = 1.0
+                                        new_node["inputs"][f"enabled_{slot}"] = True
+                                    else:
+                                        new_node["inputs"][f"lora_{slot}"] = "__none__"
+                                        new_node["inputs"][f"strength_{slot}"] = 0.0
+                                        new_node["inputs"][f"enabled_{slot}"] = False
+                                        
+                            pass1_workflow[new_id] = new_node
 
                     print(f"🚀 Queuing Math Encoding Pass for {len(batch_scenes)} Scenes simultaneously...")
                     await self.execute_comfy_workflow(session, pass1_workflow)
@@ -673,17 +639,35 @@ NODE_CLASS_MAPPINGS = {
                         if os.path.exists(out_dir): shutil.rmtree(out_dir)
                         os.makedirs(out_dir)
 
+                        scene_seed = scene["_seed"]
+
+                        # Target explicit node structures and dynamic class_types to prevent breakage
                         if "103" in pass2_workflow: pass2_workflow["103"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                         if "102" in pass2_workflow: pass2_workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
                         if "94:105" in pass2_workflow: pass2_workflow["94:105"]["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
-                        if "400" in pass2_workflow: 
-                            pass2_workflow["400"]["inputs"]["scene_id"] = str(idx)
-                            pass2_workflow["400"]["inputs"].pop("cache_id", None)
+                        
+                        # Apply fallback scanning for samplers, seeders, and cache blocks
+                        for n_id, n_data in pass2_workflow.items():
+                            c_type = n_data.get("class_type")
                             
-                        scene_seed = scene["_seed"]
-                        if "94:28" in pass2_workflow: pass2_workflow["94:28"]["inputs"]["noise_seed"] = scene_seed
-                        if "94:108" in pass2_workflow: pass2_workflow["94:108"]["inputs"]["noise_seed"] = scene_seed
+                            # Cache injection 
+                            if c_type == "MemoryCacheReader":
+                                n_data["inputs"]["scene_id"] = str(idx)
+                                n_data["inputs"].pop("cache_id", None)
+                                
+                            # Safe seed injection
+                            if "noise_seed" in n_data.get("inputs", {}):
+                                n_data["inputs"]["noise_seed"] = scene_seed
+                            elif "seed" in n_data.get("inputs", {}):
+                                n_data["inputs"]["seed"] = scene_seed
+                                
+                            # Configuration formatting
+                            if c_type == "VHS_VideoCombine":
+                                n_data["inputs"]["frame_rate"] = 24
+                                if "pingpong" in n_data.get("inputs", {}): 
+                                    n_data["inputs"]["pingpong"] = False
 
+                        # Safely update known base & upscale sampling parameters without breakage
                         if "94:11" in pass2_workflow and "inputs" in pass2_workflow["94:11"]:
                             pass2_workflow["94:11"]["inputs"]["steps"] = 12
                             if "denoise" in pass2_workflow["94:11"]["inputs"]: pass2_workflow["94:11"]["inputs"]["denoise"] = 1.0
@@ -692,10 +676,7 @@ NODE_CLASS_MAPPINGS = {
                             if "denoise" in pass2_workflow["94:54"]["inputs"]: pass2_workflow["94:54"]["inputs"]["denoise"] = 0.42
                         if "94:49" in pass2_workflow and "inputs" in pass2_workflow["94:49"]: 
                             if "cfg" in pass2_workflow["94:49"]["inputs"]: pass2_workflow["94:49"]["inputs"]["cfg"] = 1.5
-                        if "109" in pass2_workflow:
-                            pass2_workflow["109"]["inputs"]["frame_rate"] = 24
-                            if "pingpong" in pass2_workflow["109"]["inputs"]: pass2_workflow["109"]["inputs"]["pingpong"] = False
-                        if "401" in pass2_workflow:
+                        if "401" in pass2_workflow and "inputs" in pass2_workflow["401"]:
                             pass2_workflow["401"]["inputs"]["effect_strength"] = 0.6
                             pass2_workflow["401"]["inputs"]["pop_factor"] = 0.7
 

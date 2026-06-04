@@ -524,6 +524,7 @@ NODE_CLASS_MAPPINGS = {
                         # 🛡️ INJECTS YOUTUBE SHORTS (9:16) DIMENSIONS SO IT STAYS FAST
                         scene_46["inputs"]["custom_width"] = custom_w
                         scene_46["inputs"]["custom_height"] = custom_h
+                        scene_46["inputs"]["frame_rate"] = 24 
                         
                         pass1_workflow[f"46_{idx}"] = scene_46
 

@@ -81,7 +81,7 @@ clone_image = torch_image.run_commands(
     
     "git clone --depth 1 https://github.com/Fannovel16/comfyui_controlnet_aux.git /workspace/ComfyUI/custom_nodes/comfyui_controlnet_aux",
     "git clone --depth 1 https://github.com/chflame163/ComfyUI_LayerStyle.git /workspace/ComfyUI/custom_nodes/ComfyUI_LayerStyle",
-    "git clone --depth 1 https://github.com/Suzie1/ComfyUI_ListHelper.git /workspace/ComfyUI/custom_nodes/ComfyUI_ListHelper"
+    "git clone --depth 1 https://github.com/dseditor/ComfyUI-ListHelper"
 )
 
 deps_image = clone_image.run_commands(

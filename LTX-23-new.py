@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "410"  
+    "FORCE_REBUILD_INDEX": "351"  # Bumping this forces Modal to rebuild the image
 })
 
 # ==============================================================================
@@ -51,9 +51,10 @@ build_image = base_image.env({
 # ==============================================================================
 # PART 4: COMFYUI & CUSTOM NODES CLONING
 # ==============================================================================
+# 🛡️ FIX APPLIED HERE: Pinned transformers==4.48.3 to prevent PyTorch 2.6.0 float8 crashes
 torch_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124",
-    "python3.12 -m pip install --no-cache-dir diffusers accelerate transformers torchsde numpy==1.26.4 kornia==0.7.3",
+    "python3.12 -m pip install --no-cache-dir diffusers accelerate transformers==4.48.3 torchsde numpy==1.26.4 kornia==0.7.3",
     "python3.12 -m pip install --no-cache-dir sageattention==1.0.6"
 )
 

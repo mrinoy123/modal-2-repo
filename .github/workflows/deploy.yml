@@ -11,9 +11,10 @@ on:
       target:
         description: 'Which API engine to deploy?'
         required: true
-        default: 'LTX-23-new'
+        default: 'ltx23-all-workflow'
         type: choice
         options:
+          - ltx23-all-workflow
           - LTX-23-new
           - ltx-19b
           - sonic-1vpsync
@@ -51,7 +52,12 @@ jobs:
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET_2 }}
           TARGET: ${{ github.event.inputs.target }}
         run: |
-          if [ "$TARGET" = "LTX-23-new" ]; then
+          if [ "$TARGET" = "ltx23-all-workflow" ]; then
+            echo "🚀 Deploying completely brand-new ltx23-all-workflow Video API to Account 2..."
+            echo "ℹ️ This execution thread establishes an independent, unshared container snapshot image."
+            modal deploy ltx23-all-workflow.py
+
+          elif [ "$TARGET" = "LTX-23-new" ]; then
             echo "🚀 Deploying completely brand-new LTX-23-new Video API to Account 2..."
             echo "ℹ️ This execution thread establishes an independent, unshared container snapshot image."
             modal deploy LTX-23-new.py

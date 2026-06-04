@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "365"  # Bumping ensures we wipe the corrupted main.py and build clean
+    "FORCE_REBUILD_INDEX": "366"  # Bumping for safe runtime cache refresh
 })
 
 # ==============================================================================
@@ -53,7 +53,6 @@ build_image = base_image.env({
 # ==============================================================================
 torch_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124",
-    # 🛡️ THE FIX: Allow transformers >= 4.49.0 to get Gemma3Config support for LTX-Video 2.3
     "python3.12 -m pip install --no-cache-dir diffusers accelerate transformers>=4.49.0 torchsde numpy==1.26.4 kornia==0.7.3",
     "python3.12 -m pip install --no-cache-dir sageattention==1.0.6"
 )
@@ -79,9 +78,6 @@ deps_image = clone_image.run_commands(
 final_image = deps_image.run_commands(
     "echo '' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     "echo 'sageattn_qk_int8_pv_fp16_triton = sageattn' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
-    
-    # 🛡️ THE PERMANENT FIX: We inject the PyTorch 2.6 property directly into the base torch library.
-    # This completely solves the transformers>=4.49.0 crash WITHOUT breaking ComfyUI's VRAM/CUDA boot sequence!
     "echo 'float8_e8m0fnu = int8' >> /usr/local/lib/python3.12/site-packages/torch/__init__.py",
     env={
         "CUDA_HOME": "/usr/local/cuda",
@@ -126,7 +122,6 @@ class LTX23Engine:
     def start_comfy(self):
         import boto3
         
-        # 🔥 CUSTOM NODES: LTXColorFixer, Two-Pass Cache Writers & VAE Armor Patch 🔥
         print("🎨 Injecting Smart Nodes, Caches & VAE Memory Protections...")
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline.py"
         with open(custom_nodes_path, "w") as f:
@@ -166,7 +161,6 @@ class LTXColorFixer:
             
         return (image,)
 
-# High-Speed Python Dictionary serving as VRAM Cache Buffer
 LTX_CACHE = {}
 
 class MemoryCacheWriter:
@@ -238,24 +232,19 @@ NODE_CLASS_MAPPINGS = {
 
         print("🔗 Running Atomic Model Folder Linker for LTX 2.3...")
         base_models_dir = "/workspace/ComfyUI/models"
-        
         dirs = ["unet", "vae", "clip", "text_encoders", "checkpoints", "loras", "upscale_models", "latent_upscale_models"]
-        for d in dirs: 
-            os.makedirs(os.path.join(base_models_dir, d), exist_ok=True)
+        for d in dirs: os.makedirs(os.path.join(base_models_dir, d), exist_ok=True)
 
         if os.path.exists("/mnt/weights"):
             for root_dir, _, files in os.walk("/mnt/weights"):
                 for filename in files:
-                    if not filename.endswith((".safetensors", ".gguf", ".pth", ".pt", ".bin")): 
-                        continue
+                    if not filename.endswith((".safetensors", ".gguf", ".pth", ".pt", ".bin")): continue
                     src_path = os.path.join(root_dir, filename)
                     for target_dir in dirs:
                         dest = os.path.join(base_models_dir, target_dir, filename)
                         if not os.path.exists(dest):
-                            try: 
-                                os.symlink(src_path, dest)
-                            except FileExistsError: 
-                                pass
+                            try: os.symlink(src_path, dest)
+                            except FileExistsError: pass
 
         self.s3 = boto3.client(
             service_name='s3', 
@@ -287,8 +276,7 @@ NODE_CLASS_MAPPINGS = {
         start_time = time.time()
         comfy_ready = False
         while time.time() - start_time < 300:
-            if self.process.poll() is not None: 
-                os._exit(1)
+            if self.process.poll() is not None: os._exit(1)
             try:
                 with urllib.request.urlopen("http://127.0.0.1:8188/", timeout=1) as response:
                     if response.status == 200: 
@@ -297,9 +285,7 @@ NODE_CLASS_MAPPINGS = {
             except Exception: 
                 time.sleep(2)
                 
-        if not comfy_ready:
-            os._exit(1)
-
+        if not comfy_ready: os._exit(1)
         print("✅ Base pipeline active. Awaiting Two-Pass API Batch triggers.")
 
     async def clear_comfy_memory(self, session, unload_models=False):
@@ -307,17 +293,13 @@ NODE_CLASS_MAPPINGS = {
             async with session.post("http://127.0.0.1:8188/free", json={"unload_models": unload_models, "free_memory": True}) as r:
                 await r.read()
         except Exception: pass
-        
-        import gc
-        import torch
+        import gc, torch
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
             torch.cuda.reset_peak_memory_stats()
-            
-        try:
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        try: ctypes.CDLL("libc.so.6").malloc_trim(0)
         except Exception: pass
         await asyncio.sleep(1)
 
@@ -343,7 +325,6 @@ NODE_CLASS_MAPPINGS = {
             
             if self.process.poll() is not None:
                 raise HTTPException(status_code=500, detail="ComfyUI server process crashed.")
-                
             await asyncio.sleep(1)
 
     # ==============================================================================
@@ -362,16 +343,19 @@ NODE_CLASS_MAPPINGS = {
         async def process_pipeline():
             date_folder = body.get("date_folder", time.strftime('%Y-%m-%d'))
             batch_scenes = body.get("batch_scenes", [])
-            
             subgraph_1 = body.get("subgraph_1")
             subgraph_2 = body.get("subgraph_2")
 
             if not batch_scenes: raise HTTPException(status_code=400, detail="Missing batch_scenes array.")
             if not subgraph_1 or not subgraph_2: raise HTTPException(status_code=400, detail="Missing Subgraph definitions.")
 
-            dynamic_guides_dir = "/workspace/ComfyUI/input/dynamic_guides"
-            if os.path.exists(dynamic_guides_dir): shutil.rmtree(dynamic_guides_dir)
-            os.makedirs(dynamic_guides_dir, exist_ok=True)
+            # 🛡️ FIX 1: We use relative directory structures for ComfyUI's strict Input security rules
+            comfy_input_dir = "/workspace/ComfyUI/input"
+            dynamic_guides_rel = "dynamic_guides"
+            dynamic_guides_abs = os.path.join(comfy_input_dir, dynamic_guides_rel)
+            
+            if os.path.exists(dynamic_guides_abs): shutil.rmtree(dynamic_guides_abs)
+            os.makedirs(dynamic_guides_abs, exist_ok=True)
 
             ram_task = asyncio.create_task(self._ram_squeezer())
             generated_outputs = []
@@ -385,16 +369,15 @@ NODE_CLASS_MAPPINGS = {
                     # PRE-COMPUTE: Download ALL Reference Images & Calculate Dimensions
                     # ==============================================================================
                     for idx, scene in enumerate(batch_scenes):
-                        scene_img_dir = os.path.join(dynamic_guides_dir, f"scene_{idx}")
+                        relative_scene_dir = f"{dynamic_guides_rel}/scene_{idx}"
+                        scene_img_dir = os.path.join(comfy_input_dir, relative_scene_dir)
                         os.makedirs(scene_img_dir, exist_ok=True)
                         
-                        # Dynamically handle multiple images (supports 1 to N images per scene)
                         image_urls = scene.get("image_urls", [])
                         if not image_urls and scene.get("image_url"):
                             image_urls = [scene.get("image_url")]
 
                         if not image_urls:
-                            # Fallback dummy black image if none provided
                             target_path = os.path.join(scene_img_dir, "default.png")
                             from PIL import Image
                             Image.new('RGB', (custom_w, custom_h), color='black').save(target_path)
@@ -407,13 +390,11 @@ NODE_CLASS_MAPPINGS = {
                                     async with session.get(url, timeout=120) as r:
                                         if r.status == 200:
                                             with open(target_path, "wb") as f: f.write(await r.read())
-                                            # Optional: resize explicitly if you don't trust DenoMultiImageLoader
                                             from PIL import Image
                                             img = Image.open(target_path).convert("RGB")
                                             img = img.resize((custom_w, custom_h), Image.Resampling.LANCZOS)
                                             img.save(target_path)
                                             
-                                            # We grab the first image for the Director Timeline start point (fallback visualization)
                                             if img_i == 0:
                                                 with open(target_path, "rb") as f:
                                                     b64_img = base64.b64encode(f.read()).decode("utf-8")
@@ -424,7 +405,6 @@ NODE_CLASS_MAPPINGS = {
                         
                         timeline_data_str = json.dumps({"segments": segments, "audioSegments": []})
 
-                        # Dynamic Frame Length Computations
                         actions = scene.get("kinetic_actions", [])
                         if not actions: actions = ["The subject moves dynamically across the cinematic scene."]
                         
@@ -436,6 +416,14 @@ NODE_CLASS_MAPPINGS = {
                         
                         num_actions = len(actions)
                         keyframe_steps = [int(i * (total_frames - 1) / max(1, num_actions - 1)) for i in range(num_actions)]
+
+                        # 🛡️ FIX 2: Clamp LiconMSR Guide frames to its strict valid combo box selection
+                        valid_msr_frames = [17, 25, 33, 41]
+                        msr_frames = 41
+                        for vf in reversed(valid_msr_frames):
+                            if total_frames >= vf:
+                                msr_frames = vf
+                                break
 
                         style = scene.get("style", "")
                         subject = scene.get("subject", "")
@@ -453,11 +441,11 @@ NODE_CLASS_MAPPINGS = {
                             
                         local_prompts_str = "\n".join(local_prompts_list)
                         
-                        # Store in dict for next pass
                         scene["_timeline_data_str"] = timeline_data_str
                         scene["_local_prompts_str"] = local_prompts_str
                         scene["_total_frames"] = total_frames
-                        scene["_img_dir"] = scene_img_dir
+                        scene["_msr_frames"] = msr_frames
+                        scene["_img_dir"] = relative_scene_dir  # Safely mapped relative path
                         scene["_seed"] = scene.get("seed", int(time.time() * 1000) % 1000000)
 
                     # ==============================================================================
@@ -469,14 +457,12 @@ NODE_CLASS_MAPPINGS = {
                     if "98" in pass1_workflow: 
                         pass1_workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
                         pass1_workflow["98"]["inputs"]["weight_dtype"] = "fp8_e4m3fn"
-                        
                     if "97" in pass1_workflow: pass1_workflow["97"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                     if "102" in pass1_workflow: pass1_workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
                     if "101" in pass1_workflow: 
                         pass1_workflow["101"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
                         pass1_workflow["101"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
 
-                    # Pop nodes so we can duplicate them cleanly per scene logic
                     tpl_107 = pass1_workflow.pop("107", None)
                     tpl_200 = pass1_workflow.pop("200", None)
                     tpl_46 = pass1_workflow.pop("46", None)
@@ -500,7 +486,6 @@ NODE_CLASS_MAPPINGS = {
                     }
 
                     for idx, scene in enumerate(batch_scenes):
-                        # 1. Deno Multi Lora Loader (Node 107) - Adding HARDCUT LoRA natively.
                         scene_107 = json.loads(json.dumps(tpl_107))
                         scene_107["inputs"]["lora_1"] = "LTX_2.3_Crisp_Enhance_Style_LoRa.safetensors"
                         scene_107["inputs"]["strength_1"] = 0.5
@@ -508,7 +493,6 @@ NODE_CLASS_MAPPINGS = {
                         scene_107["inputs"]["strength_2"] = 0.7
                         scene_107["inputs"]["lora_3"] = "LTX_2.3_Soft_Enhance_Style_LoRa.safetensors"
                         scene_107["inputs"]["strength_3"] = 0.5
-                        # ---> HARDCODED CINEMATIC HARDCUT LORA <---
                         scene_107["inputs"]["lora_4"] = "LTX-2.3_Cinematic_hardcut.safetensors"
                         scene_107["inputs"]["strength_4"] = 0.75 
                         scene_107["inputs"]["enabled_4"] = True
@@ -520,11 +504,8 @@ NODE_CLASS_MAPPINGS = {
                             for c in cams[:3]:
                                 if c in camera_loras_map:
                                     active_cameras.append(camera_loras_map[c])
-                        
-                        if not active_cameras:
-                            active_cameras.append(camera_loras_map["static"])
+                        if not active_cameras: active_cameras.append(camera_loras_map["static"])
 
-                        # Map up to 3 camera LoRAs to slots 5, 6, 7
                         for i in range(3):
                             slot = i + 5
                             if i < len(active_cameras):
@@ -535,17 +516,13 @@ NODE_CLASS_MAPPINGS = {
                                 scene_107["inputs"][f"lora_{slot}"] = "__none__"
                                 scene_107["inputs"][f"strength_{slot}"] = 0.0
                                 scene_107["inputs"][f"enabled_{slot}"] = False
-                                
                         pass1_workflow[f"107_{idx}"] = scene_107
 
-                        # 2. Negative Prompt Encoder (Node 200)
                         scene_200 = json.loads(json.dumps(tpl_200))
-                        default_neg = "no humans, bad quality, distorted, blurry, watermark"
-                        scene_200["inputs"]["text"] = scene.get("negative_prompt", default_neg)
+                        scene_200["inputs"]["text"] = scene.get("negative_prompt", "no humans, bad quality, distorted, blurry, watermark")
                         scene_200["inputs"]["clip"] = [f"107_{idx}", 1]
                         pass1_workflow[f"200_{idx}"] = scene_200
 
-                        # 3. IC-LoRAs Injection Series (353 & 354)
                         scene_353 = json.loads(json.dumps(tpl_353))
                         scene_353["inputs"]["model"] = [f"107_{idx}", 0]
                         scene_353["inputs"]["lora_name"] = "ltx-2.3-22b-ic-lora-refocus.safetensors"
@@ -558,33 +535,31 @@ NODE_CLASS_MAPPINGS = {
                         scene_354["inputs"]["strength_model"] = 1.0
                         pass1_workflow[f"354_{idx}"] = scene_354
 
-                        # 4. LTX Director (Node 46) 
                         scene_46 = json.loads(json.dumps(tpl_46))
                         scene_46["inputs"]["duration_frames"] = scene["_total_frames"]
                         scene_46["inputs"]["local_prompts"] = scene["_local_prompts_str"]
                         scene_46["inputs"]["timeline_data"] = scene["_timeline_data_str"]
-                        scene_46["inputs"]["model"] = [f"354_{idx}", 0] # Model wired from IC-LoRAs
+                        scene_46["inputs"]["model"] = [f"354_{idx}", 0]
                         scene_46["inputs"]["clip"] = [f"107_{idx}", 1]
                         scene_46["inputs"]["custom_width"] = custom_w
                         scene_46["inputs"]["custom_height"] = custom_h
                         scene_46["inputs"]["frame_rate"] = 24 
                         pass1_workflow[f"46_{idx}"] = scene_46
 
-                        # 5. Deno Multi Image Loader (Node 351) -> Targets the scene_img_dir automatically!
+                        # 🛡️ FIX 1 APPLIED: Safe Relative Paths for Strict Validation
                         scene_351 = json.loads(json.dumps(tpl_351))
                         scene_351["inputs"]["image_paths"] = scene["_img_dir"]
                         scene_351["inputs"]["width"] = custom_w
                         scene_351["inputs"]["height"] = custom_h
                         pass1_workflow[f"351_{idx}"] = scene_351
 
-                        # 6. Conditioning Matrix (Node 94:5)
                         scene_94_5 = json.loads(json.dumps(tpl_94_5))
                         scene_94_5["inputs"]["positive"] = [f"46_{idx}", 1]
                         scene_94_5["inputs"]["negative"] = [f"200_{idx}", 0]
                         scene_94_5["inputs"]["frame_rate"] = [f"46_{idx}", 5]
                         pass1_workflow[f"94:5_{idx}"] = scene_94_5
 
-                        # 7. Licon MSR (Node 320)
+                        # 🛡️ FIX 2 APPLIED: Clamped Combo-Box limits
                         scene_320 = json.loads(json.dumps(tpl_320))
                         scene_320["inputs"]["1"] = [f"351_{idx}", 0]
                         scene_320["inputs"]["2"] = [f"351_{idx}", 0]
@@ -592,10 +567,9 @@ NODE_CLASS_MAPPINGS = {
                         scene_320["inputs"]["4"] = [f"351_{idx}", 0]
                         scene_320["inputs"]["width"] = custom_w
                         scene_320["inputs"]["height"] = custom_h
-                        scene_320["inputs"]["frame_count"] = scene["_total_frames"]
+                        scene_320["inputs"]["frame_count"] = scene["_msr_frames"]
                         pass1_workflow[f"320_{idx}"] = scene_320
 
-                        # 8. IC-LoRA Guide Injection (Node 330)
                         scene_330 = json.loads(json.dumps(tpl_330))
                         scene_330["inputs"]["positive"] = [f"94:5_{idx}", 0]
                         scene_330["inputs"]["negative"] = [f"94:5_{idx}", 1]
@@ -603,7 +577,6 @@ NODE_CLASS_MAPPINGS = {
                         scene_330["inputs"]["image"] = [f"320_{idx}", 0]
                         pass1_workflow[f"330_{idx}"] = scene_330
 
-                        # 9. Sequencer Integration (Node 352)
                         scene_352 = json.loads(json.dumps(tpl_352))
                         scene_352["inputs"]["positive"] = [f"330_{idx}", 0]
                         scene_352["inputs"]["negative"] = [f"330_{idx}", 1]
@@ -611,7 +584,6 @@ NODE_CLASS_MAPPINGS = {
                         scene_352["inputs"]["multi_input"] = [f"351_{idx}", 0]
                         pass1_workflow[f"352_{idx}"] = scene_352
 
-                        # 10. Memory Writer (Node 300) - Saves Final Encoded Output to RAM
                         scene_300 = json.loads(json.dumps(tpl_300))
                         scene_300["inputs"]["model"] = [f"46_{idx}", 0]
                         scene_300["inputs"]["positive"] = [f"352_{idx}", 0]
@@ -634,55 +606,37 @@ NODE_CLASS_MAPPINGS = {
                     
                     for idx, scene in enumerate(batch_scenes):
                         print(f"\n🎬 Rendering Native Scene [{idx+1}/{len(batch_scenes)}]: {scene.get('name', 'Clip')}")
-                        
                         pass2_workflow = json.loads(json.dumps(subgraph_2))
-
                         out_dir = "/workspace/ComfyUI/output"
                         if os.path.exists(out_dir): shutil.rmtree(out_dir)
                         os.makedirs(out_dir)
 
-                        # Inject Models
                         if "103" in pass2_workflow: pass2_workflow["103"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                         if "102" in pass2_workflow: pass2_workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
                         if "94:105" in pass2_workflow: pass2_workflow["94:105"]["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
-
-                        # Set target Scene ID for Memory Cache Reader
                         if "400" in pass2_workflow: pass2_workflow["400"]["inputs"]["cache_id"] = str(idx)
 
-                        # Set Noise Seeds
                         scene_seed = scene["_seed"]
                         if "94:28" in pass2_workflow: pass2_workflow["94:28"]["inputs"]["noise_seed"] = scene_seed
                         if "94:108" in pass2_workflow: pass2_workflow["94:108"]["inputs"]["noise_seed"] = scene_seed
 
-                        # 1. STRICT SCHEDULER LOCKS BY ID
                         if "94:11" in pass2_workflow and "inputs" in pass2_workflow["94:11"]:
                             pass2_workflow["94:11"]["inputs"]["steps"] = 12
-                            if "denoise" in pass2_workflow["94:11"]["inputs"]:
-                                pass2_workflow["94:11"]["inputs"]["denoise"] = 1.0
-                        
+                            if "denoise" in pass2_workflow["94:11"]["inputs"]: pass2_workflow["94:11"]["inputs"]["denoise"] = 1.0
                         if "94:54" in pass2_workflow and "inputs" in pass2_workflow["94:54"]:
                             pass2_workflow["94:54"]["inputs"]["steps"] = 16
-                            if "denoise" in pass2_workflow["94:54"]["inputs"]:
-                                pass2_workflow["94:54"]["inputs"]["denoise"] = 0.42
-                            
+                            if "denoise" in pass2_workflow["94:54"]["inputs"]: pass2_workflow["94:54"]["inputs"]["denoise"] = 0.42
                         if "94:49" in pass2_workflow and "inputs" in pass2_workflow["94:49"]: 
-                            if "cfg" in pass2_workflow["94:49"]["inputs"]:
-                                pass2_workflow["94:49"]["inputs"]["cfg"] = 1.5
-
-                        # 2. AUDIO SYNC FIX
+                            if "cfg" in pass2_workflow["94:49"]["inputs"]: pass2_workflow["94:49"]["inputs"]["cfg"] = 1.5
                         if "109" in pass2_workflow:
                             pass2_workflow["109"]["inputs"]["frame_rate"] = 24
-                            if "pingpong" in pass2_workflow["109"]["inputs"]:
-                                pass2_workflow["109"]["inputs"]["pingpong"] = False
-                                
-                        # 3. EasyColorCorrector Configuration
+                            if "pingpong" in pass2_workflow["109"]["inputs"]: pass2_workflow["109"]["inputs"]["pingpong"] = False
                         if "401" in pass2_workflow:
                             pass2_workflow["401"]["inputs"]["effect_strength"] = 0.6
                             pass2_workflow["401"]["inputs"]["pop_factor"] = 0.7
 
                         await self.execute_comfy_workflow(session, pass2_workflow)
 
-                        # Capture & Upload Final Processed Video
                         output_files = []
                         for root_p, _, filenames in os.walk(out_dir):
                             for name in filenames:
@@ -690,7 +644,6 @@ NODE_CLASS_MAPPINGS = {
                                     output_files.append(os.path.join(root_p, name))
 
                         if not output_files: raise Exception("Inference finished but no output media files were detected.")
-                        
                         output_files.sort(key=os.path.getmtime)
                         target_video_file = output_files[-1]
                         saved_filename = os.path.basename(target_video_file)
@@ -703,7 +656,6 @@ NODE_CLASS_MAPPINGS = {
                         )
 
                         public_path_url = f"https://pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev/{target_key}" 
-                        
                         generated_outputs.append({
                             "scene": scene.get("name", f"Clip_{idx+1}"),
                             "status": "success",
@@ -711,8 +663,6 @@ NODE_CLASS_MAPPINGS = {
                             "public_url": public_path_url,
                             "filename": saved_filename
                         })
-
-                        # BATCH SPEED RULE: Clean out active rendering cache but keep heavy UNET loaded.
                         await self.clear_comfy_memory(session, unload_models=False)
                     
                     return generated_outputs

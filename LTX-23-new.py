@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "351"  # Bumping this forces Modal to rebuild the image
+    "FORCE_REBUILD_INDEX": "352"  # Bumping this forces Modal to rebuild the image with new custom nodes
 })
 
 # ==============================================================================
@@ -51,7 +51,6 @@ build_image = base_image.env({
 # ==============================================================================
 # PART 4: COMFYUI & CUSTOM NODES CLONING
 # ==============================================================================
-# 🛡️ FIX APPLIED HERE: Pinned transformers==4.48.3 to prevent PyTorch 2.6.0 float8 crashes
 torch_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124",
     "python3.12 -m pip install --no-cache-dir diffusers accelerate transformers==4.48.3 torchsde numpy==1.26.4 kornia==0.7.3",
@@ -64,7 +63,10 @@ clone_image = torch_image.run_commands(
     "GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 https://github.com/Lightricks/ComfyUI-LTXVideo.git /workspace/ComfyUI/custom_nodes/ComfyUI-LTXVideo",
     "git clone --depth 1 https://github.com/WhatDreamsCost/WhatDreamsCost-ComfyUI.git /workspace/ComfyUI/custom_nodes/WhatDreamsCost-ComfyUI",
     "git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git /workspace/ComfyUI/custom_nodes/ComfyUI-KJNodes",
-    "git clone --depth 1 https://github.com/Deno2026/comfyui-deno-custom-nodes.git /workspace/ComfyUI/custom_nodes/comfyui-deno-custom-nodes"
+    "git clone --depth 1 https://github.com/Deno2026/comfyui-deno-custom-nodes.git /workspace/ComfyUI/custom_nodes/comfyui-deno-custom-nodes",
+    # ---> NEW CUSTOM NODES ADDED HERE <---
+    "git clone --depth 1 https://github.com/liconstudio/ComfyUI-Licon-MSR /workspace/ComfyUI/custom_nodes/ComfyUI-Licon-MSR",
+    "git clone --depth 1 https://github.com/regiellis/ComfyUI-EasyColorCorrector /workspace/ComfyUI/custom_nodes/ComfyUI-EasyColorCorrector"
 )
 
 deps_image = clone_image.run_commands(
@@ -376,36 +378,49 @@ NODE_CLASS_MAPPINGS = {
                     custom_h = body.get("custom_height", 1024)
 
                     # ==============================================================================
-                    # PRE-COMPUTE: Download Images & Calculate Dimensions
+                    # PRE-COMPUTE: Download ALL Reference Images & Calculate Dimensions
                     # ==============================================================================
                     for idx, scene in enumerate(batch_scenes):
-                        target_img_name = f"guide_anchor_{idx}.png"
-                        target_path = os.path.join(dynamic_guides_dir, target_img_name)
+                        scene_img_dir = os.path.join(dynamic_guides_dir, f"scene_{idx}")
+                        os.makedirs(scene_img_dir, exist_ok=True)
                         
-                        image_url = scene.get("image_url", "")
-                        if image_url:
-                            try:
-                                async with session.get(image_url, timeout=120) as r:
-                                    if r.status == 200:
-                                        with open(target_path, "wb") as f: f.write(await r.read())
-                            except Exception: pass
-                        
-                        if not os.path.exists(target_path):
+                        # Dynamically handle multiple images (supports 1 to N images per scene)
+                        image_urls = scene.get("image_urls", [])
+                        if not image_urls and scene.get("image_url"):
+                            image_urls = [scene.get("image_url")]
+
+                        if not image_urls:
+                            # Fallback dummy black image if none provided
+                            target_path = os.path.join(scene_img_dir, "default.png")
                             from PIL import Image
                             Image.new('RGB', (custom_w, custom_h), color='black').save(target_path)
-                            
-                        from PIL import Image
-                        img = Image.open(target_path).convert("RGB")
-                        img = img.resize((custom_w, custom_h), Image.Resampling.LANCZOS)
-                        img.save(target_path)
+                            segments = [{"frame": 0, "image": ""}, {"frame": 1, "image": ""}]
+                        else:
+                            segments = []
+                            for img_i, url in enumerate(image_urls):
+                                target_path = os.path.join(scene_img_dir, f"img_{img_i}.png")
+                                try:
+                                    async with session.get(url, timeout=120) as r:
+                                        if r.status == 200:
+                                            with open(target_path, "wb") as f: f.write(await r.read())
+                                            # Optional: resize explicitly if you don't trust DenoMultiImageLoader
+                                            from PIL import Image
+                                            img = Image.open(target_path).convert("RGB")
+                                            img = img.resize((custom_w, custom_h), Image.Resampling.LANCZOS)
+                                            img.save(target_path)
+                                            
+                                            # We grab the first image for the Director Timeline start point (fallback visualization)
+                                            if img_i == 0:
+                                                with open(target_path, "rb") as f:
+                                                    b64_img = base64.b64encode(f.read()).decode("utf-8")
+                                                    segments.append({"frame": 0, "image": f"data:image/png;base64,{b64_img}"})
+                                                    segments.append({"frame": 1, "image": f"data:image/png;base64,{b64_img}"})
+                                except Exception as e:
+                                    print(f"Failed to download image {url}: {e}")
                         
-                        segments = []
-                        for frame in [0, 1]:
-                            with open(target_path, "rb") as f:
-                                b64_img = base64.b64encode(f.read()).decode("utf-8")
-                                segments.append({"frame": frame, "image": f"data:image/png;base64,{b64_img}"})
                         timeline_data_str = json.dumps({"segments": segments, "audioSegments": []})
 
+                        # Dynamic Frame Length Computations
                         actions = scene.get("kinetic_actions", [])
                         if not actions: actions = ["The subject moves dynamically across the cinematic scene."]
                         
@@ -434,20 +449,22 @@ NODE_CLASS_MAPPINGS = {
                             
                         local_prompts_str = "\n".join(local_prompts_list)
                         
+                        # Store in dict for next pass
                         scene["_timeline_data_str"] = timeline_data_str
                         scene["_local_prompts_str"] = local_prompts_str
                         scene["_total_frames"] = total_frames
+                        scene["_img_dir"] = scene_img_dir
                         scene["_seed"] = scene.get("seed", int(time.time() * 1000) % 1000000)
 
                     # ==============================================================================
-                    # PASS 1: TEXT ENCODING & DYNAMIC LORA MATRIX BATCHING
+                    # PASS 1: TEXT ENCODING, IC-LORAS & DYNAMIC LORA MATRIX BATCHING
                     # ==============================================================================
-                    print("\n[Two-Pass System] 🎬 PASS 1 START: Initiating Text Encoding & LoRA Multiplier Matrix...")
+                    print("\n[Two-Pass System] 🎬 PASS 1 START: Initiating Text Encoding, IC-LoRAs & Matrix Mapping...")
                     pass1_workflow = json.loads(json.dumps(subgraph_1))
                     
                     if "98" in pass1_workflow: 
                         pass1_workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
-                        pass1_workflow["98"]["inputs"]["weight_dtype"] = "fp8_e4m3fn" # 🛡️ FORCES SAGEATTENTION/FLASHATTENTION TO PREVENT THE 15-SECOND BUGS
+                        pass1_workflow["98"]["inputs"]["weight_dtype"] = "fp8_e4m3fn"
                         
                     if "97" in pass1_workflow: pass1_workflow["97"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                     if "102" in pass1_workflow: pass1_workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
@@ -455,11 +472,18 @@ NODE_CLASS_MAPPINGS = {
                         pass1_workflow["101"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
                         pass1_workflow["101"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
 
+                    # Pop nodes so we can duplicate them cleanly per scene logic
                     tpl_107 = pass1_workflow.pop("107", None)
                     tpl_200 = pass1_workflow.pop("200", None)
                     tpl_46 = pass1_workflow.pop("46", None)
                     tpl_94_5 = pass1_workflow.pop("94:5", None)
                     tpl_300 = pass1_workflow.pop("300", None)
+                    tpl_351 = pass1_workflow.pop("351", None)
+                    tpl_352 = pass1_workflow.pop("352", None)
+                    tpl_353 = pass1_workflow.pop("353", None)
+                    tpl_354 = pass1_workflow.pop("354", None)
+                    tpl_320 = pass1_workflow.pop("320", None)
+                    tpl_330 = pass1_workflow.pop("330", None)
 
                     camera_loras_map = {
                         "dolly_in": "ltx-2-19b-lora-camera-control-dolly-in.safetensors",
@@ -472,7 +496,7 @@ NODE_CLASS_MAPPINGS = {
                     }
 
                     for idx, scene in enumerate(batch_scenes):
-                        # 1. Deno Multi Lora Loader (Node 107) - Hardcoded Styles + Dynamic Cameras
+                        # 1. Deno Multi Lora Loader (Node 107) - Adding HARDCUT LoRA natively.
                         scene_107 = json.loads(json.dumps(tpl_107))
                         scene_107["inputs"]["lora_1"] = "LTX_2.3_Crisp_Enhance_Style_LoRa.safetensors"
                         scene_107["inputs"]["strength_1"] = 0.5
@@ -480,6 +504,10 @@ NODE_CLASS_MAPPINGS = {
                         scene_107["inputs"]["strength_2"] = 0.7
                         scene_107["inputs"]["lora_3"] = "LTX_2.3_Soft_Enhance_Style_LoRa.safetensors"
                         scene_107["inputs"]["strength_3"] = 0.5
+                        # ---> HARDCODED CINEMATIC HARDCUT LORA <---
+                        scene_107["inputs"]["lora_4"] = "LTX-2.3_Cinematic_hardcut.safetensors"
+                        scene_107["inputs"]["strength_4"] = 0.75 
+                        scene_107["inputs"]["enabled_4"] = True
 
                         active_cameras = []
                         cam_string = scene.get("camera", "")
@@ -492,9 +520,9 @@ NODE_CLASS_MAPPINGS = {
                         if not active_cameras:
                             active_cameras.append(camera_loras_map["static"])
 
-                        # Map up to 3 camera LoRAs to slots 4, 5, 6
+                        # Map up to 3 camera LoRAs to slots 5, 6, 7
                         for i in range(3):
-                            slot = i + 4
+                            slot = i + 5
                             if i < len(active_cameras):
                                 scene_107["inputs"][f"lora_{slot}"] = active_cameras[i]
                                 scene_107["inputs"][f"strength_{slot}"] = 1.0
@@ -513,34 +541,78 @@ NODE_CLASS_MAPPINGS = {
                         scene_200["inputs"]["clip"] = [f"107_{idx}", 1]
                         pass1_workflow[f"200_{idx}"] = scene_200
 
-                        # 3. LTX Director (Node 46) 
+                        # 3. IC-LoRAs Injection Series (353 & 354)
+                        scene_353 = json.loads(json.dumps(tpl_353))
+                        scene_353["inputs"]["model"] = [f"107_{idx}", 0]
+                        scene_353["inputs"]["lora_name"] = "ltx-2.3-22b-ic-lora-refocus.safetensors"
+                        scene_353["inputs"]["strength_model"] = 1.0
+                        pass1_workflow[f"353_{idx}"] = scene_353
+
+                        scene_354 = json.loads(json.dumps(tpl_354))
+                        scene_354["inputs"]["model"] = [f"353_{idx}", 0]
+                        scene_354["inputs"]["lora_name"] = "LTX2.3-Licon-MSR-test_version.safetensors"
+                        scene_354["inputs"]["strength_model"] = 1.0
+                        pass1_workflow[f"354_{idx}"] = scene_354
+
+                        # 4. LTX Director (Node 46) 
                         scene_46 = json.loads(json.dumps(tpl_46))
                         scene_46["inputs"]["duration_frames"] = scene["_total_frames"]
                         scene_46["inputs"]["local_prompts"] = scene["_local_prompts_str"]
                         scene_46["inputs"]["timeline_data"] = scene["_timeline_data_str"]
-                        scene_46["inputs"]["model"] = [f"107_{idx}", 0]
+                        scene_46["inputs"]["model"] = [f"354_{idx}", 0] # Model wired from IC-LoRAs
                         scene_46["inputs"]["clip"] = [f"107_{idx}", 1]
-                        
-                        # 🛡️ INJECTS YOUTUBE SHORTS (9:16) DIMENSIONS SO IT STAYS FAST
                         scene_46["inputs"]["custom_width"] = custom_w
                         scene_46["inputs"]["custom_height"] = custom_h
                         scene_46["inputs"]["frame_rate"] = 24 
-                        
                         pass1_workflow[f"46_{idx}"] = scene_46
 
-                        # 4. Conditioning Matrix (Node 94:5)
+                        # 5. Deno Multi Image Loader (Node 351) -> Targets the scene_img_dir automatically!
+                        scene_351 = json.loads(json.dumps(tpl_351))
+                        scene_351["inputs"]["image_paths"] = scene["_img_dir"]
+                        scene_351["inputs"]["width"] = custom_w
+                        scene_351["inputs"]["height"] = custom_h
+                        pass1_workflow[f"351_{idx}"] = scene_351
+
+                        # 6. Conditioning Matrix (Node 94:5)
                         scene_94_5 = json.loads(json.dumps(tpl_94_5))
                         scene_94_5["inputs"]["positive"] = [f"46_{idx}", 1]
                         scene_94_5["inputs"]["negative"] = [f"200_{idx}", 0]
                         scene_94_5["inputs"]["frame_rate"] = [f"46_{idx}", 5]
                         pass1_workflow[f"94:5_{idx}"] = scene_94_5
 
-                        # 5. Memory Writer (Node 300) - Saves Pos & Neg to RAM
+                        # 7. Licon MSR (Node 320)
+                        scene_320 = json.loads(json.dumps(tpl_320))
+                        scene_320["inputs"]["1"] = [f"351_{idx}", 0]
+                        scene_320["inputs"]["2"] = [f"351_{idx}", 0]
+                        scene_320["inputs"]["3"] = [f"351_{idx}", 0]
+                        scene_320["inputs"]["4"] = [f"351_{idx}", 0]
+                        scene_320["inputs"]["width"] = custom_w
+                        scene_320["inputs"]["height"] = custom_h
+                        scene_320["inputs"]["frame_count"] = scene["_total_frames"]
+                        pass1_workflow[f"320_{idx}"] = scene_320
+
+                        # 8. IC-LoRA Guide Injection (Node 330)
+                        scene_330 = json.loads(json.dumps(tpl_330))
+                        scene_330["inputs"]["positive"] = [f"94:5_{idx}", 0]
+                        scene_330["inputs"]["negative"] = [f"94:5_{idx}", 1]
+                        scene_330["inputs"]["latent"] = [f"46_{idx}", 2]
+                        scene_330["inputs"]["image"] = [f"320_{idx}", 0]
+                        pass1_workflow[f"330_{idx}"] = scene_330
+
+                        # 9. Sequencer Integration (Node 352)
+                        scene_352 = json.loads(json.dumps(tpl_352))
+                        scene_352["inputs"]["positive"] = [f"330_{idx}", 0]
+                        scene_352["inputs"]["negative"] = [f"330_{idx}", 1]
+                        scene_352["inputs"]["latent"] = [f"330_{idx}", 2]
+                        scene_352["inputs"]["multi_input"] = [f"351_{idx}", 0]
+                        pass1_workflow[f"352_{idx}"] = scene_352
+
+                        # 10. Memory Writer (Node 300) - Saves Final Encoded Output to RAM
                         scene_300 = json.loads(json.dumps(tpl_300))
                         scene_300["inputs"]["model"] = [f"46_{idx}", 0]
-                        scene_300["inputs"]["positive"] = [f"94:5_{idx}", 0]
-                        scene_300["inputs"]["negative"] = [f"94:5_{idx}", 1]
-                        scene_300["inputs"]["video_latent"] = [f"46_{idx}", 2]
+                        scene_300["inputs"]["positive"] = [f"352_{idx}", 0]
+                        scene_300["inputs"]["negative"] = [f"352_{idx}", 1]
+                        scene_300["inputs"]["video_latent"] = [f"352_{idx}", 2]
                         scene_300["inputs"]["audio_latent"] = [f"46_{idx}", 3]
                         scene_300["inputs"]["guide_data"] = [f"46_{idx}", 4]
                         scene_300["inputs"]["frame_rate"] = [f"46_{idx}", 5]
@@ -571,7 +643,7 @@ NODE_CLASS_MAPPINGS = {
                         if "94:105" in pass2_workflow: pass2_workflow["94:105"]["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
 
                         # Set target Scene ID for Memory Cache Reader
-                        if "400" in pass2_workflow: pass2_workflow["400"]["inputs"]["scene_id"] = str(idx)
+                        if "400" in pass2_workflow: pass2_workflow["400"]["inputs"]["cache_id"] = str(idx)
 
                         # Set Noise Seeds
                         scene_seed = scene["_seed"]
@@ -598,16 +670,11 @@ NODE_CLASS_MAPPINGS = {
                             pass2_workflow["109"]["inputs"]["frame_rate"] = 24
                             if "pingpong" in pass2_workflow["109"]["inputs"]:
                                 pass2_workflow["109"]["inputs"]["pingpong"] = False
-
-                        # 3. Dynamic Color Fixer Injection
-                        if "109" in pass2_workflow and "images" in pass2_workflow["109"]["inputs"]:
-                            original_image_source = pass2_workflow["109"]["inputs"]["images"]
-                            fixer_id = f"9999_color_fixer_{idx}"
-                            pass2_workflow[fixer_id] = {
-                                "class_type": "LTXColorFixer",
-                                "inputs": {"image": original_image_source, "target_brightness": 0.40, "max_boost": 2.0}
-                            }
-                            pass2_workflow["109"]["inputs"]["images"] = [fixer_id, 0]
+                                
+                        # 3. EasyColorCorrector Configuration
+                        if "401" in pass2_workflow:
+                            pass2_workflow["401"]["inputs"]["effect_strength"] = 0.6
+                            pass2_workflow["401"]["inputs"]["pop_factor"] = 0.7
 
                         await self.execute_comfy_workflow(session, pass2_workflow)
 

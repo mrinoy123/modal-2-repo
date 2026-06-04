@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "361"  # Bumping this forces Modal to rebuild and fix the transformers bug
+    "FORCE_REBUILD_INDEX": "362"  # Bumping this forces Modal to rebuild and apply the final fix
 })
 
 # ==============================================================================
@@ -53,7 +53,6 @@ build_image = base_image.env({
 # ==============================================================================
 torch_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124",
-    # 🛡️ FIX APPLIED HERE: Pinned transformers==4.47.1 to prevent the float8_e8m0fnu PyTorch 2.6.0 crash
     "python3.12 -m pip install --no-cache-dir diffusers accelerate transformers==4.47.1 torchsde numpy==1.26.4 kornia==0.7.3",
     "python3.12 -m pip install --no-cache-dir sageattention==1.0.6"
 )
@@ -73,7 +72,9 @@ deps_image = clone_image.run_commands(
     "sed -i '/torch/d' /workspace/ComfyUI/requirements.txt",
     r"find /workspace/ComfyUI/custom_nodes -name 'requirements.txt' -exec sed -i '/torch/d' {} \;",
     "python3.12 -m pip install --no-cache-dir -r /workspace/ComfyUI/requirements.txt",
-    r"find /workspace/ComfyUI/custom_nodes -name 'requirements.txt' -exec python3.12 -m pip install --no-cache-dir -r {} \;"
+    r"find /workspace/ComfyUI/custom_nodes -name 'requirements.txt' -exec python3.12 -m pip install --no-cache-dir -r {} \;",
+    # 🛡️ THE FIX: Forcefully revert transformers back to 4.47.1 after custom nodes try to upgrade it!
+    "python3.12 -m pip install --no-cache-dir transformers==4.47.1"
 )
 
 final_image = deps_image.run_commands(

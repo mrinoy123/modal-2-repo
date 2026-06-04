@@ -2,6 +2,7 @@
 # PART 1: WORKFLOW IDENTITY & INTERACTIVE TRIGGERS
 # Purpose: Define the action namespace and configure structural choice selection
 #          inputs for isolated cloud runtime deployment targeting Account 2.
+#          Includes the new toggle target for the simplified workflow matrix.
 # ==============================================================================
 name: 🚀 Deploy API Engines to Modal (Account 2)
 
@@ -14,6 +15,7 @@ on:
         default: 'ltx23-all-workflow'
         type: choice
         options:
+          - working-director-ltx23-simpleworkflow
           - ltx23-all-workflow
           - LTX-23-new
           - ltx-19b
@@ -22,6 +24,7 @@ on:
 # ==============================================================================
 # PART 2: ISOLATED DEPLOYMENT ENVIRONMENT ORCHESTRATION
 # Purpose: Provision fresh runner compute nodes and inject isolated access keys.
+#          Establishes a synchronized environment runner with custom dependency layers.
 # ==============================================================================
 jobs:
   deploy:
@@ -44,6 +47,7 @@ jobs:
 # PART 3: TARGET ROUTING EVALUATION LOGIC
 # Purpose: Execute execution branches matching target boundaries cleanly, 
 #          ensuring fresh environments are generated out-of-the-box.
+#          Handles mapping for both simple and complex workflow scripts natively.
 # ==============================================================================
       - name: Deploy Selected API Engine
         # Maps the unique Account 2 secrets in GitHub to what Modal expects
@@ -52,7 +56,12 @@ jobs:
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET_2 }}
           TARGET: ${{ github.event.inputs.target }}
         run: |
-          if [ "$TARGET" = "ltx23-all-workflow" ]; then
+          if [ "$TARGET" = "working-director-ltx23-simpleworkflow" ]; then
+            echo "🚀 Deploying working-director-ltx23-simpleworkflow Video API to Account 2..."
+            echo "ℹ️ This execution thread establishes an independent, unshared container snapshot image."
+            modal deploy working-director-ltx23-simpleworkflow.py
+
+          elif [ "$TARGET" = "ltx23-all-workflow" ]; then
             echo "🚀 Deploying completely brand-new ltx23-all-workflow Video API to Account 2..."
             echo "ℹ️ This execution thread establishes an independent, unshared container snapshot image."
             modal deploy ltx23-all-workflow.py

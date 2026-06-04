@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "364"  # Bumping ensures invalidation of the old transformers installation
+    "FORCE_REBUILD_INDEX": "365"  # Bumping ensures we wipe the corrupted main.py and build clean
 })
 
 # ==============================================================================
@@ -79,6 +79,10 @@ deps_image = clone_image.run_commands(
 final_image = deps_image.run_commands(
     "echo '' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     "echo 'sageattn_qk_int8_pv_fp16_triton = sageattn' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
+    
+    # 🛡️ THE PERMANENT FIX: We inject the PyTorch 2.6 property directly into the base torch library.
+    # This completely solves the transformers>=4.49.0 crash WITHOUT breaking ComfyUI's VRAM/CUDA boot sequence!
+    "echo 'float8_e8m0fnu = int8' >> /usr/local/lib/python3.12/site-packages/torch/__init__.py",
     env={
         "CUDA_HOME": "/usr/local/cuda",
         "PATH": "/usr/local/cuda/bin:" + os.environ.get("PATH", ""),
@@ -121,12 +125,7 @@ class LTX23Engine:
     @modal.enter()
     def start_comfy(self):
         import boto3
-        import torch
         
-        # 🛡️ SYSTEM FIX: Hotfix container memory space before imports trigger
-        if not hasattr(torch, 'float8_e8m0fnu'):
-            torch.float8_e8m0fnu = torch.int8
-
         # 🔥 CUSTOM NODES: LTXColorFixer, Two-Pass Cache Writers & VAE Armor Patch 🔥
         print("🎨 Injecting Smart Nodes, Caches & VAE Memory Protections...")
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline.py"
@@ -268,18 +267,6 @@ NODE_CLASS_MAPPINGS = {
 
         print("🚀 Launching Two-Pass Server Engine on L40S GPU (48GB Native)...")
         os.makedirs("/tmp/comfy_swap", exist_ok=True)
-
-        # 🛡️ THE NATIVE HOTFIX: Force-inject the float8 attribute directly into main.py before launching subprocess
-        # This protects the subprocess from crashing while keeping Gemma 3 compatible via latest transformers
-        main_py_path = "/workspace/ComfyUI/main.py"
-        if os.path.exists(main_py_path):
-            with open(main_py_path, "r") as f:
-                main_content = f.read()
-            if "float8_e8m0fnu" not in main_content:
-                patch_code = "import torch\nif not hasattr(torch, 'float8_e8m0fnu'): torch.float8_e8m0fnu = torch.int8\n"
-                with open(main_py_path, "w") as f:
-                    f.write(patch_code + main_content)
-                print("⚡ Dynamic Transformers crash protection injected into main.py safely.")
 
         env_vars = os.environ.copy()
         env_vars["LD_PRELOAD"] = "/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4"

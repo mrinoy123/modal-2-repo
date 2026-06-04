@@ -184,6 +184,8 @@ class MemoryCacheWriter:
             "model": ("MODEL",),
             "positive": ("CONDITIONING",),
             "negative": ("CONDITIONING",),
+            "audio_positive": ("CONDITIONING",),
+            "audio_negative": ("CONDITIONING",),
             "video_latent": ("LATENT",),
             "audio_latent": ("LATENT",),
             "guide_data": ("GUIDE_DATA",),
@@ -195,18 +197,20 @@ class MemoryCacheWriter:
     FUNCTION = "write_cache"
     CATEGORY = "LTXBatch"
 
-    def write_cache(self, model, positive, negative, video_latent, audio_latent, guide_data, frame_rate, scene_id):
+    def write_cache(self, model, positive, negative, audio_positive, audio_negative, video_latent, audio_latent, guide_data, frame_rate, scene_id):
         global LTX_CACHE
         LTX_CACHE[str(scene_id)] = {
             "model": model, 
             "positive": positive,
             "negative": negative,
+            "audio_positive": audio_positive,
+            "audio_negative": audio_negative,
             "video_latent": video_latent,
             "audio_latent": audio_latent,
             "guide_data": guide_data,
             "frame_rate": frame_rate
         }
-        print(f"\\n[Two-Pass System] 💾 Encoded & Saved Conditionings for Scene {scene_id} into RAM\\n")
+        print(f"\\n[Two-Pass System] 💾 Encoded & Saved Multi-Conditionings (Visual & Audio) for Scene {scene_id} into RAM\\n")
         return ()
 
 class MemoryCacheReader:
@@ -215,8 +219,8 @@ class MemoryCacheReader:
         return {"required": {
             "scene_id": ("STRING", {"default": "0"})
         }}
-    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "LATENT", "GUIDE_DATA", "FLOAT")
-    RETURN_NAMES = ("model", "positive", "negative", "video_latent", "audio_latent", "guide_data", "frame_rate")
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "CONDITIONING", "CONDITIONING", "LATENT", "LATENT", "GUIDE_DATA", "FLOAT")
+    RETURN_NAMES = ("model", "positive", "negative", "audio_positive", "audio_negative", "video_latent", "audio_latent", "guide_data", "frame_rate")
     FUNCTION = "read_cache"
     CATEGORY = "LTXBatch"
 
@@ -225,8 +229,8 @@ class MemoryCacheReader:
         data = LTX_CACHE.get(str(scene_id))
         if data is None:
             raise ValueError(f"Cache for Scene {scene_id} not found in RAM! Text Encoder Pass failed.")
-        print(f"\\n[Two-Pass System] 🚀 Loaded Pre-Cached Conditionings for Scene {scene_id}\\n")
-        return (data["model"], data["positive"], data["negative"], data["video_latent"], data["audio_latent"], data["guide_data"], data["frame_rate"])
+        print(f"\\n[Two-Pass System] 🚀 Loaded Pre-Cached Multi-Conditionings for Scene {scene_id}\\n")
+        return (data["model"], data["positive"], data["negative"], data["audio_positive"], data["audio_negative"], data["video_latent"], data["audio_latent"], data["guide_data"], data["frame_rate"])
 
 class FastVAEDecode(nodes.VAEDecode):
     def decode(self, vae, samples):
@@ -586,9 +590,24 @@ NODE_CLASS_MAPPINGS = {
                                     new_node["inputs"]["width"] = custom_w
                                 if not isinstance(new_node["inputs"].get("height"), list):
                                     new_node["inputs"]["height"] = custom_h
+
+                            elif c_type == "LTXICLoRALoaderModelOnly":
+                                # Safely inject Missing Model files for Licon-MSR / IC LoRA based on ID bindings
+                                if n_id == "9408":
+                                    new_node["inputs"]["lora_name"] = "LTX2.3-Licon-MSR-test_version.safetensors"
+                                elif n_id == "9407":
+                                    new_node["inputs"]["lora_name"] = "ltx-2.3-22b-ic-lora-refocus.safetensors"
+                                else:
+                                    new_node["inputs"]["lora_name"] = "ltx-2.3-22b-ic-lora-refocus.safetensors"
                                     
-                            elif c_type == "CLIPTextEncode" and (n_id == "200" or "no humans" in str(new_node.get("inputs", {}).get("text", ""))):
-                                new_node["inputs"]["text"] = scene.get("negative_prompt", "no humans, bad quality, distorted, blurry, watermark")
+                            elif c_type == "CLIPTextEncode":
+                                current_text = str(new_node.get("inputs", {}).get("text", "")).lower()
+                                if n_id == "200" or "no humans" in current_text:
+                                    new_node["inputs"]["text"] = scene.get("negative_prompt", "no humans, bad quality, distorted, blurry, watermark")
+                                elif n_id == "201" or "audio" in current_text:
+                                    new_node["inputs"]["text"] = scene.get("audio_prompt", "cinematic sound design, high quality clear audio")
+                                elif n_id == "202" or "static" in current_text:
+                                    new_node["inputs"]["text"] = scene.get("audio_negative_prompt", "noise, static, distorted audio")
                                 
                             elif c_type == "CR LoRA Stack" or n_id == "107":
                                 new_node["inputs"]["lora_1"] = "LTX_2.3_Crisp_Enhance_Style_LoRa.safetensors"

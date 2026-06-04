@@ -177,6 +177,17 @@ class LTXColorFixer:
 
 LTX_CACHE = {}
 
+def recursive_cpu(item):
+    if isinstance(item, torch.Tensor):
+        return item.cpu()
+    elif isinstance(item, dict):
+        return {k: recursive_cpu(v) for k, v in item.items()}
+    elif isinstance(item, list):
+        return [recursive_cpu(x) for x in item]
+    elif isinstance(item, tuple):
+        return tuple(recursive_cpu(x) for x in item)
+    return item
+
 class MemoryCacheWriter:
     @classmethod
     def INPUT_TYPES(s):
@@ -197,16 +208,23 @@ class MemoryCacheWriter:
 
     def write_cache(self, model, positive, negative, video_latent, audio_latent, guide_data, frame_rate, scene_id):
         global LTX_CACHE
+        # Recursively offload all tensors to CPU to prevent silent VRAM leaks before UNet sampling!
         LTX_CACHE[str(scene_id)] = {
             "model": model, 
-            "positive": positive,
-            "negative": negative,
-            "video_latent": video_latent,
-            "audio_latent": audio_latent,
-            "guide_data": guide_data,
+            "positive": recursive_cpu(positive),
+            "negative": recursive_cpu(negative),
+            "video_latent": recursive_cpu(video_latent),
+            "audio_latent": recursive_cpu(audio_latent),
+            "guide_data": recursive_cpu(guide_data),
             "frame_rate": frame_rate
         }
-        print(f"\\n[Two-Pass System] 💾 Encoded & Saved Conditionings for Scene {scene_id} into RAM\\n")
+        
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        print(f"\\n[Two-Pass System] 💾 Encoded & Saved Conditionings (CPU Offloaded) for Scene {scene_id} into RAM\\n")
         return ()
 
 class MemoryCacheReader:
@@ -275,7 +293,8 @@ NODE_CLASS_MAPPINGS = {
         env_vars["LD_PRELOAD"] = "/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4"
         env_vars["TORCH_NUM_THREADS"] = "1"
         env_vars["OMP_NUM_THREADS"] = "1"
-        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:64"
+        # CLEANED ALLOCATOR FIX: Keeps PyTorch from holding fragmented memory during large frame generation
+        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
         env_vars["CUDA_MODULE_LOADING"] = "LAZY" 
         
         self.process = subprocess.Popen([
@@ -636,7 +655,11 @@ NODE_CLASS_MAPPINGS = {
 
                     print(f"🚀 Queuing Math Encoding Pass for {len(batch_scenes)} Scenes simultaneously...")
                     await self.execute_comfy_workflow(session, pass1_workflow)
-                    await self.clear_comfy_memory(session, unload_models=False)
+                    
+                    # 🔥 THE BULLET FIX FOR THE OOM ISSUE 🔥
+                    # By passing unload_models=True here, we completely wipe the 12B Gemma Model from VRAM
+                    # allowing the 22B UNet the entire 48GB GPU space to blast out the 258 frame samples!
+                    await self.clear_comfy_memory(session, unload_models=True)
 
                     # ==============================================================================
                     # PASS 2: THE SAMPLING BLAST (Iterative per scene)
@@ -719,7 +742,7 @@ NODE_CLASS_MAPPINGS = {
                             "public_url": public_path_url,
                             "filename": saved_filename
                         })
-                        await self.clear_comfy_memory(session, unload_models=False)
+                        await self.clear_comfy_memory(session, unload_models=True)
                     
                     return generated_outputs
 

@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "366"  # Bumping for safe runtime cache refresh
+    "FORCE_REBUILD_INDEX": "366"  # Refreshes container build cache completely
 })
 
 # ==============================================================================
@@ -286,7 +286,7 @@ NODE_CLASS_MAPPINGS = {
                 time.sleep(2)
                 
         if not comfy_ready: os._exit(1)
-        print("✅ Base pipeline active. Awaiting Two-Pass API Batch triggers.")
+        print("Base pipeline active. Awaiting Two-Pass API Batch triggers.")
 
     async def clear_comfy_memory(self, session, unload_models=False):
         try:
@@ -341,6 +341,9 @@ NODE_CLASS_MAPPINGS = {
             elif "body" in body: body = body["body"]
 
         async def process_pipeline():
+            from urllib.parse import urlparse
+            import botocore.exceptions
+
             date_folder = body.get("date_folder", time.strftime('%Y-%m-%d'))
             batch_scenes = body.get("batch_scenes", [])
             subgraph_1 = body.get("subgraph_1")
@@ -349,7 +352,6 @@ NODE_CLASS_MAPPINGS = {
             if not batch_scenes: raise HTTPException(status_code=400, detail="Missing batch_scenes array.")
             if not subgraph_1 or not subgraph_2: raise HTTPException(status_code=400, detail="Missing Subgraph definitions.")
 
-            # 🛡️ THE FIX: Restoring ABSOLUTE path logic required by DenoMultiImageLoader custom node
             dynamic_guides_dir = "/workspace/ComfyUI/input/dynamic_guides"
             if os.path.exists(dynamic_guides_dir): shutil.rmtree(dynamic_guides_dir)
             os.makedirs(dynamic_guides_dir, exist_ok=True)
@@ -366,7 +368,6 @@ NODE_CLASS_MAPPINGS = {
                     # PRE-COMPUTE: Download ALL Reference Images & Calculate Dimensions
                     # ==============================================================================
                     for idx, scene in enumerate(batch_scenes):
-                        # 🛡️ Deno Loader Absolute Map Applied Here
                         scene_img_dir = os.path.join(dynamic_guides_dir, f"scene_{idx}")
                         os.makedirs(scene_img_dir, exist_ok=True)
                         
@@ -374,31 +375,64 @@ NODE_CLASS_MAPPINGS = {
                         if not image_urls and scene.get("image_url"):
                             image_urls = [scene.get("image_url")]
 
+                        segments = []
+
                         if not image_urls:
+                            # Fallback dummy black image if none provided
                             target_path = os.path.join(scene_img_dir, "default.png")
                             from PIL import Image
                             Image.new('RGB', (custom_w, custom_h), color='black').save(target_path)
                             segments = [{"frame": 0, "image": ""}, {"frame": 1, "image": ""}]
                         else:
-                            segments = []
-                            for img_i, url in enumerate(image_urls):
+                            for img_i, url_str in enumerate(image_urls):
                                 target_path = os.path.join(scene_img_dir, f"img_{img_i}.png")
                                 try:
-                                    async with session.get(url, timeout=120) as r:
-                                        if r.status == 200:
-                                            with open(target_path, "wb") as f: f.write(await r.read())
-                                            from PIL import Image
-                                            img = Image.open(target_path).convert("RGB")
-                                            img = img.resize((custom_w, custom_h), Image.Resampling.LANCZOS)
-                                            img.save(target_path)
-                                            
-                                            if img_i == 0:
-                                                with open(target_path, "rb") as f:
-                                                    b64_img = base64.b64encode(f.read()).decode("utf-8")
-                                                    segments.append({"frame": 0, "image": f"data:image/png;base64,{b64_img}"})
-                                                    segments.append({"frame": 1, "image": f"data:image/png;base64,{b64_img}"})
+                                    parsed = urlparse(url_str)
+                                    # 🛡️ AUTHENTICATED DOWNLOAD MANAGER FOR CLOUDFLARE R2
+                                    if "r2.cloudflarestorage.com" in url_str or "pub-" in url_str or parsed.netloc == "" or not parsed.scheme:
+                                        file_key = parsed.path.lstrip('/')
+                                        while "//" in file_key: file_key = file_key.replace("//", "/")
+                                        print(f"📥 Authenticating and downloading R2 Asset Key: {file_key}")
+                                        await asyncio.get_event_loop().run_in_executor(
+                                            None, 
+                                            self.s3.download_file, 
+                                            "video-asset-files-storage-workflow", 
+                                            file_key, 
+                                            target_path
+                                        )
+                                    else:
+                                        print(f"📥 Downloading public URL: {url_str}")
+                                        async with session.get(url_str, timeout=120) as r:
+                                            if r.status == 200:
+                                                with open(target_path, "wb") as f: f.write(await r.read())
+                                            else:
+                                                print(f"[Warning] HTTP status {r.status} for URL: {url_str}")
+                                except botocore.exceptions.ClientError as e:
+                                    print(f"[Warning] R2 ClientError downloading {url_str}: {e}")
                                 except Exception as e:
-                                    print(f"Failed to download image {url}: {e}")
+                                    print(f"[Warning] Unexpected error downloading {url_str}: {e}")
+                                
+                                # 🛡️ IRONCLAD VALIDATION SAFETY NET: Generate placeholder image if download failed
+                                if not os.path.exists(target_path) or os.path.getsize(target_path) == 0:
+                                    from PIL import Image
+                                    Image.new('RGB', (custom_w, custom_h), color='black').save(target_path)
+                                    print(f"[Fallback] Successfully protected pipeline with blank placeholder image at: {target_path}")
+                                else:
+                                    try:
+                                        from PIL import Image
+                                        img = Image.open(target_path).convert("RGB")
+                                        img = img.resize((custom_w, custom_h), Image.Resampling.LANCZOS)
+                                        img.save(target_path)
+                                    except Exception as img_err:
+                                        print(f"PIL processing failed, reverting to placeholder: {img_err}")
+                                        from PIL import Image
+                                        Image.new('RGB', (custom_w, custom_h), color='black').save(target_path)
+
+                                if img_i == 0 and os.path.exists(target_path):
+                                    with open(target_path, "rb") as f:
+                                        b64_img = base64.b64encode(f.read()).decode("utf-8")
+                                        segments.append({"frame": 0, "image": f"data:image/png;base64,{b64_img}"})
+                                        segments.append({"frame": 1, "image": f"data:image/png;base64,{b64_img}"})
                         
                         timeline_data_str = json.dumps({"segments": segments, "audioSegments": []})
 
@@ -441,7 +475,7 @@ NODE_CLASS_MAPPINGS = {
                         scene["_local_prompts_str"] = local_prompts_str
                         scene["_total_frames"] = total_frames
                         scene["_msr_frames"] = msr_frames
-                        scene["_img_dir"] = scene_img_dir  # 🛡️ Passing the full Absolute Path 
+                        scene["_img_dir"] = scene_img_dir  
                         scene["_seed"] = scene.get("seed", int(time.time() * 1000) % 1000000)
 
                     # ==============================================================================
@@ -542,9 +576,8 @@ NODE_CLASS_MAPPINGS = {
                         scene_46["inputs"]["frame_rate"] = 24 
                         pass1_workflow[f"46_{idx}"] = scene_46
 
-                        # 🛡️ THE FIX APPLIED IN MATRIX MAPPING:
                         scene_351 = json.loads(json.dumps(tpl_351))
-                        scene_351["inputs"]["image_paths"] = scene["_img_dir"]  # Passes Exact Absolute System Path
+                        scene_351["inputs"]["image_paths"] = scene["_img_dir"]  
                         scene_351["inputs"]["width"] = custom_w
                         scene_351["inputs"]["height"] = custom_h
                         pass1_workflow[f"351_{idx}"] = scene_351

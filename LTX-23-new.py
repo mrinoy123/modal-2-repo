@@ -14,6 +14,7 @@ import asyncio
 import ctypes
 import base64
 import math
+import re
 from fastapi import Request, Response, HTTPException, Header
 from fastapi.responses import StreamingResponse
 from typing import Optional
@@ -29,7 +30,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "366"  # Refreshes container build cache completely
+    "FORCE_REBUILD_INDEX": "368"  # Bumping for fresh build
 })
 
 # ==============================================================================
@@ -122,6 +123,22 @@ class LTX23Engine:
     def start_comfy(self):
         import boto3
         
+        # 🛡️ THE MASTER FIX: Monkey-patch LiconMSR to remove the 41-frame limit!
+        # By converting the hardcoded combo box [17, 25, 33, 41] into an unbounded "INT",
+        # the node will accept our full 257+ frames perfectly.
+        msr_path = "/workspace/ComfyUI/custom_nodes/ComfyUI-Licon-MSR/licon_msr.py"
+        if os.path.exists(msr_path):
+            try:
+                with open(msr_path, "r") as f:
+                    content = f.read()
+                # Replace exact match of the list with "INT"
+                content = re.sub(r'\[\s*17\s*,\s*25\s*,\s*33\s*,\s*41\s*\]', '"INT"', content)
+                with open(msr_path, "w") as f:
+                    f.write(content)
+                print("⚡ HACK SUCCESS: Unlocked LiconMSR frame_count limit to allow INFINITE video length!")
+            except Exception as e:
+                print(f"⚠️ Failed to patch LiconMSR: {e}")
+
         print("🎨 Injecting Smart Nodes, Caches & VAE Memory Protections...")
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline.py"
         with open(custom_nodes_path, "w") as f:
@@ -361,10 +378,13 @@ NODE_CLASS_MAPPINGS = {
 
             try:
                 async with aiohttp.ClientSession() as session:
-                    custom_w = body.get("custom_width", 576)
-                    custom_h = body.get("custom_height", 1024)
+                    # Dimensions locked to multiples of 32 for UNet safety
+                    custom_w = int(body.get("custom_width", 576))
+                    custom_h = int(body.get("custom_height", 1024))
+                    custom_w = (custom_w // 32) * 32
+                    custom_h = (custom_h // 32) * 32
 
-# ==============================================================================
+                    # ==============================================================================
                     # PRE-COMPUTE: Download ALL Reference Images & Calculate Dimensions
                     # ==============================================================================
                     for idx, scene in enumerate(batch_scenes):
@@ -372,8 +392,6 @@ NODE_CLASS_MAPPINGS = {
                         scene_img_dir = os.path.join("/workspace/ComfyUI/input", relative_scene_dir)
                         os.makedirs(scene_img_dir, exist_ok=True)
                         
-                        # 🛡️ THE FIX 1: Generate a pure black image for the background!
-                        # This satisfies the node's requirement but lets the AI hallucinate the background from the prompt.
                         bg_path = os.path.join(scene_img_dir, "black_bg.png")
                         from PIL import Image
                         Image.new('RGB', (custom_w, custom_h), color='black').save(bg_path)
@@ -384,19 +402,18 @@ NODE_CLASS_MAPPINGS = {
                             image_urls = [scene.get("image_url")]
 
                         segments = []
-                        valid_relative_paths = []  # 🛡️ THE FIX: Array to store exact file paths
+                        valid_relative_paths = []
 
                         if not image_urls:
                             target_path = os.path.join(scene_img_dir, "default.png")
                             rel_path = f"{relative_scene_dir}/default.png"
-                            from PIL import Image
                             Image.new('RGB', (custom_w, custom_h), color='black').save(target_path)
                             segments = [{"frame": 0, "image": ""}, {"frame": 1, "image": ""}]
                             valid_relative_paths.append(rel_path)
                         else:
                             for img_i, url_str in enumerate(image_urls):
                                 target_path = os.path.join(scene_img_dir, f"img_{img_i}.png")
-                                rel_path = f"{relative_scene_dir}/img_{img_i}.png" # Exact relative file path
+                                rel_path = f"{relative_scene_dir}/img_{img_i}.png"
                                 
                                 try:
                                     if url_str.lower().endswith((".jpg", ".jpeg")):
@@ -427,21 +444,17 @@ NODE_CLASS_MAPPINGS = {
                                     print(f"[Warning] Unexpected error downloading {url_str}: {e}")
                                 
                                 if not os.path.exists(target_path) or os.path.getsize(target_path) == 0:
-                                    from PIL import Image
                                     Image.new('RGB', (custom_w, custom_h), color='black').save(target_path)
                                     print(f"[Fallback] Successfully protected pipeline with blank placeholder image at: {target_path}")
                                 else:
                                     try:
-                                        from PIL import Image
                                         img = Image.open(target_path).convert("RGB")
                                         img = img.resize((custom_w, custom_h), Image.Resampling.LANCZOS)
                                         img.save(target_path)
                                     except Exception as img_err:
                                         print(f"PIL processing failed, reverting to placeholder: {img_err}")
-                                        from PIL import Image
                                         Image.new('RGB', (custom_w, custom_h), color='black').save(target_path)
 
-                                # Add to valid paths if it was successfully written
                                 if os.path.exists(target_path):
                                     valid_relative_paths.append(rel_path)
 
@@ -460,17 +473,11 @@ NODE_CLASS_MAPPINGS = {
                         seconds = max(total_words / (130 / 60.0), 2.5)  
                         raw_frames = seconds * 24
                         total_frames = int(math.ceil((raw_frames - 1) / 8) * 8 + 1)
+                        # 🛡️ THE FIX: Unlock the video limit up to 257 frames! (10.7 seconds)
                         total_frames = max(33, min(total_frames, 257))
                         
                         num_actions = len(actions)
                         keyframe_steps = [int(i * (total_frames - 1) / max(1, num_actions - 1)) for i in range(num_actions)]
-
-                        valid_msr_frames = [17, 25, 33, 41]
-                        msr_frames = 41
-                        for vf in reversed(valid_msr_frames):
-                            if total_frames >= vf:
-                                msr_frames = vf
-                                break
 
                         style = scene.get("style", "")
                         subject = scene.get("subject", "")
@@ -490,13 +497,12 @@ NODE_CLASS_MAPPINGS = {
                         
                         scene["_timeline_data_str"] = timeline_data_str
                         scene["_local_prompts_str"] = local_prompts_str
+                        # 🛡️ THE FIX: Pass the exact same frame count to BOTH Director and MSR!
                         scene["_total_frames"] = total_frames
-                        scene["_msr_frames"] = msr_frames
                         
-                        # 🛡️ THE CRITICAL FIX: Join the actual file paths with newlines!
                         scene["_image_paths_str"] = "\n".join(valid_relative_paths)
-                        
                         scene["_seed"] = scene.get("seed", int(time.time() * 1000) % 1000000)
+
                     # ==============================================================================
                     # PASS 1: TEXT ENCODING, IC-LORAS & DYNAMIC LORA MATRIX BATCHING
                     # ==============================================================================
@@ -585,6 +591,7 @@ NODE_CLASS_MAPPINGS = {
                         pass1_workflow[f"354_{idx}"] = scene_354
 
                         scene_46 = json.loads(json.dumps(tpl_46))
+                        # 🛡️ THE FIX: Unlock length passed to the generator!
                         scene_46["inputs"]["duration_frames"] = scene["_total_frames"]
                         scene_46["inputs"]["local_prompts"] = scene["_local_prompts_str"]
                         scene_46["inputs"]["timeline_data"] = scene["_timeline_data_str"]
@@ -607,7 +614,6 @@ NODE_CLASS_MAPPINGS = {
                         scene_94_5["inputs"]["frame_rate"] = [f"46_{idx}", 5]
                         pass1_workflow[f"94:5_{idx}"] = scene_94_5
 
-                         # 🛡️ THE FIX 2: Inject a LoadImage node for our black background canvas
                         bg_loader_id = f"998_bg_{idx}"
                         pass1_workflow[bg_loader_id] = {
                             "class_type": "LoadImage",
@@ -622,7 +628,8 @@ NODE_CLASS_MAPPINGS = {
                         scene_320["inputs"]["background"] = [bg_loader_id, 0]
                         scene_320["inputs"]["width"] = custom_w
                         scene_320["inputs"]["height"] = custom_h
-                        scene_320["inputs"]["frame_count"] = scene["_msr_frames"]
+                        # 🛡️ THE FIX: Unlock length passed to the MSR node (Thanks to our hack!)
+                        scene_320["inputs"]["frame_count"] = scene["_total_frames"]
                         pass1_workflow[f"320_{idx}"] = scene_320
 
                         scene_330 = json.loads(json.dumps(tpl_330))
@@ -671,10 +678,8 @@ NODE_CLASS_MAPPINGS = {
                         if "94:105" in pass2_workflow: pass2_workflow["94:105"]["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
                         if "400" in pass2_workflow: 
                             pass2_workflow["400"]["inputs"]["scene_id"] = str(idx)
-                            # Remove the old incorrect key from the JSON template so ComfyUI doesn't get confused
                             pass2_workflow["400"]["inputs"].pop("cache_id", None)
                             
-
                         scene_seed = scene["_seed"]
                         if "94:28" in pass2_workflow: pass2_workflow["94:28"]["inputs"]["noise_seed"] = scene_seed
                         if "94:108" in pass2_workflow: pass2_workflow["94:108"]["inputs"]["noise_seed"] = scene_seed

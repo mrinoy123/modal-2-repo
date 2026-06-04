@@ -293,8 +293,8 @@ NODE_CLASS_MAPPINGS = {
         env_vars["LD_PRELOAD"] = "/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4"
         env_vars["TORCH_NUM_THREADS"] = "1"
         env_vars["OMP_NUM_THREADS"] = "1"
-        # CLEANED ALLOCATOR FIX: Keeps PyTorch from holding fragmented memory during large frame generation
-        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+        # 🛡️ THE OOM ALLOCATOR FIX: Reconfigured with max_split_size_mb to combat deep fragmentation crashes during FP8!
+        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:256"
         env_vars["CUDA_MODULE_LOADING"] = "LAZY" 
         
         self.process = subprocess.Popen([
@@ -502,6 +502,12 @@ NODE_CLASS_MAPPINGS = {
                         
                         static_env = f"{subject} {style} {bg} {light}".strip()
                         
+                        # 🎵 AUDIO SYNC FIX: Inject audio description into the static_env prompts
+                        # so the model can condition the audio_latent generation appropriately without losing sync!
+                        audio_prompt = scene.get("audio_prompt", "")
+                        if audio_prompt:
+                            static_env += f". Audio description: {audio_prompt}"
+                        
                         local_prompts_list = []
                         for step_frame, action_text in zip(keyframe_steps, actions):
                             action_cam = f"{action_text} {cam}".strip()
@@ -528,6 +534,11 @@ NODE_CLASS_MAPPINGS = {
                         c_type = n_data.get("class_type")
                         if c_type in ["UNETLoader", "VAELoaderKJ", "DualCLIPLoader"]:
                             global_nodes[n_id] = n_data
+                        elif c_type == "LTX2SamplingPreviewOverride":
+                            # 🛡️ OOM FIX 1: Completely bypass and annihilate the Preview Override node!
+                            # Leaving this active caused ComfyUI to secretly run vae.decode() every 8 steps 
+                            # directly into your GPU VRAM while the 22B UNet was STILL loaded! Instant OOM.
+                            pass 
                         else:
                             scene_template[n_id] = n_data
                             
@@ -573,7 +584,10 @@ NODE_CLASS_MAPPINGS = {
                             for in_key, in_val in new_node.get("inputs", {}).items():
                                 if isinstance(in_val, list) and len(in_val) == 2 and isinstance(in_val[0], str):
                                     target_id = in_val[0]
-                                    if target_id in scene_template:
+                                    if target_id == "99":
+                                        # 🛡️ OOM FIX 2: Reroute directly to UNETLoader (98) to bypass the removed Preview Override natively!
+                                        new_node["inputs"][in_key] = ["98", 0]
+                                    elif target_id in scene_template:
                                         new_node["inputs"][in_key] = [f"{target_id}_{idx}", in_val[1]]
                                     elif target_id in global_nodes:
                                         new_node["inputs"][in_key] = [target_id, in_val[1]]
@@ -600,14 +614,12 @@ NODE_CLASS_MAPPINGS = {
                             elif c_type == "LiconMSR":
                                 new_node["inputs"]["background"] = [bg_loader_id, 0]
                                 new_node["inputs"]["frame_count"] = scene["_total_frames"]
-                                # 🛡️ CRITICAL FIX: Respect dynamic topological linkage - prevent masking crash
                                 if not isinstance(new_node["inputs"].get("width"), list):
                                     new_node["inputs"]["width"] = custom_w
                                 if not isinstance(new_node["inputs"].get("height"), list):
                                     new_node["inputs"]["height"] = custom_h
 
                             elif c_type == "LTXICLoRALoaderModelOnly":
-                                # Safely inject Missing Model files for Licon-MSR / IC LoRA based on ID bindings
                                 if n_id == "9408":
                                     new_node["inputs"]["lora_name"] = "LTX2.3-Licon-MSR-test_version.safetensors"
                                 elif n_id == "9407":
@@ -618,6 +630,7 @@ NODE_CLASS_MAPPINGS = {
                             elif c_type == "CLIPTextEncode":
                                 current_text = str(new_node.get("inputs", {}).get("text", "")).lower()
                                 if n_id == "200" or "no humans" in current_text:
+                                    # Properly inject Negative Conditioning based on n8n webhook
                                     new_node["inputs"]["text"] = scene.get("negative_prompt", "no humans, bad quality, distorted, blurry, watermark")
                                 
                             elif c_type == "CR LoRA Stack" or n_id == "107":
@@ -656,9 +669,7 @@ NODE_CLASS_MAPPINGS = {
                     print(f"🚀 Queuing Math Encoding Pass for {len(batch_scenes)} Scenes simultaneously...")
                     await self.execute_comfy_workflow(session, pass1_workflow)
                     
-                    # 🔥 THE BULLET FIX FOR THE OOM ISSUE 🔥
-                    # By passing unload_models=True here, we completely wipe the 12B Gemma Model from VRAM
-                    # allowing the 22B UNet the entire 48GB GPU space to blast out the 258 frame samples!
+                    # Wipe all Text Encoders entirely from VRAM allowing the 22B UNet the entire 48GB GPU
                     await self.clear_comfy_memory(session, unload_models=True)
 
                     # ==============================================================================
@@ -684,18 +695,15 @@ NODE_CLASS_MAPPINGS = {
                         for n_id, n_data in pass2_workflow.items():
                             c_type = n_data.get("class_type")
                             
-                            # Cache injection 
                             if c_type == "MemoryCacheReader":
                                 n_data["inputs"]["scene_id"] = str(idx)
                                 n_data["inputs"].pop("cache_id", None)
                                 
-                            # Safe seed injection
                             if "noise_seed" in n_data.get("inputs", {}):
                                 n_data["inputs"]["noise_seed"] = scene_seed
                             elif "seed" in n_data.get("inputs", {}):
                                 n_data["inputs"]["seed"] = scene_seed
                                 
-                            # Configuration formatting
                             if c_type == "VHS_VideoCombine":
                                 n_data["inputs"]["frame_rate"] = 24
                                 if "pingpong" in n_data.get("inputs", {}): 
@@ -705,11 +713,19 @@ NODE_CLASS_MAPPINGS = {
                         if "94:11" in pass2_workflow and "inputs" in pass2_workflow["94:11"]:
                             pass2_workflow["94:11"]["inputs"]["steps"] = 12
                             if "denoise" in pass2_workflow["94:11"]["inputs"]: pass2_workflow["94:11"]["inputs"]["denoise"] = 1.0
+                            
+                        # 🎯 NEGATIVE PROMPT FIX: Enable CFG for the BASE Sampler Guider! 
+                        # If left at 1.0, ComfyUI mathematically skips negative conditioning entirely, explaining your "No Human" flaw.
+                        if "94:9" in pass2_workflow and "inputs" in pass2_workflow["94:9"]:
+                            pass2_workflow["94:9"]["inputs"]["cfg"] = 1.5
+
                         if "94:54" in pass2_workflow and "inputs" in pass2_workflow["94:54"]:
                             pass2_workflow["94:54"]["inputs"]["steps"] = 16
                             if "denoise" in pass2_workflow["94:54"]["inputs"]: pass2_workflow["94:54"]["inputs"]["denoise"] = 0.42
+                            
                         if "94:49" in pass2_workflow and "inputs" in pass2_workflow["94:49"]: 
                             if "cfg" in pass2_workflow["94:49"]["inputs"]: pass2_workflow["94:49"]["inputs"]["cfg"] = 1.5
+                        
                         if "401" in pass2_workflow and "inputs" in pass2_workflow["401"]:
                             pass2_workflow["401"]["inputs"]["effect_strength"] = 0.6
                             pass2_workflow["401"]["inputs"]["pop_factor"] = 0.7

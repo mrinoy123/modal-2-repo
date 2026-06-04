@@ -669,7 +669,11 @@ NODE_CLASS_MAPPINGS = {
                         if "103" in pass2_workflow: pass2_workflow["103"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                         if "102" in pass2_workflow: pass2_workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
                         if "94:105" in pass2_workflow: pass2_workflow["94:105"]["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
-                        if "400" in pass2_workflow: pass2_workflow["400"]["inputs"]["cache_id"] = str(idx)
+                        if "400" in pass2_workflow: 
+                            pass2_workflow["400"]["inputs"]["scene_id"] = str(idx)
+                            # Remove the old incorrect key from the JSON template so ComfyUI doesn't get confused
+                            pass2_workflow["400"]["inputs"].pop("cache_id", None)
+                            
 
                         scene_seed = scene["_seed"]
                         if "94:28" in pass2_workflow: pass2_workflow["94:28"]["inputs"]["noise_seed"] = scene_seed

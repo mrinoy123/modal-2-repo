@@ -349,13 +349,10 @@ NODE_CLASS_MAPPINGS = {
             if not batch_scenes: raise HTTPException(status_code=400, detail="Missing batch_scenes array.")
             if not subgraph_1 or not subgraph_2: raise HTTPException(status_code=400, detail="Missing Subgraph definitions.")
 
-            # 🛡️ FIX 1: We use relative directory structures for ComfyUI's strict Input security rules
-            comfy_input_dir = "/workspace/ComfyUI/input"
-            dynamic_guides_rel = "dynamic_guides"
-            dynamic_guides_abs = os.path.join(comfy_input_dir, dynamic_guides_rel)
-            
-            if os.path.exists(dynamic_guides_abs): shutil.rmtree(dynamic_guides_abs)
-            os.makedirs(dynamic_guides_abs, exist_ok=True)
+            # 🛡️ THE FIX: Restoring ABSOLUTE path logic required by DenoMultiImageLoader custom node
+            dynamic_guides_dir = "/workspace/ComfyUI/input/dynamic_guides"
+            if os.path.exists(dynamic_guides_dir): shutil.rmtree(dynamic_guides_dir)
+            os.makedirs(dynamic_guides_dir, exist_ok=True)
 
             ram_task = asyncio.create_task(self._ram_squeezer())
             generated_outputs = []
@@ -369,8 +366,8 @@ NODE_CLASS_MAPPINGS = {
                     # PRE-COMPUTE: Download ALL Reference Images & Calculate Dimensions
                     # ==============================================================================
                     for idx, scene in enumerate(batch_scenes):
-                        relative_scene_dir = f"{dynamic_guides_rel}/scene_{idx}"
-                        scene_img_dir = os.path.join(comfy_input_dir, relative_scene_dir)
+                        # 🛡️ Deno Loader Absolute Map Applied Here
+                        scene_img_dir = os.path.join(dynamic_guides_dir, f"scene_{idx}")
                         os.makedirs(scene_img_dir, exist_ok=True)
                         
                         image_urls = scene.get("image_urls", [])
@@ -417,7 +414,6 @@ NODE_CLASS_MAPPINGS = {
                         num_actions = len(actions)
                         keyframe_steps = [int(i * (total_frames - 1) / max(1, num_actions - 1)) for i in range(num_actions)]
 
-                        # 🛡️ FIX 2: Clamp LiconMSR Guide frames to its strict valid combo box selection
                         valid_msr_frames = [17, 25, 33, 41]
                         msr_frames = 41
                         for vf in reversed(valid_msr_frames):
@@ -445,7 +441,7 @@ NODE_CLASS_MAPPINGS = {
                         scene["_local_prompts_str"] = local_prompts_str
                         scene["_total_frames"] = total_frames
                         scene["_msr_frames"] = msr_frames
-                        scene["_img_dir"] = relative_scene_dir  # Safely mapped relative path
+                        scene["_img_dir"] = scene_img_dir  # 🛡️ Passing the full Absolute Path 
                         scene["_seed"] = scene.get("seed", int(time.time() * 1000) % 1000000)
 
                     # ==============================================================================
@@ -546,9 +542,9 @@ NODE_CLASS_MAPPINGS = {
                         scene_46["inputs"]["frame_rate"] = 24 
                         pass1_workflow[f"46_{idx}"] = scene_46
 
-                        # 🛡️ FIX 1 APPLIED: Safe Relative Paths for Strict Validation
+                        # 🛡️ THE FIX APPLIED IN MATRIX MAPPING:
                         scene_351 = json.loads(json.dumps(tpl_351))
-                        scene_351["inputs"]["image_paths"] = scene["_img_dir"]
+                        scene_351["inputs"]["image_paths"] = scene["_img_dir"]  # Passes Exact Absolute System Path
                         scene_351["inputs"]["width"] = custom_w
                         scene_351["inputs"]["height"] = custom_h
                         pass1_workflow[f"351_{idx}"] = scene_351
@@ -559,7 +555,6 @@ NODE_CLASS_MAPPINGS = {
                         scene_94_5["inputs"]["frame_rate"] = [f"46_{idx}", 5]
                         pass1_workflow[f"94:5_{idx}"] = scene_94_5
 
-                        # 🛡️ FIX 2 APPLIED: Clamped Combo-Box limits
                         scene_320 = json.loads(json.dumps(tpl_320))
                         scene_320["inputs"]["1"] = [f"351_{idx}", 0]
                         scene_320["inputs"]["2"] = [f"351_{idx}", 0]

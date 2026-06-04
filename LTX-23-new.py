@@ -30,7 +30,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "380"  # Bumping for fresh build
+    "FORCE_REBUILD_INDEX": "382"  # Bumping for fresh build
 })
 
 # ==============================================================================
@@ -208,7 +208,6 @@ class MemoryCacheWriter:
 
     def write_cache(self, model, positive, negative, video_latent, audio_latent, guide_data, frame_rate, scene_id):
         global LTX_CACHE
-        # Recursively offload all tensors to CPU to prevent silent VRAM leaks before UNet sampling!
         LTX_CACHE[str(scene_id)] = {
             "model": model, 
             "positive": recursive_cpu(positive),
@@ -293,8 +292,7 @@ NODE_CLASS_MAPPINGS = {
         env_vars["LD_PRELOAD"] = "/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4"
         env_vars["TORCH_NUM_THREADS"] = "1"
         env_vars["OMP_NUM_THREADS"] = "1"
-        # 🛡️ THE OOM ALLOCATOR FIX: Reconfigured with max_split_size_mb to combat deep fragmentation crashes during FP8!
-        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:256"
+        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
         env_vars["CUDA_MODULE_LOADING"] = "LAZY" 
         
         self.process = subprocess.Popen([
@@ -408,11 +406,6 @@ NODE_CLASS_MAPPINGS = {
                         scene_img_dir = os.path.join("/workspace/ComfyUI/input", relative_scene_dir)
                         os.makedirs(scene_img_dir, exist_ok=True)
                         
-                        bg_path = os.path.join(scene_img_dir, "black_bg.png")
-                        from PIL import Image
-                        Image.new('RGB', (custom_w, custom_h), color='black').save(bg_path)
-                        scene["_bg_img_path"] = f"{relative_scene_dir}/black_bg.png"
-                        
                         image_urls = scene.get("image_urls", [])
                         if not image_urls and scene.get("image_url"):
                             image_urls = [scene.get("image_url")]
@@ -420,13 +413,8 @@ NODE_CLASS_MAPPINGS = {
                         segments = []
                         valid_relative_paths = []
 
-                        if not image_urls:
-                            target_path = os.path.join(scene_img_dir, "default.png")
-                            rel_path = f"{relative_scene_dir}/default.png"
-                            Image.new('RGB', (custom_w, custom_h), color='black').save(target_path)
-                            segments = [{"frame": 0, "image": ""}, {"frame": 1, "image": ""}]
-                            valid_relative_paths.append(rel_path)
-                        else:
+                        # Structure Image Fetching Loop
+                        if image_urls:
                             for img_i, url_str in enumerate(image_urls):
                                 target_path = os.path.join(scene_img_dir, f"img_{img_i}.png")
                                 rel_path = f"{relative_scene_dir}/img_{img_i}.png"
@@ -459,27 +447,34 @@ NODE_CLASS_MAPPINGS = {
                                 except Exception as e:
                                     print(f"[Warning] Unexpected error downloading {url_str}: {e}")
                                 
-                                if not os.path.exists(target_path) or os.path.getsize(target_path) == 0:
-                                    Image.new('RGB', (custom_w, custom_h), color='black').save(target_path)
-                                    print(f"[Fallback] Successfully protected pipeline with blank placeholder image at: {target_path}")
-                                else:
+                                if os.path.exists(target_path) and os.path.getsize(target_path) > 0:
                                     try:
+                                        from PIL import Image
                                         img = Image.open(target_path).convert("RGB")
                                         img = img.resize((custom_w, custom_h), Image.Resampling.LANCZOS)
                                         img.save(target_path)
+                                        valid_relative_paths.append(rel_path)
+                                        
+                                        if img_i == 0:
+                                            with open(target_path, "rb") as f:
+                                                b64_img = base64.b64encode(f.read()).decode("utf-8")
+                                                segments.append({"frame": 0, "image": f"data:image/png;base64,{b64_img}"})
+                                                segments.append({"frame": 1, "image": f"data:image/png;base64,{b64_img}"})
                                     except Exception as img_err:
-                                        print(f"PIL processing failed, reverting to placeholder: {img_err}")
-                                        Image.new('RGB', (custom_w, custom_h), color='black').save(target_path)
+                                        print(f"PIL processing failed for {target_path}: {img_err}")
 
-                                if os.path.exists(target_path):
-                                    valid_relative_paths.append(rel_path)
+                        # 🎯 THE FIX: No more fake black images. The background is strictly mapped to the structure image!
+                        if valid_relative_paths:
+                            scene["_bg_img_path"] = valid_relative_paths[0]
+                        else:
+                            # Absolute fallback: Only happens if the URL provided was entirely broken/404
+                            fallback_path = os.path.join(scene_img_dir, "fallback.png")
+                            rel_fallback = f"{relative_scene_dir}/fallback.png"
+                            from PIL import Image
+                            Image.new('RGB', (custom_w, custom_h), color='black').save(fallback_path)
+                            valid_relative_paths.append(rel_fallback)
+                            scene["_bg_img_path"] = rel_fallback
 
-                                if img_i == 0 and os.path.exists(target_path):
-                                    with open(target_path, "rb") as f:
-                                        b64_img = base64.b64encode(f.read()).decode("utf-8")
-                                        segments.append({"frame": 0, "image": f"data:image/png;base64,{b64_img}"})
-                                        segments.append({"frame": 1, "image": f"data:image/png;base64,{b64_img}"})
-                        
                         timeline_data_str = json.dumps({"segments": segments, "audioSegments": []})
 
                         actions = scene.get("kinetic_actions", [])
@@ -502,8 +497,6 @@ NODE_CLASS_MAPPINGS = {
                         
                         static_env = f"{subject} {style} {bg} {light}".strip()
                         
-                        # 🎵 AUDIO SYNC FIX: Inject audio description into the static_env prompts
-                        # so the model can condition the audio_latent generation appropriately without losing sync!
                         audio_prompt = scene.get("audio_prompt", "")
                         if audio_prompt:
                             static_env += f". Audio description: {audio_prompt}"
@@ -535,9 +528,7 @@ NODE_CLASS_MAPPINGS = {
                         if c_type in ["UNETLoader", "VAELoaderKJ", "DualCLIPLoader"]:
                             global_nodes[n_id] = n_data
                         elif c_type == "LTX2SamplingPreviewOverride":
-                            # 🛡️ OOM FIX 1: Completely bypass and annihilate the Preview Override node!
-                            # Leaving this active caused ComfyUI to secretly run vae.decode() every 8 steps 
-                            # directly into your GPU VRAM while the 22B UNet was STILL loaded! Instant OOM.
+                            # 🛡️ OOM FIX 1: Bypass the Preview Override to prevent midway VAE Decoding
                             pass 
                         else:
                             scene_template[n_id] = n_data
@@ -551,7 +542,6 @@ NODE_CLASS_MAPPINGS = {
                             pass1_workflow[n_id]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
                             pass1_workflow[n_id]["inputs"]["weight_dtype"] = "fp8_e4m3fn"
                         elif pass1_workflow[n_id].get("class_type") == "VAELoaderKJ":
-                            # Safe assumptions based on IDs
                             if n_id == "97": pass1_workflow[n_id]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                             if n_id == "102": pass1_workflow[n_id]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
                         elif pass1_workflow[n_id].get("class_type") == "DualCLIPLoader":
@@ -570,6 +560,7 @@ NODE_CLASS_MAPPINGS = {
 
                     # 2. Deep Copy and Link Subgraphs dynamically per Scene
                     for idx, scene in enumerate(batch_scenes):
+                        # Ensure the background loader node correctly targets the true Structure Image!
                         bg_loader_id = f"998_bg_{idx}"
                         pass1_workflow[bg_loader_id] = {
                             "class_type": "LoadImage",
@@ -580,19 +571,16 @@ NODE_CLASS_MAPPINGS = {
                             new_id = f"{n_id}_{idx}"
                             new_node = json.loads(json.dumps(n_data))
                             
-                            # Preserve and rename internal link matrices natively
                             for in_key, in_val in new_node.get("inputs", {}).items():
                                 if isinstance(in_val, list) and len(in_val) == 2 and isinstance(in_val[0], str):
                                     target_id = in_val[0]
                                     if target_id == "99":
-                                        # 🛡️ OOM FIX 2: Reroute directly to UNETLoader (98) to bypass the removed Preview Override natively!
                                         new_node["inputs"][in_key] = ["98", 0]
                                     elif target_id in scene_template:
                                         new_node["inputs"][in_key] = [f"{target_id}_{idx}", in_val[1]]
                                     elif target_id in global_nodes:
                                         new_node["inputs"][in_key] = [target_id, in_val[1]]
                                         
-                            # Safely inject parameters by Class Type (ID agnostic)
                             c_type = new_node.get("class_type")
                             
                             if c_type == "LTXDirector":
@@ -612,25 +600,27 @@ NODE_CLASS_MAPPINGS = {
                                 new_node["inputs"]["height"] = custom_h
                                 
                             elif c_type == "LiconMSR":
-                                new_node["inputs"]["background"] = [bg_loader_id, 0]
                                 new_node["inputs"]["frame_count"] = scene["_total_frames"]
                                 if not isinstance(new_node["inputs"].get("width"), list):
                                     new_node["inputs"]["width"] = custom_w
                                 if not isinstance(new_node["inputs"].get("height"), list):
                                     new_node["inputs"]["height"] = custom_h
 
+                            elif c_type == "LTXAddVideoICLoRAGuide":
+                                # 🛡️ THE REAL OOM FIX: Forcing VAE Tiled Encode during Phase 1
+                                new_node["inputs"]["use_tiled_encode"] = True
+                                new_node["inputs"]["tile_size"] = 256
+                                new_node["inputs"]["tile_overlap"] = 64
+
                             elif c_type == "LTXICLoRALoaderModelOnly":
                                 if n_id == "9408":
                                     new_node["inputs"]["lora_name"] = "LTX2.3-Licon-MSR-test_version.safetensors"
-                                elif n_id == "9407":
-                                    new_node["inputs"]["lora_name"] = "ltx-2.3-22b-ic-lora-refocus.safetensors"
                                 else:
                                     new_node["inputs"]["lora_name"] = "ltx-2.3-22b-ic-lora-refocus.safetensors"
                                     
                             elif c_type == "CLIPTextEncode":
                                 current_text = str(new_node.get("inputs", {}).get("text", "")).lower()
                                 if n_id == "200" or "no humans" in current_text:
-                                    # Properly inject Negative Conditioning based on n8n webhook
                                     new_node["inputs"]["text"] = scene.get("negative_prompt", "no humans, bad quality, distorted, blurry, watermark")
                                 
                             elif c_type == "CR LoRA Stack" or n_id == "107":
@@ -669,7 +659,6 @@ NODE_CLASS_MAPPINGS = {
                     print(f"🚀 Queuing Math Encoding Pass for {len(batch_scenes)} Scenes simultaneously...")
                     await self.execute_comfy_workflow(session, pass1_workflow)
                     
-                    # Wipe all Text Encoders entirely from VRAM allowing the 22B UNet the entire 48GB GPU
                     await self.clear_comfy_memory(session, unload_models=True)
 
                     # ==============================================================================
@@ -686,12 +675,10 @@ NODE_CLASS_MAPPINGS = {
 
                         scene_seed = scene["_seed"]
 
-                        # Target explicit node structures and dynamic class_types to prevent breakage
                         if "103" in pass2_workflow: pass2_workflow["103"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                         if "102" in pass2_workflow: pass2_workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
                         if "94:105" in pass2_workflow: pass2_workflow["94:105"]["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
                         
-                        # Apply fallback scanning for samplers, seeders, and cache blocks
                         for n_id, n_data in pass2_workflow.items():
                             c_type = n_data.get("class_type")
                             
@@ -709,13 +696,11 @@ NODE_CLASS_MAPPINGS = {
                                 if "pingpong" in n_data.get("inputs", {}): 
                                     n_data["inputs"]["pingpong"] = False
 
-                        # Safely update known base & upscale sampling parameters without breakage
                         if "94:11" in pass2_workflow and "inputs" in pass2_workflow["94:11"]:
                             pass2_workflow["94:11"]["inputs"]["steps"] = 12
                             if "denoise" in pass2_workflow["94:11"]["inputs"]: pass2_workflow["94:11"]["inputs"]["denoise"] = 1.0
                             
                         # 🎯 NEGATIVE PROMPT FIX: Enable CFG for the BASE Sampler Guider! 
-                        # If left at 1.0, ComfyUI mathematically skips negative conditioning entirely, explaining your "No Human" flaw.
                         if "94:9" in pass2_workflow and "inputs" in pass2_workflow["94:9"]:
                             pass2_workflow["94:9"]["inputs"]["cfg"] = 1.5
 

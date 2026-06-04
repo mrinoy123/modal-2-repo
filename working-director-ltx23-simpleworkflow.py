@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "351"  # Bumping this forces Modal to rebuild the image
+    "FORCE_REBUILD_INDEX": "400"  # Bumping this forces Modal to rebuild the image
 })
 
 # ==============================================================================

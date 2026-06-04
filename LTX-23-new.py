@@ -364,11 +364,13 @@ NODE_CLASS_MAPPINGS = {
                     custom_w = body.get("custom_width", 576)
                     custom_h = body.get("custom_height", 1024)
 
-                    # ==============================================================================
+# ==============================================================================
                     # PRE-COMPUTE: Download ALL Reference Images & Calculate Dimensions
                     # ==============================================================================
                     for idx, scene in enumerate(batch_scenes):
-                        scene_img_dir = os.path.join(dynamic_guides_dir, f"scene_{idx}")
+                        # 🛡️ FIX 1: Create a strictly RELATIVE path for ComfyUI's input directory rules
+                        relative_scene_dir = f"dynamic_guides/scene_{idx}"
+                        scene_img_dir = os.path.join("/workspace/ComfyUI/input", relative_scene_dir)
                         os.makedirs(scene_img_dir, exist_ok=True)
                         
                         image_urls = scene.get("image_urls", [])
@@ -378,7 +380,6 @@ NODE_CLASS_MAPPINGS = {
                         segments = []
 
                         if not image_urls:
-                            # Fallback dummy black image if none provided
                             target_path = os.path.join(scene_img_dir, "default.png")
                             from PIL import Image
                             Image.new('RGB', (custom_w, custom_h), color='black').save(target_path)
@@ -390,7 +391,7 @@ NODE_CLASS_MAPPINGS = {
                                     # 🛡️ FIX 2: Auto-correct .jpg/.jpeg to .png to prevent the 404 error
                                     if url_str.lower().endswith((".jpg", ".jpeg")):
                                         url_str = url_str.rsplit(".", 1)[0] + ".png"
-
+                                        
                                     parsed = urlparse(url_str)
                                     # 🛡️ AUTHENTICATED DOWNLOAD MANAGER FOR CLOUDFLARE R2
                                     if "r2.cloudflarestorage.com" in url_str or "pub-" in url_str or parsed.netloc == "" or not parsed.scheme:
@@ -475,13 +476,16 @@ NODE_CLASS_MAPPINGS = {
                             
                         local_prompts_str = "\n".join(local_prompts_list)
                         
+                        # Store in dict for next pass
                         scene["_timeline_data_str"] = timeline_data_str
                         scene["_local_prompts_str"] = local_prompts_str
                         scene["_total_frames"] = total_frames
                         scene["_msr_frames"] = msr_frames
-                        scene["_img_dir"] = scene_img_dir  
+                        
+                        # 🛡️ FIX 3: Pass ONLY the relative directory to ComfyUI to satisfy the strict validator!
+                        scene["_img_dir"] = relative_scene_dir  
+                        
                         scene["_seed"] = scene.get("seed", int(time.time() * 1000) % 1000000)
-
                     # ==============================================================================
                     # PASS 1: TEXT ENCODING, IC-LORAS & DYNAMIC LORA MATRIX BATCHING
                     # ==============================================================================

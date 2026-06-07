@@ -14,6 +14,7 @@ import asyncio
 import ctypes
 import base64
 import math
+import numpy as np
 from fastapi import Request, Response, HTTPException, Header
 from fastapi.responses import StreamingResponse
 from typing import Optional
@@ -29,7 +30,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "422"  # ⚠️ Bumped to force fresh install of missing Audio dependencies
+    "FORCE_REBUILD_INDEX": "422"  
 })
 
 build_image = base_image.env({
@@ -42,7 +43,6 @@ build_image = base_image.env({
     "CXX": "g++"
 }).run_commands(
     "python3.12 -m pip install --no-cache-dir fastapi aiohttp boto3 triton>=3.1.0 ninja setuptools>=70.0.0 wheel pip>=24.0 Pillow",
-    # ⚠️ CRITICAL FIX: "rotary_embedding_torch" explicitly added here because Kijai moved to pyproject.toml
     "python3.12 -m pip install --no-cache-dir pandas numexpr pytz python-dateutil scipy matplotlib colorama torchvision librosa soundfile decord imageio scikit-image numba einops bitsandbytes rotary_embedding_torch"
 )
 
@@ -307,15 +307,29 @@ NODE_CLASS_MAPPINGS = {
 
             try:
                 async with aiohttp.ClientSession() as session:
-                    # 🛡️ 9:16 Aspect Ratio Enforced (Divisible by 32 required for VAE) 
                     custom_w = body.get("custom_width", 384) 
                     custom_h = body.get("custom_height", 672)
 
                     for idx, scene in enumerate(batch_scenes):
                         
-                        # --- ASSET DOWNLOAD UTILITIES ---
+                        # --- SECURE ASSET DOWNLOAD UTILITY (Handles Private R2 Links) ---
                         async def download_asset(url, target_path):
-                            if url:
+                            if not url: return False
+                            
+                            # Detect Cloudflare R2 Dev Domain
+                            if "pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev" in url:
+                                key = url.split(".dev/")[-1]
+                                try:
+                                    print(f"📥 Authenticated download via boto3 for private R2 asset: {key}")
+                                    await asyncio.get_event_loop().run_in_executor(
+                                        None, self.s3.download_file, "video-asset-files-storage-workflow", key, target_path
+                                    )
+                                    return True
+                                except Exception as e:
+                                    print(f"❌ Failed to download private R2 asset: {e}")
+                                    return False
+                            else:
+                                # Fallback for standard public URLs
                                 try:
                                     async with session.get(url, timeout=60) as r:
                                         if r.status == 200:
@@ -324,7 +338,7 @@ NODE_CLASS_MAPPINGS = {
                                 except Exception: pass
                             return False
 
-                        # 1️⃣ Dual Image Preparation
+                        # 1️⃣ Image Processing & Failsafe Black Dummy Creation
                         img1_path = os.path.join(dynamic_guides_dir, f"char1_{idx}.png")
                         img2_path = os.path.join(dynamic_guides_dir, f"char2_{idx}.png")
                         
@@ -334,12 +348,13 @@ NODE_CLASS_MAPPINGS = {
                         from PIL import Image
                         for img_p in [img1_path, img2_path]:
                             if not os.path.exists(img_p):
+                                print(f"⚠️ Image not found, generating safety dummy: {img_p}")
                                 Image.new('RGB', (custom_w, custom_h), color='black').save(img_p)
                             else:
                                 i = Image.open(img_p).convert("RGB")
                                 i.resize((custom_w, custom_h), Image.Resampling.LANCZOS).save(img_p)
 
-                        # 2️⃣ Dual Audio Processing (16kHz Resampling for CosyVoice/LTX VAE compatibility)
+                        # 2️⃣ Audio Processing & Failsafe Silence Dummy Creation
                         spk1_path = os.path.join(dynamic_guides_dir, f"spk1_{idx}.wav")
                         spk2_path = os.path.join(dynamic_guides_dir, f"spk2_{idx}.wav")
 
@@ -349,12 +364,20 @@ NODE_CLASS_MAPPINGS = {
                         import soundfile as sf
                         import librosa
                         for aud_p in [spk1_path, spk2_path]:
-                            if os.path.exists(aud_p):
-                                data, _ = librosa.load(aud_p, sr=16000, mono=True)
-                                sf.write(aud_p, data, 16000)
+                            if not os.path.exists(aud_p):
+                                print(f"⚠️ Audio not found, generating safety silence: {aud_p}")
+                                dummy_data = np.zeros(16000, dtype=np.float32)
+                                sf.write(aud_p, dummy_data, 16000)
+                            else:
+                                try:
+                                    data, _ = librosa.load(aud_p, sr=16000, mono=True)
+                                    sf.write(aud_p, data, 16000)
+                                except Exception as e:
+                                    print(f"❌ Corrupt audio replaced with silence: {e}")
+                                    dummy_data = np.zeros(16000, dtype=np.float32)
+                                    sf.write(aud_p, dummy_data, 16000)
 
-                        # Frames control
-                        total_frames = scene.get("total_frames", 161) # 161 frames is ~6 seconds at 25fps
+                        total_frames = scene.get("total_frames", 161)
 
                         # ==============================================================================
                         # SUBGRAPH 1: TEXT, ZERO-SHOT VOICE CLONING & COMPRESSION
@@ -362,35 +385,27 @@ NODE_CLASS_MAPPINGS = {
                         print(f"\n[Lypsync API] 🎬 Initiating SUBGRAPH 1 (Voice & Embeddings) for Scene {idx}...")
                         sg1 = json.loads(json.dumps(subgraph_1))
                         
-                        # Model Hookups (Correctly tailored against Subgraph 1 API references)
-                        if "1" in sg1: 
-                            sg1["1"]["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
-                        if "369" in sg1: 
-                            sg1["369"]["inputs"]["model_name"] = "MelBandRoformer_fp32.safetensors"
-                        if "367" in sg1: 
-                            sg1["367"]["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
+                        if "1" in sg1: sg1["1"]["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
+                        if "369" in sg1: sg1["369"]["inputs"]["model_name"] = "MelBandRoformer_fp32.safetensors"
+                        if "367" in sg1: sg1["367"]["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
                         if "368" in sg1:
                             sg1["368"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
                             sg1["368"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
 
-                        # Text & Script Mapping
                         if "12" in sg1: sg1["12"]["inputs"]["text"] = scene.get("positive_prompt", "")
                         if "13" in sg1: sg1["13"]["inputs"]["text"] = scene.get("negative_prompt", "blurry, distorted, bad quality")
                         if "371" in sg1: sg1["371"]["inputs"]["dialog_text"] = scene.get("dialog_text", "")
                         if "374" in sg1: sg1["374"]["inputs"]["text"] = scene.get("speaker1_text", "")
                         if "375" in sg1: sg1["375"]["inputs"]["text"] = scene.get("speaker2_text", "")
 
-                        # Audio References Input
                         if "365" in sg1: sg1["365"]["inputs"]["audio"] = f"dynamic_guides/spk1_{idx}.wav"
                         if "366" in sg1: sg1["366"]["inputs"]["audio"] = f"dynamic_guides/spk2_{idx}.wav"
 
-                        # Canvas Resolution Link
                         if "14" in sg1:
                             sg1["14"]["inputs"]["width"] = custom_w
                             sg1["14"]["inputs"]["height"] = custom_h
                             sg1["14"]["inputs"]["length"] = total_frames
 
-                        # Memory Writer Index Map
                         if "300" in sg1: sg1["300"]["inputs"]["scene_id"] = str(idx)
 
                         await self.execute_comfy_workflow(session, sg1)
@@ -409,34 +424,27 @@ NODE_CLASS_MAPPINGS = {
 
                         if "301" in sg2: sg2["301"]["inputs"]["scene_id"] = str(idx)
 
-                        # Base Models & Quantization Targets (Correctly tailored against Subgraph 2 API References)
                         if "422" in sg2: sg2["422"]["inputs"]["model_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
                         if "428" in sg2: sg2["428"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                         if "431" in sg2: sg2["431"]["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
 
-                        # IC-LoRA Configuration
                         if "426" in sg2:
                             sg2["426"]["inputs"]["lora_1"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
                             sg2["426"]["inputs"]["strength_1"] = 1.0
 
-                        # Crop Guides Setup
                         if "429" in sg2: sg2["429"]["inputs"]["image"] = f"dynamic_guides/char1_{idx}.png"
                         if "430" in sg2: sg2["430"]["inputs"]["image"] = f"dynamic_guides/char2_{idx}.png"
 
-                        # Primary Rendering Loop (Fixed targeted node reference mapping for seed payload)
                         if "413" in sg2: sg2["413"]["inputs"]["noise_seed"] = scene_seed
                         if "412" in sg2: sg2["412"]["inputs"]["steps"] = 12
 
-                        # Stage 2 Execution (Protecting the generated Lip Sync)
                         if "502" in sg2: sg2["502"]["inputs"]["noise_seed"] = scene_seed
                         if "501" in sg2:
                             sg2["501"]["inputs"]["steps"] = 8
-                            # Ensuring Stage 2 denoise/terminal is low to avoid overwriting mouths
                             if "terminal" in sg2["501"]["inputs"]: sg2["501"]["inputs"]["terminal"] = 0.1 
 
                         await self.execute_comfy_workflow(session, sg2)
 
-                        # Output Sync
                         output_files = []
                         for root_p, _, filenames in os.walk(out_dir):
                             for name in filenames:

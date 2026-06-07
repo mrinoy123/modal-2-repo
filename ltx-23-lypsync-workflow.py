@@ -62,8 +62,8 @@ clone_image = torch_image.run_commands(
     "git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git /workspace/ComfyUI/custom_nodes/ComfyUI-KJNodes",
     "git clone --depth 1 https://github.com/Deno2026/comfyui-deno-custom-nodes.git /workspace/ComfyUI/custom_nodes/comfyui-deno-custom-nodes",
     # ⚠️ Added Core Audio Processing Suites for Voice Cloning & RoFormer
-    "git clone --depth 1 https://github.com/AuraSR/ComfyUI-MelBandRoFormer.git /workspace/ComfyUI/custom_nodes/ComfyUI-MelBandRoFormer",
-    "git clone --depth 1 https://github.com/first-letter/ComfyUI-FL_CosyVoice.git /workspace/ComfyUI/custom_nodes/ComfyUI-FL_CosyVoice"
+    "git clone --depth 1 https://github.com/kijai/ComfyUI-MelBandRoFormer.git /workspace/ComfyUI/custom_nodes/ComfyUI-MelBandRoFormer",
+    "git clone --depth 1 https://github.com/filliptm/ComfyUI_FL-CosyVoice3.git /workspace/ComfyUI/custom_nodes/ComfyUI-FL_CosyVoice"
 )
 
 deps_image = clone_image.run_commands(

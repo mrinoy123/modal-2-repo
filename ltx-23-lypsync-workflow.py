@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "420"  # Bumped for Lypsync dependencies
+    "FORCE_REBUILD_INDEX": "422"  # Bumped for caching reset
 })
 
 build_image = base_image.env({
@@ -63,7 +63,7 @@ clone_image = torch_image.run_commands(
     "git clone --depth 1 https://github.com/Deno2026/comfyui-deno-custom-nodes.git /workspace/ComfyUI/custom_nodes/comfyui-deno-custom-nodes",
     # ⚠️ Added Core Audio Processing Suites for Voice Cloning & RoFormer
     "git clone --depth 1 https://github.com/kijai/ComfyUI-MelBandRoFormer.git /workspace/ComfyUI/custom_nodes/ComfyUI-MelBandRoFormer",
-    "git clone --depth 1 https://github.com/filliptm/ComfyUI_FL-CosyVoice3.git /workspace/ComfyUI/custom_nodes/ComfyUI-FL_CosyVoice"
+    "git clone --depth 1 https://github.com/filliptm/ComfyUI_FL-CosyVoice3.git /workspace/ComfyUI/custom_nodes/ComfyUI_FL-CosyVoice3"
 )
 
 deps_image = clone_image.run_commands(
@@ -81,7 +81,7 @@ final_image = deps_image.run_commands(
 )
 
 # ==============================================================================
-# PART 5: MODAL APP CONFIGURATION & CLOUD VOLUMES (L40S TARGET)
+# PART 5: MODAL APP CONFIGURATION & CLOUD VOLUMES 
 # ==============================================================================
 app = modal.App("media-worker-ltx23-lypsync")
 weights_volume = modal.Volume.from_name("Ltx-23-model-weights-new", create_if_missing=False)
@@ -179,17 +179,30 @@ NODE_CLASS_MAPPINGS = {
 }
 """)
 
-        print("🔗 Running Atomic Model Folder Linker for LTX 2.3...")
+        print("🔗 Running Atomic Model Folder Linker for LTX 2.3 & CosyVoice3...")
         base_models_dir = "/workspace/ComfyUI/models"
         dirs = ["unet", "vae", "clip", "text_encoders", "checkpoints", "loras", "upscale_models", "latent_upscale_models", "cosyvoice", "melbandroformer"]
         for d in dirs: os.makedirs(os.path.join(base_models_dir, d), exist_ok=True)
 
+        # ⚠️ CRITICAL FIX: CosyVoice strictly relies on the internal architecture alongside its `.yaml` & `.onnx` configurations.
+        # Direct folder symlinking is utilized here specifically so that its internal structure isn't flattened.
+        cv_source = "/mnt/weights/cosyvoice3"
+        cv_dest = os.path.join(base_models_dir, "cosyvoice", "Fun-CosyVoice3-0.5B")
+        if os.path.exists(cv_source) and not os.path.exists(cv_dest):
+            os.symlink(cv_source, cv_dest)
+            print(f"🔗 Symlinked strictly structured CosyVoice3 folder to {cv_dest}")
+
+        # Fallback flat file linker for everything else natively.
         if os.path.exists("/mnt/weights"):
             for root_dir, _, files in os.walk("/mnt/weights"):
+                # Avoid destroying the folder tree if it's already mapped
+                if "cosyvoice3" in root_dir.split(os.sep): 
+                    continue 
                 for filename in files:
-                    if not filename.endswith((".safetensors", ".gguf", ".pth", ".pt", ".bin")): continue
+                    if not filename.endswith((".safetensors", ".gguf", ".pth", ".pt", ".bin", ".onnx", ".yaml", ".json")): continue
                     src_path = os.path.join(root_dir, filename)
                     for target_dir in dirs:
+                        if target_dir == "cosyvoice": continue # Skip flattened link for cosyvoice 
                         dest = os.path.join(base_models_dir, target_dir, filename)
                         if not os.path.exists(dest):
                             try: os.symlink(src_path, dest)
@@ -300,9 +313,9 @@ NODE_CLASS_MAPPINGS = {
 
             try:
                 async with aiohttp.ClientSession() as session:
-                    # 🛡️ Lypsync Primary Canvas Res (Base before upscale)
+                    # 🛡️ 9:16 Aspect Ratio Enforced (Divisible by 32 required for VAE) 
                     custom_w = body.get("custom_width", 384) 
-                    custom_h = body.get("custom_height", 680)
+                    custom_h = body.get("custom_height", 672)
 
                     for idx, scene in enumerate(batch_scenes):
                         
@@ -355,10 +368,13 @@ NODE_CLASS_MAPPINGS = {
                         print(f"\n[Lypsync API] 🎬 Initiating SUBGRAPH 1 (Voice & Embeddings) for Scene {idx}...")
                         sg1 = json.loads(json.dumps(subgraph_1))
                         
-                        # Model Hookups
-                        if "1" in sg1: sg1["1"]["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
-                        if "369" in sg1: sg1["369"]["inputs"]["model"] = "MelBandRoformer_fp32.safetensors"
-                        if "367" in sg1: sg1["367"]["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
+                        # Model Hookups (Correctly tailored against Subgraph 1 API references)
+                        if "1" in sg1: 
+                            sg1["1"]["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
+                        if "369" in sg1: 
+                            sg1["369"]["inputs"]["model_name"] = "MelBandRoformer_fp32.safetensors"
+                        if "367" in sg1: 
+                            sg1["367"]["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
                         if "368" in sg1:
                             sg1["368"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
                             sg1["368"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
@@ -399,26 +415,26 @@ NODE_CLASS_MAPPINGS = {
 
                         if "301" in sg2: sg2["301"]["inputs"]["scene_id"] = str(idx)
 
-                        # Base Models & Quantization Targets
-                        if "422" in sg2: sg2["422"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
+                        # Base Models & Quantization Targets (Correctly tailored against Subgraph 2 API References)
+                        if "422" in sg2: sg2["422"]["inputs"]["model_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
                         if "428" in sg2: sg2["428"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                         if "431" in sg2: sg2["431"]["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
 
                         # IC-LoRA Configuration
                         if "426" in sg2:
-                            sg2["426"]["inputs"]["lora_1_name"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
-                            sg2["426"]["inputs"]["lora_1_strength"] = 1.0
+                            sg2["426"]["inputs"]["lora_1"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
+                            sg2["426"]["inputs"]["strength_1"] = 1.0
 
                         # Crop Guides Setup
                         if "429" in sg2: sg2["429"]["inputs"]["image"] = f"dynamic_guides/char1_{idx}.png"
                         if "430" in sg2: sg2["430"]["inputs"]["image"] = f"dynamic_guides/char2_{idx}.png"
 
-                        # Primary Rendering Loop (Distilled FP8 limits)
-                        if "416" in sg2: sg2["416"]["inputs"]["noise_seed"] = scene_seed
+                        # Primary Rendering Loop (Fixed targeted node reference mapping for seed payload)
+                        if "413" in sg2: sg2["413"]["inputs"]["noise_seed"] = scene_seed
                         if "412" in sg2: sg2["412"]["inputs"]["steps"] = 12
 
                         # Stage 2 Execution (Protecting the generated Lip Sync)
-                        if "503" in sg2: sg2["503"]["inputs"]["noise_seed"] = scene_seed
+                        if "502" in sg2: sg2["502"]["inputs"]["noise_seed"] = scene_seed
                         if "501" in sg2:
                             sg2["501"]["inputs"]["steps"] = 8
                             # Ensuring Stage 2 denoise/terminal is low to avoid overwriting mouths

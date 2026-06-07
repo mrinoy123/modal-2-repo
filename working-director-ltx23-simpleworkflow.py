@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "411"  # Bumped to force Modal rebuild with new patch
+    "FORCE_REBUILD_INDEX": "412"  # Bumped to force Modal rebuild with the clean fix
 })
 
 build_image = base_image.env({
@@ -71,8 +71,9 @@ deps_image = clone_image.run_commands(
 )
 
 final_image = deps_image.run_commands(
-    # 🛡️ FATAL BUG FIX: Transformers 4.49.0 dropped support for PyTorch 2.5.1 by requiring float8_e8m0fnu. This mock completely neutralizes the crash.
-    "python3.12 -c \"import os; p='/workspace/ComfyUI/main.py'; c=open(p).read(); open(p,'w').write('import torch\\nif not hasattr(torch, \\'float8_e8m0fnu\\'): torch.float8_e8m0fnu = getattr(torch, \\'float8_e4m3fn\\', None)\\n' + c)\"",
+    # 🛡️ FATAL BUG FIX: Custom nodes' requirements secretly upgraded `transformers` to 4.49+ which breaks PyTorch 2.5.1.
+    # We forcefully downgrade it back to 4.48.3 here after all nodes are installed to safely prevent the float8_e8m0fnu crash.
+    "python3.12 -m pip install --no-cache-dir transformers==4.48.3",
     "echo '' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     "echo 'sageattn_qk_int8_pv_fp16_triton = sageattn' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     env={"CUDA_HOME": "/usr/local/cuda", "PATH": "/usr/local/cuda/bin:" + os.environ.get("PATH", ""), "FORCE_CUDA": "1", "TORCH_CUDA_ARCH_LIST": "8.9"}

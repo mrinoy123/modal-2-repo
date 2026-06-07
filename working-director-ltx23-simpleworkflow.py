@@ -19,7 +19,7 @@ from fastapi.responses import StreamingResponse
 from typing import Optional
 
 # ==============================================================================
-# PART 2: BASE IMAGE & OS CONFIGURATION
+# PART 2 & 3: BASE IMAGE & OS CONFIGURATION
 # ==============================================================================
 base_image = modal.Image.from_registry(
     "nvidia/cuda:12.5.1-devel-ubuntu24.04",
@@ -29,12 +29,9 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "400"  # Bumping this forces Modal to rebuild the image
+    "FORCE_REBUILD_INDEX": "401"  # Bumped to force Modal rebuild
 })
 
-# ==============================================================================
-# PART 3: CORE PYTHON DEPENDENCIES & ENVIRONMENT VARIABLES
-# ==============================================================================
 build_image = base_image.env({
     "CUDA_HOME": "/usr/local/cuda",
     "PATH": "/usr/local/cuda/bin:" + os.environ.get("PATH", ""),
@@ -51,7 +48,6 @@ build_image = base_image.env({
 # ==============================================================================
 # PART 4: COMFYUI & CUSTOM NODES CLONING
 # ==============================================================================
-# 🛡️ FIX APPLIED HERE: Pinned transformers==4.48.3 to prevent PyTorch 2.6.0 float8 crashes
 torch_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124",
     "python3.12 -m pip install --no-cache-dir diffusers accelerate transformers==4.48.3 torchsde numpy==1.26.4 kornia==0.7.3",
@@ -77,22 +73,17 @@ deps_image = clone_image.run_commands(
 final_image = deps_image.run_commands(
     "echo '' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     "echo 'sageattn_qk_int8_pv_fp16_triton = sageattn' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
-    env={
-        "CUDA_HOME": "/usr/local/cuda",
-        "PATH": "/usr/local/cuda/bin:" + os.environ.get("PATH", ""),
-        "FORCE_CUDA": "1",
-        "TORCH_CUDA_ARCH_LIST": "8.9"
-    }
+    env={"CUDA_HOME": "/usr/local/cuda", "PATH": "/usr/local/cuda/bin:" + os.environ.get("PATH", ""), "FORCE_CUDA": "1", "TORCH_CUDA_ARCH_LIST": "8.9"}
 )
 
 # ==============================================================================
-# PART 5: MODAL APP CONFIGURATION & CLOUD VOLUMES (L40S GPU TARGET)
+# PART 5: MODAL APP CONFIGURATION & CLOUD VOLUMES (L4 24GB GPU TARGET)
 # ==============================================================================
 app = modal.App("media-worker-ltx23")
 weights_volume = modal.Volume.from_name("Ltx-23-model-weights-new", create_if_missing=False)
 
 @app.cls(
-    gpu="L4", 
+    gpu="L4", # 🛡️ Fixed to L4 per your instructions
     image=final_image,
     volumes={"/mnt/weights": weights_volume},
     secrets=[modal.Secret.from_name("custom-secret")],
@@ -104,23 +95,21 @@ class LTX23Engine:
 
     def _log_reader(self):
         for line in iter(self.process.stdout.readline, ""):
-            if line: 
-                print(f"[ComfyUI] {line.strip()}")
+            if line: print(f"[ComfyUI] {line.strip()}")
 
     async def _ram_squeezer(self):
         while True:
             try:
                 with open('/proc/sys/vm/drop_caches', 'w') as f:
                     f.write('1\n')
-            except Exception: 
-                pass
+            except Exception: pass
             await asyncio.sleep(15)
 
     @modal.enter()
     def start_comfy(self):
         import boto3
         
-        # 🔥 CUSTOM NODES: LTXColorFixer, Two-Pass Cache Writers & VAE Armor Patch 🔥
+        # 🔥 CUSTOM NODES: Two-Pass Cache Writers & VAE Armor Patch
         print("🎨 Injecting Smart Nodes, Caches & VAE Memory Protections...")
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline.py"
         with open(custom_nodes_path, "w") as f:
@@ -132,12 +121,7 @@ import nodes
 class LTXColorFixer:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {
-            "image": ("IMAGE",),
-            "target_brightness": ("FLOAT", {"default": 0.40, "min": 0.1, "max": 1.0, "step": 0.05}),
-            "max_boost": ("FLOAT", {"default": 1.6, "min": 1.0, "max": 3.0, "step": 0.1}),
-        }}
-    
+        return {"required": {"image": ("IMAGE",), "target_brightness": ("FLOAT", {"default": 0.40, "min": 0.1, "max": 1.0, "step": 0.05}), "max_boost": ("FLOAT", {"default": 1.6, "min": 1.0, "max": 3.0, "step": 0.1})}}
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "process"
     CATEGORY = "image/postprocessing"
@@ -157,10 +141,8 @@ class LTXColorFixer:
             sat_boost = 1.0 + ((boost - 1.0) * 0.4) 
             img_t = TF.adjust_saturation(img_t, sat_boost)
             image = img_t.permute(0, 2, 3, 1)
-            
         return (image,)
 
-# High-Speed Python Dictionary serving as VRAM Cache Buffer
 LTX_CACHE = {}
 
 class MemoryCacheWriter:
@@ -173,7 +155,7 @@ class MemoryCacheWriter:
             "video_latent": ("LATENT",),
             "audio_latent": ("LATENT",),
             "guide_data": ("GUIDE_DATA",),
-            "frame_rate": ("FLOAT", {"default": 24.0, "forceInput": True}),
+            "frame_rate": ("FLOAT", {"default": 25.0, "forceInput": True}),
             "scene_id": ("STRING", {"default": "0"})
         }}
     RETURN_TYPES = ()
@@ -184,23 +166,17 @@ class MemoryCacheWriter:
     def write_cache(self, model, positive, negative, video_latent, audio_latent, guide_data, frame_rate, scene_id):
         global LTX_CACHE
         LTX_CACHE[str(scene_id)] = {
-            "model": model, 
-            "positive": positive,
-            "negative": negative,
-            "video_latent": video_latent,
-            "audio_latent": audio_latent,
-            "guide_data": guide_data,
-            "frame_rate": frame_rate
+            "model": model, "positive": positive, "negative": negative,
+            "video_latent": video_latent, "audio_latent": audio_latent,
+            "guide_data": guide_data, "frame_rate": frame_rate
         }
-        print(f"\\n[Two-Pass System] 💾 Encoded & Saved Conditionings for Scene {scene_id} into RAM\\n")
+        print(f"\\n[Two-Pass System] 💾 Saved POS & NEG Conditionings + Audio Latent for Scene {scene_id} into RAM\\n")
         return ()
 
 class MemoryCacheReader:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {
-            "scene_id": ("STRING", {"default": "0"})
-        }}
+        return {"required": {"scene_id": ("STRING", {"default": "0"})}}
     RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "LATENT", "GUIDE_DATA", "FLOAT")
     RETURN_NAMES = ("model", "positive", "negative", "video_latent", "audio_latent", "guide_data", "frame_rate")
     FUNCTION = "read_cache"
@@ -211,45 +187,36 @@ class MemoryCacheReader:
         data = LTX_CACHE.get(str(scene_id))
         if data is None:
             raise ValueError(f"Cache for Scene {scene_id} not found in RAM! Text Encoder Pass failed.")
-        print(f"\\n[Two-Pass System] 🚀 Loaded Pre-Cached Conditionings for Scene {scene_id}\\n")
         return (data["model"], data["positive"], data["negative"], data["video_latent"], data["audio_latent"], data["guide_data"], data["frame_rate"])
 
 class FastVAEDecode(nodes.VAEDecode):
     def decode(self, vae, samples):
-        print("\\n[Two-Pass System] 🛡️ Auto-Routing to Tiled VAE Decoding to protect 22B UNet VRAM state.\\n")
         try:
             return (vae.decode_tiled(samples["samples"], tile_x=512, tile_y=512), )
-        except Exception as e:
+        except Exception:
             return super().decode(vae, samples)
 
 NODE_CLASS_MAPPINGS = {
-    "LTXColorFixer": LTXColorFixer,
-    "MemoryCacheWriter": MemoryCacheWriter,
-    "MemoryCacheReader": MemoryCacheReader,
-    "VAEDecode": FastVAEDecode
+    "LTXColorFixer": LTXColorFixer, "MemoryCacheWriter": MemoryCacheWriter,
+    "MemoryCacheReader": MemoryCacheReader, "VAEDecode": FastVAEDecode
 }
 """)
 
         print("🔗 Running Atomic Model Folder Linker for LTX 2.3...")
         base_models_dir = "/workspace/ComfyUI/models"
-        
         dirs = ["unet", "vae", "clip", "text_encoders", "checkpoints", "loras", "upscale_models", "latent_upscale_models"]
-        for d in dirs: 
-            os.makedirs(os.path.join(base_models_dir, d), exist_ok=True)
+        for d in dirs: os.makedirs(os.path.join(base_models_dir, d), exist_ok=True)
 
         if os.path.exists("/mnt/weights"):
             for root_dir, _, files in os.walk("/mnt/weights"):
                 for filename in files:
-                    if not filename.endswith((".safetensors", ".gguf", ".pth", ".pt", ".bin")): 
-                        continue
+                    if not filename.endswith((".safetensors", ".gguf", ".pth", ".pt", ".bin")): continue
                     src_path = os.path.join(root_dir, filename)
                     for target_dir in dirs:
                         dest = os.path.join(base_models_dir, target_dir, filename)
                         if not os.path.exists(dest):
-                            try: 
-                                os.symlink(src_path, dest)
-                            except FileExistsError: 
-                                pass
+                            try: os.symlink(src_path, dest)
+                            except FileExistsError: pass
 
         self.s3 = boto3.client(
             service_name='s3', 
@@ -259,13 +226,12 @@ NODE_CLASS_MAPPINGS = {
             region_name="auto"
         )
 
-        print("🚀 Launching Two-Pass Server Engine on L40S GPU (48GB Native)...")
+        print("🚀 Launching Two-Pass Server Engine on L4 GPU (24GB)...")
         os.makedirs("/tmp/comfy_swap", exist_ok=True)
 
         env_vars = os.environ.copy()
         env_vars["LD_PRELOAD"] = "/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4"
         env_vars["TORCH_NUM_THREADS"] = "1"
-        env_vars["OMP_NUM_THREADS"] = "1"
         env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:64"
         env_vars["CUDA_MODULE_LOADING"] = "LAZY" 
         
@@ -281,37 +247,27 @@ NODE_CLASS_MAPPINGS = {
         start_time = time.time()
         comfy_ready = False
         while time.time() - start_time < 300:
-            if self.process.poll() is not None: 
-                os._exit(1)
+            if self.process.poll() is not None: os._exit(1)
             try:
                 with urllib.request.urlopen("http://127.0.0.1:8188/", timeout=1) as response:
                     if response.status == 200: 
                         comfy_ready = True
                         break
-            except Exception: 
-                time.sleep(2)
+            except Exception: time.sleep(2)
                 
-        if not comfy_ready:
-            os._exit(1)
-
+        if not comfy_ready: os._exit(1)
         print("✅ Base pipeline active. Awaiting Two-Pass API Batch triggers.")
 
     async def clear_comfy_memory(self, session, unload_models=False):
         try:
-            async with session.post("http://127.0.0.1:8188/free", json={"unload_models": unload_models, "free_memory": True}) as r:
-                await r.read()
+            async with session.post("http://127.0.0.1:8188/free", json={"unload_models": unload_models, "free_memory": True}) as r: await r.read()
         except Exception: pass
-        
-        import gc
-        import torch
+        import gc, torch
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.ipc_collect()
-            torch.cuda.reset_peak_memory_stats()
-            
-        try:
-            ctypes.CDLL("libc.so.6").malloc_trim(0)
+        try: ctypes.CDLL("libc.so.6").malloc_trim(0)
         except Exception: pass
         await asyncio.sleep(1)
 
@@ -331,13 +287,9 @@ NODE_CLASS_MAPPINGS = {
                         step_data = history_data[prompt_id]
                         if "status" in step_data and "messages" in step_data["status"]:
                             for msg in step_data["status"]["messages"]:
-                                if msg[0] == "execution_error":
-                                    raise HTTPException(status_code=500, detail=f"ComfyUI execution error: {msg[1]}")
+                                if msg[0] == "execution_error": raise HTTPException(status_code=500, detail=f"ComfyUI execution error: {msg[1]}")
                         return step_data
-            
-            if self.process.poll() is not None:
-                raise HTTPException(status_code=500, detail="ComfyUI server process crashed.")
-                
+            if self.process.poll() is not None: raise HTTPException(status_code=500, detail="ComfyUI server process crashed.")
             await asyncio.sleep(1)
 
     # ==============================================================================
@@ -356,7 +308,6 @@ NODE_CLASS_MAPPINGS = {
         async def process_pipeline():
             date_folder = body.get("date_folder", time.strftime('%Y-%m-%d'))
             batch_scenes = body.get("batch_scenes", [])
-            
             subgraph_1 = body.get("subgraph_1")
             subgraph_2 = body.get("subgraph_2")
 
@@ -372,16 +323,16 @@ NODE_CLASS_MAPPINGS = {
 
             try:
                 async with aiohttp.ClientSession() as session:
-                    custom_w = body.get("custom_width", 576)
-                    custom_h = body.get("custom_height", 1024)
+                    custom_w = body.get("custom_width", 704)
+                    custom_h = body.get("custom_height", 1280)
 
                     # ==============================================================================
-                    # PRE-COMPUTE: Download Images & Calculate Dimensions
+                    # PRE-COMPUTE: Download Images & Audio Context Setup
                     # ==============================================================================
                     for idx, scene in enumerate(batch_scenes):
+                        # --- Image Handling ---
                         target_img_name = f"guide_anchor_{idx}.png"
                         target_path = os.path.join(dynamic_guides_dir, target_img_name)
-                        
                         image_url = scene.get("image_url", "")
                         if image_url:
                             try:
@@ -404,50 +355,69 @@ NODE_CLASS_MAPPINGS = {
                             with open(target_path, "rb") as f:
                                 b64_img = base64.b64encode(f.read()).decode("utf-8")
                                 segments.append({"frame": frame, "image": f"data:image/png;base64,{b64_img}"})
-                        timeline_data_str = json.dumps({"segments": segments, "audioSegments": []})
 
-                        actions = scene.get("kinetic_actions", [])
-                        if not actions: actions = ["The subject moves dynamically across the cinematic scene."]
+                        # --- AUDIO LOGIC FIX (Crucial for Lip Sync) ---
+                        audio_url = scene.get("audio_url", "")
+                        has_audio = False
+                        audio_path = None
+                        if audio_url:
+                            audio_ext = "wav"
+                            audio_path = os.path.join(dynamic_guides_dir, f"audio_{idx}.{audio_ext}")
+                            try:
+                                async with session.get(audio_url, timeout=120) as r:
+                                    if r.status == 200:
+                                        with open(audio_path, "wb") as f: f.write(await r.read())
+                                        has_audio = True
+                            except Exception as e: print(f"Audio download failed: {e}")
+
+                        # Inject Local Audio File directly into Director Timeline
+                        timeline_data = {"segments": segments, "audioSegments": []}
+                        if has_audio:
+                            timeline_data["audioSegments"].append({"audio": audio_path, "start": 0})
                         
+                        scene["_timeline_data_str"] = json.dumps(timeline_data)
+                        scene["_has_audio"] = has_audio
+
+                        # --- Frames & Duration ---
+                        actions = scene.get("kinetic_actions", ["The subject moves dynamically across the cinematic scene."])
                         total_words = sum(len(str(a).split()) for a in actions)
                         seconds = max(total_words / (130 / 60.0), 2.5)  
-                        raw_frames = seconds * 24
+                        raw_frames = seconds * 25 # 🛡️ Forced to 25 FPS for Talking Head support
                         total_frames = int(math.ceil((raw_frames - 1) / 8) * 8 + 1)
                         total_frames = max(33, min(total_frames, 257))
                         
                         num_actions = len(actions)
                         keyframe_steps = [int(i * (total_frames - 1) / max(1, num_actions - 1)) for i in range(num_actions)]
 
-                        style = scene.get("style", "")
-                        subject = scene.get("subject", "")
-                        bg = scene.get("background", "")
-                        light = scene.get("lighting", "")
-                        cam = scene.get("camera", "")
-                        
-                        static_env = f"{subject} {style} {bg} {light}".strip()
+                        # --- Dynamic Prompt Generation ---
+                        static_env = f"{scene.get('subject', '')} {scene.get('style', '')} {scene.get('background', '')} {scene.get('lighting', '')}".strip()
+                        speech_transcript = scene.get("speech_transcript", "")
                         
                         local_prompts_list = []
                         for step_frame, action_text in zip(keyframe_steps, actions):
-                            action_cam = f"{action_text} {cam}".strip()
+                            action_cam = f"{action_text} {scene.get('camera', '')}".strip()
                             fused_prompt = f"{action_cam}. Cinematic environment and styling: {static_env}"
+                            
+                            # 🛡️ IF Audio is present, inject Talking Head Trigger & Transcript
+                            if has_audio:
+                                fused_prompt = f"OHWXPERSON, {fused_prompt}. The person is talking, and says: \"{speech_transcript}\""
+                                
                             local_prompts_list.append(f"{step_frame}: {fused_prompt}")
                             
-                        local_prompts_str = "\n".join(local_prompts_list)
-                        
-                        scene["_timeline_data_str"] = timeline_data_str
-                        scene["_local_prompts_str"] = local_prompts_str
+                        scene["_local_prompts_str"] = "\n".join(local_prompts_list)
                         scene["_total_frames"] = total_frames
                         scene["_seed"] = scene.get("seed", int(time.time() * 1000) % 1000000)
 
                     # ==============================================================================
-                    # PASS 1: TEXT ENCODING & DYNAMIC LORA MATRIX BATCHING
+                    # PASS 1: TEXT ENCODING & DYNAMIC LORA MATRIX
                     # ==============================================================================
                     print("\n[Two-Pass System] 🎬 PASS 1 START: Initiating Text Encoding & LoRA Multiplier Matrix...")
                     pass1_workflow = json.loads(json.dumps(subgraph_1))
                     
+                    # 🛡️ Inject FP4 Model for VRAM efficiency
                     if "98" in pass1_workflow: 
                         pass1_workflow["98"]["inputs"]["unet_name"] = "LTX-2.3-22B-Distilled-FP4ME.safetensors"
-                        pass1_workflow["98"]["inputs"]["weight_dtype"] = "fp8_e4m3fn" # 🛡️ FORCES SAGEATTENTION/FLASHATTENTION TO PREVENT THE 15-SECOND BUGS
+                        pass1_workflow["98"]["inputs"]["weight_dtype"] = "fp8_e4m3fn" 
                         
                     if "97" in pass1_workflow: pass1_workflow["97"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                     if "102" in pass1_workflow: pass1_workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
@@ -472,41 +442,44 @@ NODE_CLASS_MAPPINGS = {
                     }
 
                     for idx, scene in enumerate(batch_scenes):
-                        # 1. Deno Multi Lora Loader (Node 107) - Hardcoded Styles + Dynamic Cameras
+                        # 1. 🛡️ DYNAMIC LORA LOGIC (8 Slots Total)
                         scene_107 = json.loads(json.dumps(tpl_107))
-                        scene_107["inputs"]["lora_1"] = "LTX_2.3_Crisp_Enhance_Style_LoRa.safetensors"
-                        scene_107["inputs"]["strength_1"] = 0.5
-                        scene_107["inputs"]["lora_2"] = "VBVR-official-comfyui.safetensors"
-                        scene_107["inputs"]["strength_2"] = 0.7
-                        scene_107["inputs"]["lora_3"] = "LTX_2.3_Soft_Enhance_Style_LoRa.safetensors"
-                        scene_107["inputs"]["strength_3"] = 0.5
-
-                        active_cameras = []
+                        
+                        # -> Hardcoded Core Styles
+                        lora_stack = [
+                            ("LTX_2.3_Crisp_Enhance_Style_LoRa.safetensors", 0.5),
+                            ("LTX_2.3_Soft_Enhance_Style_LoRa.safetensors", 0.5),
+                            ("VBVR-official-comfyui.safetensors", 0.7),
+                            ("LTX-2.3_Cinematic_hardcut.safetensors", 0.6)
+                        ]
+                        
+                        # -> Conditional Audio/Lip-Sync LoRAs
+                        if scene["_has_audio"]:
+                            lora_stack.append(("LTX_2.3_22b_AV_LoRA_talking_head.safetensors", 1.0))
+                            lora_stack.append(("LTX_2.3_RL_OmniNFT_LoRa.safetensors", 0.8))
+                            
+                        # -> Dynamic Camera LoRAs (Fill remaining empty slots)
                         cam_string = scene.get("camera", "")
                         if cam_string:
-                            cams = [c.strip().lower() for c in cam_string.split("+")]
-                            for c in cams[:3]:
-                                if c in camera_loras_map:
-                                    active_cameras.append(camera_loras_map[c])
+                            for c in [x.strip().lower() for x in cam_string.split("+")]:
+                                if c in camera_loras_map and len(lora_stack) < 8:
+                                    lora_stack.append((camera_loras_map[c], 1.0))
                         
-                        if not active_cameras:
-                            active_cameras.append(camera_loras_map["static"])
-
-                        # Map up to 3 camera LoRAs to slots 4, 5, 6
-                        for i in range(3):
-                            slot = i + 4
-                            if i < len(active_cameras):
-                                scene_107["inputs"][f"lora_{slot}"] = active_cameras[i]
-                                scene_107["inputs"][f"strength_{slot}"] = 1.0
+                        # Apply stack to JSON payload
+                        for i in range(8):
+                            slot = i + 1
+                            if i < len(lora_stack):
+                                scene_107["inputs"][f"lora_{slot}"] = lora_stack[i][0]
+                                scene_107["inputs"][f"strength_{slot}"] = lora_stack[i][1]
                                 scene_107["inputs"][f"enabled_{slot}"] = True
                             else:
                                 scene_107["inputs"][f"lora_{slot}"] = "__none__"
                                 scene_107["inputs"][f"strength_{slot}"] = 0.0
                                 scene_107["inputs"][f"enabled_{slot}"] = False
-                                
+
                         pass1_workflow[f"107_{idx}"] = scene_107
 
-                        # 2. Negative Prompt Encoder (Node 200)
+                        # 2. 🛡️ Negative Prompt Processing (Safely mapped)
                         scene_200 = json.loads(json.dumps(tpl_200))
                         default_neg = "no humans, bad quality, distorted, blurry, watermark"
                         scene_200["inputs"]["text"] = scene.get("negative_prompt", default_neg)
@@ -520,12 +493,9 @@ NODE_CLASS_MAPPINGS = {
                         scene_46["inputs"]["timeline_data"] = scene["_timeline_data_str"]
                         scene_46["inputs"]["model"] = [f"107_{idx}", 0]
                         scene_46["inputs"]["clip"] = [f"107_{idx}", 1]
-                        
-                        # 🛡️ INJECTS YOUTUBE SHORTS (9:16) DIMENSIONS SO IT STAYS FAST
                         scene_46["inputs"]["custom_width"] = custom_w
                         scene_46["inputs"]["custom_height"] = custom_h
-                        scene_46["inputs"]["frame_rate"] = 24 
-                        
+                        scene_46["inputs"]["frame_rate"] = 25 # 🛡️ Fixed 25 FPS for accurate Lip Sync
                         pass1_workflow[f"46_{idx}"] = scene_46
 
                         # 4. Conditioning Matrix (Node 94:5)
@@ -535,13 +505,13 @@ NODE_CLASS_MAPPINGS = {
                         scene_94_5["inputs"]["frame_rate"] = [f"46_{idx}", 5]
                         pass1_workflow[f"94:5_{idx}"] = scene_94_5
 
-                        # 5. Memory Writer (Node 300) - Saves Pos & Neg to RAM
+                        # 5. Memory Writer (Node 300) - Saves Conditionings to RAM
                         scene_300 = json.loads(json.dumps(tpl_300))
                         scene_300["inputs"]["model"] = [f"46_{idx}", 0]
                         scene_300["inputs"]["positive"] = [f"94:5_{idx}", 0]
-                        scene_300["inputs"]["negative"] = [f"94:5_{idx}", 1]
+                        scene_300["inputs"]["negative"] = [f"94:5_{idx}", 1] # 🛡️ Negative prompt correctly piped
                         scene_300["inputs"]["video_latent"] = [f"46_{idx}", 2]
-                        scene_300["inputs"]["audio_latent"] = [f"46_{idx}", 3]
+                        scene_300["inputs"]["audio_latent"] = [f"46_{idx}", 3] # 🛡️ Audio latent cached
                         scene_300["inputs"]["guide_data"] = [f"46_{idx}", 4]
                         scene_300["inputs"]["frame_rate"] = [f"46_{idx}", 5]
                         scene_300["inputs"]["scene_id"] = str(idx)
@@ -558,65 +528,50 @@ NODE_CLASS_MAPPINGS = {
                     
                     for idx, scene in enumerate(batch_scenes):
                         print(f"\n🎬 Rendering Native Scene [{idx+1}/{len(batch_scenes)}]: {scene.get('name', 'Clip')}")
-                        
                         pass2_workflow = json.loads(json.dumps(subgraph_2))
-
                         out_dir = "/workspace/ComfyUI/output"
                         if os.path.exists(out_dir): shutil.rmtree(out_dir)
                         os.makedirs(out_dir)
 
-                        # Inject Models
                         if "103" in pass2_workflow: pass2_workflow["103"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                         if "102" in pass2_workflow: pass2_workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
                         if "94:105" in pass2_workflow: pass2_workflow["94:105"]["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
 
-                        # Set target Scene ID for Memory Cache Reader
+                        # Retrieve correct scene from cache
                         if "400" in pass2_workflow: pass2_workflow["400"]["inputs"]["scene_id"] = str(idx)
 
-                        # Set Noise Seeds
                         scene_seed = scene["_seed"]
                         if "94:28" in pass2_workflow: pass2_workflow["94:28"]["inputs"]["noise_seed"] = scene_seed
                         if "94:108" in pass2_workflow: pass2_workflow["94:108"]["inputs"]["noise_seed"] = scene_seed
 
-                        # 1. STRICT SCHEDULER LOCKS BY ID
                         if "94:11" in pass2_workflow and "inputs" in pass2_workflow["94:11"]:
                             pass2_workflow["94:11"]["inputs"]["steps"] = 12
-                            if "denoise" in pass2_workflow["94:11"]["inputs"]:
-                                pass2_workflow["94:11"]["inputs"]["denoise"] = 1.0
+                            if "denoise" in pass2_workflow["94:11"]["inputs"]: pass2_workflow["94:11"]["inputs"]["denoise"] = 1.0
                         
                         if "94:54" in pass2_workflow and "inputs" in pass2_workflow["94:54"]:
                             pass2_workflow["94:54"]["inputs"]["steps"] = 16
-                            if "denoise" in pass2_workflow["94:54"]["inputs"]:
-                                pass2_workflow["94:54"]["inputs"]["denoise"] = 0.42
+                            if "denoise" in pass2_workflow["94:54"]["inputs"]: pass2_workflow["94:54"]["inputs"]["denoise"] = 0.42
                             
                         if "94:49" in pass2_workflow and "inputs" in pass2_workflow["94:49"]: 
-                            if "cfg" in pass2_workflow["94:49"]["inputs"]:
-                                pass2_workflow["94:49"]["inputs"]["cfg"] = 1.5
+                            if "cfg" in pass2_workflow["94:49"]["inputs"]: pass2_workflow["94:49"]["inputs"]["cfg"] = 1.5
 
-                        # 2. AUDIO SYNC FIX
+                        # 🛡️ Audio Combine Fix (Lock matching frame rate)
                         if "109" in pass2_workflow:
-                            pass2_workflow["109"]["inputs"]["frame_rate"] = 24
-                            if "pingpong" in pass2_workflow["109"]["inputs"]:
-                                pass2_workflow["109"]["inputs"]["pingpong"] = False
+                            pass2_workflow["109"]["inputs"]["frame_rate"] = 25
+                            if "pingpong" in pass2_workflow["109"]["inputs"]: pass2_workflow["109"]["inputs"]["pingpong"] = False
 
-                        # 3. Dynamic Color Fixer Injection
                         if "109" in pass2_workflow and "images" in pass2_workflow["109"]["inputs"]:
                             original_image_source = pass2_workflow["109"]["inputs"]["images"]
                             fixer_id = f"9999_color_fixer_{idx}"
-                            pass2_workflow[fixer_id] = {
-                                "class_type": "LTXColorFixer",
-                                "inputs": {"image": original_image_source, "target_brightness": 0.40, "max_boost": 2.0}
-                            }
+                            pass2_workflow[fixer_id] = {"class_type": "LTXColorFixer", "inputs": {"image": original_image_source, "target_brightness": 0.40, "max_boost": 2.0}}
                             pass2_workflow["109"]["inputs"]["images"] = [fixer_id, 0]
 
                         await self.execute_comfy_workflow(session, pass2_workflow)
 
-                        # Capture & Upload Final Processed Video
                         output_files = []
                         for root_p, _, filenames in os.walk(out_dir):
                             for name in filenames:
-                                if name.endswith((".mp4", ".gif", ".webm")):
-                                    output_files.append(os.path.join(root_p, name))
+                                if name.endswith((".mp4", ".gif", ".webm")): output_files.append(os.path.join(root_p, name))
 
                         if not output_files: raise Exception("Inference finished but no output media files were detected.")
                         
@@ -627,21 +582,15 @@ NODE_CLASS_MAPPINGS = {
                         target_key = f"{date_folder}/generated clips/{int(time.time())}_{scene.get('name', 'clip')}_{saved_filename}"
                         print(f"📤 Syncing Finished Asset to R2: {target_key}")
                         
-                        await asyncio.get_event_loop().run_in_executor(
-                            None, self.s3.upload_file, target_video_file, "video-asset-files-storage-workflow", target_key
-                        )
-
-                        public_path_url = f"https://pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev/{target_key}" 
+                        await asyncio.get_event_loop().run_in_executor(None, self.s3.upload_file, target_video_file, "video-asset-files-storage-workflow", target_key)
                         
                         generated_outputs.append({
                             "scene": scene.get("name", f"Clip_{idx+1}"),
                             "status": "success",
                             "file_key": target_key,
-                            "public_url": public_path_url,
+                            "public_url": f"https://pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev/{target_key}",
                             "filename": saved_filename
                         })
-
-                        # BATCH SPEED RULE: Clean out active rendering cache but keep heavy UNET loaded.
                         await self.clear_comfy_memory(session, unload_models=False)
                     
                     return generated_outputs
@@ -657,13 +606,9 @@ NODE_CLASS_MAPPINGS = {
                 if task in done: break
             try:
                 result = task.result()
-                if isinstance(result, (dict, list)):
-                    yield json.dumps(result).encode("utf-8")
-                else:
-                    yield str(result).encode("utf-8")
-            except HTTPException as e:
-                yield json.dumps({"status": "error", "detail": e.detail}).encode("utf-8")
-            except Exception as e:
-                yield json.dumps({"status": "error", "detail": str(e)}).encode("utf-8")
+                if isinstance(result, (dict, list)): yield json.dumps(result).encode("utf-8")
+                else: yield str(result).encode("utf-8")
+            except HTTPException as e: yield json.dumps({"status": "error", "detail": e.detail}).encode("utf-8")
+            except Exception as e: yield json.dumps({"status": "error", "detail": str(e)}).encode("utf-8")
 
         return StreamingResponse(stream_response(), media_type="application/json")

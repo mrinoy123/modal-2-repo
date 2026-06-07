@@ -14,7 +14,6 @@ import asyncio
 import ctypes
 import base64
 import math
-# Removed "import numpy as np" from here to prevent local GitHub Actions deployment crashes.
 from fastapi import Request, Response, HTTPException, Header
 from fastapi.responses import StreamingResponse
 from typing import Optional
@@ -120,6 +119,17 @@ class LTX23LypsyncEngine:
 import torch
 import torchvision.transforms.functional as TF
 import nodes
+
+# ====================================================================
+# ⚠️ CRITICAL AUDIO VAE BFLOAT16 TYPE-MATCHING HACK ⚠️
+# Intercepts float32 spectrograms and casts them to VAE's native dtype
+# ====================================================================
+import comfy.ldm.lightricks.vae.audio_vae
+_orig_audio_encode = comfy.ldm.lightricks.vae.audio_vae.AudioVAE.encode
+def _patched_audio_encode(self, mel_spec):
+    target_dtype = next(self.autoencoder.parameters()).dtype
+    return _orig_audio_encode(self, mel_spec.to(target_dtype))
+comfy.ldm.lightricks.vae.audio_vae.AudioVAE.encode = _patched_audio_encode
 
 LTX_CACHE = {}
 
@@ -315,8 +325,6 @@ NODE_CLASS_MAPPINGS = {
                         # --- SECURE ASSET DOWNLOAD UTILITY (Handles Private R2 Links) ---
                         async def download_asset(url, target_path):
                             if not url: return False
-                            
-                            # Detect Cloudflare R2 Dev Domain
                             if "pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev" in url:
                                 key = url.split(".dev/")[-1]
                                 try:
@@ -329,7 +337,6 @@ NODE_CLASS_MAPPINGS = {
                                     print(f"❌ Failed to download private R2 asset: {e}")
                                     return False
                             else:
-                                # Fallback for standard public URLs
                                 try:
                                     async with session.get(url, timeout=60) as r:
                                         if r.status == 200:
@@ -338,7 +345,6 @@ NODE_CLASS_MAPPINGS = {
                                 except Exception: pass
                             return False
 
-                        # 1️⃣ Image Processing & Failsafe Black Dummy Creation
                         img1_path = os.path.join(dynamic_guides_dir, f"char1_{idx}.png")
                         img2_path = os.path.join(dynamic_guides_dir, f"char2_{idx}.png")
                         
@@ -354,14 +360,12 @@ NODE_CLASS_MAPPINGS = {
                                 i = Image.open(img_p).convert("RGB")
                                 i.resize((custom_w, custom_h), Image.Resampling.LANCZOS).save(img_p)
 
-                        # 2️⃣ Audio Processing & Failsafe Silence Dummy Creation
                         spk1_path = os.path.join(dynamic_guides_dir, f"spk1_{idx}.wav")
                         spk2_path = os.path.join(dynamic_guides_dir, f"spk2_{idx}.wav")
 
                         await download_asset(scene.get("speaker1_audio_url"), spk1_path)
                         await download_asset(scene.get("speaker2_audio_url"), spk2_path)
                         
-                        # IMPORTS DELAYED UNTIL INSIDE THE CONTAINER ENVIRONMENT
                         import soundfile as sf
                         import librosa
                         import numpy as np 
@@ -382,9 +386,6 @@ NODE_CLASS_MAPPINGS = {
 
                         total_frames = scene.get("total_frames", 161)
 
-                        # ==============================================================================
-                        # SUBGRAPH 1: TEXT, ZERO-SHOT VOICE CLONING & COMPRESSION
-                        # ==============================================================================
                         print(f"\n[Lypsync API] 🎬 Initiating SUBGRAPH 1 (Voice & Embeddings) for Scene {idx}...")
                         sg1 = json.loads(json.dumps(subgraph_1))
                         
@@ -414,9 +415,6 @@ NODE_CLASS_MAPPINGS = {
                         await self.execute_comfy_workflow(session, sg1)
                         await self.clear_comfy_memory(session, unload_models=False)
 
-                        # ==============================================================================
-                        # SUBGRAPH 2: DUAL-CHARACTER VIDEO GENERATION & UPSCALE
-                        # ==============================================================================
                         print(f"\n[Lypsync API] 🚀 Initiating SUBGRAPH 2 (Video Render) for Scene {idx}...")
                         sg2 = json.loads(json.dumps(subgraph_2))
                         out_dir = "/workspace/ComfyUI/output"

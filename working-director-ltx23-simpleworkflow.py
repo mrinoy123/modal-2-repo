@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "410"  # Bumped to force Modal rebuild
+    "FORCE_REBUILD_INDEX": "411"  # Bumped to force Modal rebuild with new patch
 })
 
 build_image = base_image.env({
@@ -71,23 +71,25 @@ deps_image = clone_image.run_commands(
 )
 
 final_image = deps_image.run_commands(
+    # 🛡️ FATAL BUG FIX: Transformers 4.49.0 dropped support for PyTorch 2.5.1 by requiring float8_e8m0fnu. This mock completely neutralizes the crash.
+    "python3.12 -c \"import os; p='/workspace/ComfyUI/main.py'; c=open(p).read(); open(p,'w').write('import torch\\nif not hasattr(torch, \\'float8_e8m0fnu\\'): torch.float8_e8m0fnu = getattr(torch, \\'float8_e4m3fn\\', None)\\n' + c)\"",
     "echo '' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     "echo 'sageattn_qk_int8_pv_fp16_triton = sageattn' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     env={"CUDA_HOME": "/usr/local/cuda", "PATH": "/usr/local/cuda/bin:" + os.environ.get("PATH", ""), "FORCE_CUDA": "1", "TORCH_CUDA_ARCH_LIST": "8.9"}
 )
 
 # ==============================================================================
-# PART 5: MODAL APP CONFIGURATION & CLOUD VOLUMES (L4 24GB GPU TARGET)
+# PART 5: MODAL APP CONFIGURATION & CLOUD VOLUMES (L40S 48GB GPU TARGET)
 # ==============================================================================
 app = modal.App("media-worker-ltx23")
 weights_volume = modal.Volume.from_name("Ltx-23-model-weights-new", create_if_missing=False)
 
 @app.cls(
-    gpu="L40S", # 🛡️ Fixed to L4 per your instructions
+    gpu="L40S", # 🛡️ Fixed to L40S 48GB VRAM configuration
     image=final_image,
     volumes={"/mnt/weights": weights_volume},
     secrets=[modal.Secret.from_name("custom-secret")],
-    memory=8192, 
+    memory=8192, # 🛡️ Fixed at 8GB RAM memory max
     scaledown_window=12,
     timeout=3600
 )
@@ -226,7 +228,7 @@ NODE_CLASS_MAPPINGS = {
             region_name="auto"
         )
 
-        print("🚀 Launching Two-Pass Server Engine on L4 GPU (24GB)...")
+        print("🚀 Launching Two-Pass Server Engine on L40S GPU (48GB)...")
         os.makedirs("/tmp/comfy_swap", exist_ok=True)
 
         env_vars = os.environ.copy()
@@ -323,8 +325,9 @@ NODE_CLASS_MAPPINGS = {
 
             try:
                 async with aiohttp.ClientSession() as session:
-                    custom_w = body.get("custom_width", 704)
-                    custom_h = body.get("custom_height", 1280)
+                    # 🛡️ Starting 9:16 Target Resolution Setup (384x640 cleanly divisible by 32)
+                    custom_w = body.get("custom_width", 384) 
+                    custom_h = body.get("custom_height", 640)
 
                     # ==============================================================================
                     # PRE-COMPUTE: Download Images & Audio Context Setup
@@ -378,25 +381,47 @@ NODE_CLASS_MAPPINGS = {
                         scene["_timeline_data_str"] = json.dumps(timeline_data)
                         scene["_has_audio"] = has_audio
 
-                        # --- Frames & Duration ---
+                        # --- Frames & Exact Audio Lip Sync Duration Matching ---
                         actions = scene.get("kinetic_actions", ["The subject moves dynamically across the cinematic scene."])
-                        total_words = sum(len(str(a).split()) for a in actions)
-                        seconds = max(total_words / (130 / 60.0), 2.5)  
-                        raw_frames = seconds * 25 # 🛡️ Forced to 25 FPS for Talking Head support
-                        total_frames = int(math.ceil((raw_frames - 1) / 8) * 8 + 1)
-                        total_frames = max(33, min(total_frames, 257))
                         
+                        if has_audio and os.path.exists(audio_path):
+                            import soundfile as sf
+                            try:
+                                f = sf.SoundFile(audio_path)
+                                duration = len(f) / f.samplerate
+                                raw_frames = duration * 25 # Must lock exactly to audio length for perfect syncing
+                                total_frames = int(math.ceil((raw_frames - 1) / 8) * 8 + 1)
+                                total_frames = max(33, min(total_frames, 257))
+                            except Exception as e:
+                                print(f"Audio duration read failed: {e}, falling back to word count.")
+                                total_words = sum(len(str(a).split()) for a in actions)
+                                seconds = max(total_words / (130 / 60.0), 2.5)  
+                                raw_frames = seconds * 25
+                                total_frames = int(math.ceil((raw_frames - 1) / 8) * 8 + 1)
+                                total_frames = max(33, min(total_frames, 257))
+                        else:
+                            total_words = sum(len(str(a).split()) for a in actions)
+                            seconds = max(total_words / (130 / 60.0), 2.5)  
+                            raw_frames = seconds * 25
+                            total_frames = int(math.ceil((raw_frames - 1) / 8) * 8 + 1)
+                            total_frames = max(33, min(total_frames, 257))
+                            
                         num_actions = len(actions)
-                        keyframe_steps = [int(i * (total_frames - 1) / max(1, num_actions - 1)) for i in range(num_actions)]
+                        keyframe_steps = [int(i * (total_frames - 1) / max(1, num_actions - 1)) for i in range(max(1, num_actions))]
 
                         # --- Dynamic Prompt Generation ---
                         static_env = f"{scene.get('subject', '')} {scene.get('style', '')} {scene.get('background', '')} {scene.get('lighting', '')}".strip()
                         speech_transcript = scene.get("speech_transcript", "")
+                        audio_prompt = scene.get("audio_prompt", "") 
                         
                         local_prompts_list = []
                         for step_frame, action_text in zip(keyframe_steps, actions):
                             action_cam = f"{action_text} {scene.get('camera', '')}".strip()
                             fused_prompt = f"{action_cam}. Cinematic environment and styling: {static_env}"
+                            
+                            # 🛡️ Integrate the Audio Prompt explicitly so it's compiled accurately as Audio Conditioning
+                            if audio_prompt:
+                                fused_prompt = f"{fused_prompt}. Sound/Audio FX: {audio_prompt}"
                             
                             # 🛡️ IF Audio is present, inject Talking Head Trigger & Transcript
                             if has_audio:
@@ -479,7 +504,7 @@ NODE_CLASS_MAPPINGS = {
 
                         pass1_workflow[f"107_{idx}"] = scene_107
 
-                        # 2. 🛡️ Negative Prompt Processing (Safely mapped)
+                        # 2. 🛡️ Negative Prompt Processing (Safely mapped into Node 200 & 300 Cache)
                         scene_200 = json.loads(json.dumps(tpl_200))
                         default_neg = "no humans, bad quality, distorted, blurry, watermark"
                         scene_200["inputs"]["text"] = scene.get("negative_prompt", default_neg)
@@ -509,7 +534,7 @@ NODE_CLASS_MAPPINGS = {
                         scene_300 = json.loads(json.dumps(tpl_300))
                         scene_300["inputs"]["model"] = [f"46_{idx}", 0]
                         scene_300["inputs"]["positive"] = [f"94:5_{idx}", 0]
-                        scene_300["inputs"]["negative"] = [f"94:5_{idx}", 1] # 🛡️ Negative prompt correctly piped
+                        scene_300["inputs"]["negative"] = [f"94:5_{idx}", 1] # 🛡️ Negative prompt correctly piped & cached
                         scene_300["inputs"]["video_latent"] = [f"46_{idx}", 2]
                         scene_300["inputs"]["audio_latent"] = [f"46_{idx}", 3] # 🛡️ Audio latent cached
                         scene_300["inputs"]["guide_data"] = [f"46_{idx}", 4]
@@ -549,7 +574,7 @@ NODE_CLASS_MAPPINGS = {
                             if "denoise" in pass2_workflow["94:11"]["inputs"]: pass2_workflow["94:11"]["inputs"]["denoise"] = 1.0
                         
                         if "94:54" in pass2_workflow and "inputs" in pass2_workflow["94:54"]:
-                            pass2_workflow["94:54"]["inputs"]["steps"] = 16
+                            pass2_workflow["94:54"]["inputs"]["steps"] = 8 # 🛡️ Upsampler steps securely locked at 8
                             if "denoise" in pass2_workflow["94:54"]["inputs"]: pass2_workflow["94:54"]["inputs"]["denoise"] = 0.42
                             
                         if "94:49" in pass2_workflow and "inputs" in pass2_workflow["94:49"]: 

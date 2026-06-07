@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "411"  # Bumped to force Modal rebuild with the clean fix
+    "FORCE_REBUILD_INDEX": "416"  # Bumped to force Modal rebuild with 16kHz Phoneme Fix
 })
 
 build_image = base_image.env({
@@ -71,8 +71,6 @@ deps_image = clone_image.run_commands(
 )
 
 final_image = deps_image.run_commands(
-    # 🛡️ FATAL BUG FIX: Custom nodes' requirements secretly upgraded `transformers` to 4.49+ which breaks PyTorch 2.5.1.
-    # We forcefully downgrade it back to 4.48.3 here after all nodes are installed to safely prevent the float8_e8m0fnu crash.
     "python3.12 -m pip install --no-cache-dir transformers==4.48.3",
     "echo '' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     "echo 'sageattn_qk_int8_pv_fp16_triton = sageattn' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
@@ -86,11 +84,11 @@ app = modal.App("media-worker-ltx23")
 weights_volume = modal.Volume.from_name("Ltx-23-model-weights-new", create_if_missing=False)
 
 @app.cls(
-    gpu="L40S", # 🛡️ Fixed to L40S 48GB VRAM configuration
+    gpu="L40S", 
     image=final_image,
     volumes={"/mnt/weights": weights_volume},
     secrets=[modal.Secret.from_name("custom-secret")],
-    memory=8192, # 🛡️ Fixed at 8GB RAM memory max
+    memory=8192, 
     scaledown_window=12,
     timeout=3600
 )
@@ -112,7 +110,6 @@ class LTX23Engine:
     def start_comfy(self):
         import boto3
         
-        # 🔥 CUSTOM NODES: Two-Pass Cache Writers & VAE Armor Patch
         print("🎨 Injecting Smart Nodes, Caches & VAE Memory Protections...")
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline.py"
         with open(custom_nodes_path, "w") as f:
@@ -326,13 +323,10 @@ NODE_CLASS_MAPPINGS = {
 
             try:
                 async with aiohttp.ClientSession() as session:
-                    # 🛡️ Starting 9:16 Target Resolution Setup (384x640 cleanly divisible by 32)
+                    # 🛡️ Target Resolution Setup (384x640 cleanly divisible by 32)
                     custom_w = body.get("custom_width", 384) 
                     custom_h = body.get("custom_height", 640)
 
-                    # ==============================================================================
-                    # PRE-COMPUTE: Download Images & Audio Context Setup
-                    # ==============================================================================
                     for idx, scene in enumerate(batch_scenes):
                         # --- Image Handling ---
                         target_img_name = f"guide_anchor_{idx}.png"
@@ -360,7 +354,7 @@ NODE_CLASS_MAPPINGS = {
                                 b64_img = base64.b64encode(f.read()).decode("utf-8")
                                 segments.append({"frame": frame, "image": f"data:image/png;base64,{b64_img}"})
 
-                        # --- AUDIO LOGIC FIX (Crucial for Lip Sync) ---
+                        # --- PHONEME AUDIO LOGIC FIX (Solves Inaccurate Lip Syncing) ---
                         audio_url = scene.get("audio_url", "")
                         has_audio = False
                         audio_path = None
@@ -374,27 +368,43 @@ NODE_CLASS_MAPPINGS = {
                                         has_audio = True
                             except Exception as e: print(f"Audio download failed: {e}")
 
-                        # Inject Local Audio File directly into Director Timeline
-                        timeline_data = {"segments": segments, "audioSegments": []}
-                        if has_audio:
-                            timeline_data["audioSegments"].append({"audio": audio_path, "start": 0})
-                        
-                        scene["_timeline_data_str"] = json.dumps(timeline_data)
-                        scene["_has_audio"] = has_audio
-
-                        # --- Frames & Exact Audio Lip Sync Duration Matching ---
                         actions = scene.get("kinetic_actions", ["The subject moves dynamically across the cinematic scene."])
+                        total_frames = 33 
                         
                         if has_audio and os.path.exists(audio_path):
+                            import librosa
                             import soundfile as sf
+                            import numpy as np
                             try:
-                                f = sf.SoundFile(audio_path)
-                                duration = len(f) / f.samplerate
-                                raw_frames = duration * 25 # Must lock exactly to audio length for perfect syncing
+                                # 🛡️ CRITICAL FIX: LTX Audio VAE *REQUIRES* exactly 16kHz Mono sample rate.
+                                # If TTS gives 44.1kHz and it isn't downsampled, phonemes distort heavily.
+                                data, samplerate = librosa.load(audio_path, sr=16000, mono=True)
+                                data = data.reshape(-1, 1) # Ensure 2D for stacking
+                                
+                                duration = len(data) / 16000.0
+                                raw_frames = duration * 25
+                                
+                                # Lock frames to exact LTX mathematical requirement
                                 total_frames = int(math.ceil((raw_frames - 1) / 8) * 8 + 1)
                                 total_frames = max(33, min(total_frames, 257))
+                                
+                                # PERFECT SYNC FIX: Physically Pad/Trim the Audio File to exactly match Frame duration
+                                target_duration = total_frames / 25.0
+                                target_samples = int(target_duration * 16000)
+                                
+                                if len(data) < target_samples:
+                                    padding_samples = target_samples - len(data)
+                                    silence = np.zeros((padding_samples, 1), dtype=data.dtype)
+                                    data = np.vstack((data, silence))
+                                elif len(data) > target_samples:
+                                    data = data[:target_samples]
+                                    
+                                # Save out strictly formatted 16kHz Audio
+                                sf.write(audio_path, data, 16000)
+                                print(f"🎤 [Audio Sync] Resampled to 16kHz & Padded exactly {duration:.3f}s to {target_duration:.3f}s")
+
                             except Exception as e:
-                                print(f"Audio duration read failed: {e}, falling back to word count.")
+                                print(f"Audio processing failed: {e}")
                                 total_words = sum(len(str(a).split()) for a in actions)
                                 seconds = max(total_words / (130 / 60.0), 2.5)  
                                 raw_frames = seconds * 25
@@ -406,11 +416,17 @@ NODE_CLASS_MAPPINGS = {
                             raw_frames = seconds * 25
                             total_frames = int(math.ceil((raw_frames - 1) / 8) * 8 + 1)
                             total_frames = max(33, min(total_frames, 257))
-                            
+
+                        timeline_data = {"segments": segments, "audioSegments": []}
+                        if has_audio:
+                            timeline_data["audioSegments"].append({"audio": audio_path, "start": 0})
+                        
+                        scene["_timeline_data_str"] = json.dumps(timeline_data)
+                        scene["_has_audio"] = has_audio
+
                         num_actions = len(actions)
                         keyframe_steps = [int(i * (total_frames - 1) / max(1, num_actions - 1)) for i in range(max(1, num_actions))]
 
-                        # --- Dynamic Prompt Generation ---
                         static_env = f"{scene.get('subject', '')} {scene.get('style', '')} {scene.get('background', '')} {scene.get('lighting', '')}".strip()
                         speech_transcript = scene.get("speech_transcript", "")
                         audio_prompt = scene.get("audio_prompt", "") 
@@ -420,13 +436,8 @@ NODE_CLASS_MAPPINGS = {
                             action_cam = f"{action_text} {scene.get('camera', '')}".strip()
                             fused_prompt = f"{action_cam}. Cinematic environment and styling: {static_env}"
                             
-                            # 🛡️ Integrate the Audio Prompt explicitly so it's compiled accurately as Audio Conditioning
-                            if audio_prompt:
-                                fused_prompt = f"{fused_prompt}. Sound/Audio FX: {audio_prompt}"
-                            
-                            # 🛡️ IF Audio is present, inject Talking Head Trigger & Transcript
-                            if has_audio:
-                                fused_prompt = f"OHWXPERSON, {fused_prompt}. The person is talking, and says: \"{speech_transcript}\""
+                            if audio_prompt: fused_prompt = f"{fused_prompt}. Sound/Audio FX: {audio_prompt}"
+                            if has_audio: fused_prompt = f"OHWXPERSON, {fused_prompt}. The person is talking, and says: \"{speech_transcript}\""
                                 
                             local_prompts_list.append(f"{step_frame}: {fused_prompt}")
                             
@@ -440,7 +451,6 @@ NODE_CLASS_MAPPINGS = {
                     print("\n[Two-Pass System] 🎬 PASS 1 START: Initiating Text Encoding & LoRA Multiplier Matrix...")
                     pass1_workflow = json.loads(json.dumps(subgraph_1))
                     
-                    # 🛡️ Inject FP4 Model for VRAM efficiency
                     if "98" in pass1_workflow: 
                         pass1_workflow["98"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
                         pass1_workflow["98"]["inputs"]["weight_dtype"] = "fp8_e4m3fn" 
@@ -468,10 +478,7 @@ NODE_CLASS_MAPPINGS = {
                     }
 
                     for idx, scene in enumerate(batch_scenes):
-                        # 1. 🛡️ DYNAMIC LORA LOGIC (8 Slots Total)
                         scene_107 = json.loads(json.dumps(tpl_107))
-                        
-                        # -> Hardcoded Core Styles
                         lora_stack = [
                             ("LTX_2.3_Crisp_Enhance_Style_LoRa.safetensors", 0.5),
                             ("LTX_2.3_Soft_Enhance_Style_LoRa.safetensors", 0.5),
@@ -479,19 +486,16 @@ NODE_CLASS_MAPPINGS = {
                             ("LTX-2.3_Cinematic_hardcut.safetensors", 0.6)
                         ]
                         
-                        # -> Conditional Audio/Lip-Sync LoRAs
                         if scene["_has_audio"]:
                             lora_stack.append(("LTX_2.3_22b_AV_LoRA_talking_head.safetensors", 1.0))
                             lora_stack.append(("LTX_2.3_RL_OmniNFT_LoRa.safetensors", 0.8))
                             
-                        # -> Dynamic Camera LoRAs (Fill remaining empty slots)
                         cam_string = scene.get("camera", "")
                         if cam_string:
                             for c in [x.strip().lower() for x in cam_string.split("+")]:
                                 if c in camera_loras_map and len(lora_stack) < 8:
                                     lora_stack.append((camera_loras_map[c], 1.0))
                         
-                        # Apply stack to JSON payload
                         for i in range(8):
                             slot = i + 1
                             if i < len(lora_stack):
@@ -505,14 +509,11 @@ NODE_CLASS_MAPPINGS = {
 
                         pass1_workflow[f"107_{idx}"] = scene_107
 
-                        # 2. 🛡️ Negative Prompt Processing (Safely mapped into Node 200 & 300 Cache)
                         scene_200 = json.loads(json.dumps(tpl_200))
-                        default_neg = "no humans, bad quality, distorted, blurry, watermark"
-                        scene_200["inputs"]["text"] = scene.get("negative_prompt", default_neg)
+                        scene_200["inputs"]["text"] = scene.get("negative_prompt", "no humans, bad quality, distorted, blurry, watermark")
                         scene_200["inputs"]["clip"] = [f"107_{idx}", 1]
                         pass1_workflow[f"200_{idx}"] = scene_200
 
-                        # 3. LTX Director (Node 46) 
                         scene_46 = json.loads(json.dumps(tpl_46))
                         scene_46["inputs"]["duration_frames"] = scene["_total_frames"]
                         scene_46["inputs"]["local_prompts"] = scene["_local_prompts_str"]
@@ -521,23 +522,21 @@ NODE_CLASS_MAPPINGS = {
                         scene_46["inputs"]["clip"] = [f"107_{idx}", 1]
                         scene_46["inputs"]["custom_width"] = custom_w
                         scene_46["inputs"]["custom_height"] = custom_h
-                        scene_46["inputs"]["frame_rate"] = 25 # 🛡️ Fixed 25 FPS for accurate Lip Sync
+                        scene_46["inputs"]["frame_rate"] = 25 
                         pass1_workflow[f"46_{idx}"] = scene_46
 
-                        # 4. Conditioning Matrix (Node 94:5)
                         scene_94_5 = json.loads(json.dumps(tpl_94_5))
                         scene_94_5["inputs"]["positive"] = [f"46_{idx}", 1]
                         scene_94_5["inputs"]["negative"] = [f"200_{idx}", 0]
                         scene_94_5["inputs"]["frame_rate"] = [f"46_{idx}", 5]
                         pass1_workflow[f"94:5_{idx}"] = scene_94_5
 
-                        # 5. Memory Writer (Node 300) - Saves Conditionings to RAM
                         scene_300 = json.loads(json.dumps(tpl_300))
                         scene_300["inputs"]["model"] = [f"46_{idx}", 0]
                         scene_300["inputs"]["positive"] = [f"94:5_{idx}", 0]
-                        scene_300["inputs"]["negative"] = [f"94:5_{idx}", 1] # 🛡️ Negative prompt correctly piped & cached
+                        scene_300["inputs"]["negative"] = [f"94:5_{idx}", 1] 
                         scene_300["inputs"]["video_latent"] = [f"46_{idx}", 2]
-                        scene_300["inputs"]["audio_latent"] = [f"46_{idx}", 3] # 🛡️ Audio latent cached
+                        scene_300["inputs"]["audio_latent"] = [f"46_{idx}", 3] 
                         scene_300["inputs"]["guide_data"] = [f"46_{idx}", 4]
                         scene_300["inputs"]["frame_rate"] = [f"46_{idx}", 5]
                         scene_300["inputs"]["scene_id"] = str(idx)
@@ -563,7 +562,6 @@ NODE_CLASS_MAPPINGS = {
                         if "102" in pass2_workflow: pass2_workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
                         if "94:105" in pass2_workflow: pass2_workflow["94:105"]["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
 
-                        # Retrieve correct scene from cache
                         if "400" in pass2_workflow: pass2_workflow["400"]["inputs"]["scene_id"] = str(idx)
 
                         scene_seed = scene["_seed"]
@@ -575,16 +573,24 @@ NODE_CLASS_MAPPINGS = {
                             if "denoise" in pass2_workflow["94:11"]["inputs"]: pass2_workflow["94:11"]["inputs"]["denoise"] = 1.0
                         
                         if "94:54" in pass2_workflow and "inputs" in pass2_workflow["94:54"]:
-                            pass2_workflow["94:54"]["inputs"]["steps"] = 8 # 🛡️ Upsampler steps securely locked at 8
+                            pass2_workflow["94:54"]["inputs"]["steps"] = 8 
                             if "denoise" in pass2_workflow["94:54"]["inputs"]: pass2_workflow["94:54"]["inputs"]["denoise"] = 0.42
                             
                         if "94:49" in pass2_workflow and "inputs" in pass2_workflow["94:49"]: 
                             if "cfg" in pass2_workflow["94:49"]["inputs"]: pass2_workflow["94:49"]["inputs"]["cfg"] = 1.5
 
-                        # 🛡️ Audio Combine Fix (Lock matching frame rate)
                         if "109" in pass2_workflow:
                             pass2_workflow["109"]["inputs"]["frame_rate"] = 25
                             if "pingpong" in pass2_workflow["109"]["inputs"]: pass2_workflow["109"]["inputs"]["pingpong"] = False
+
+                        if scene["_has_audio"]:
+                            load_audio_id = f"9998_load_audio_{idx}"
+                            pass2_workflow[load_audio_id] = {
+                                "class_type": "LoadAudio",
+                                "inputs": { "audio": f"dynamic_guides/audio_{idx}.wav" }
+                            }
+                            if "109" in pass2_workflow:
+                                pass2_workflow["109"]["inputs"]["audio"] = [load_audio_id, 0]
 
                         if "109" in pass2_workflow and "images" in pass2_workflow["109"]["inputs"]:
                             original_image_source = pass2_workflow["109"]["inputs"]["images"]

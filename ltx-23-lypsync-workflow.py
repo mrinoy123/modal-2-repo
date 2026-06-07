@@ -122,14 +122,21 @@ import nodes
 
 # ====================================================================
 # ⚠️ CRITICAL AUDIO VAE BFLOAT16 TYPE-MATCHING HACK ⚠️
-# Intercepts float32 spectrograms and casts them to VAE's native dtype
+# Intercepts float32 spectrograms exactly at the Autoencoder Boundary
 # ====================================================================
-import comfy.ldm.lightricks.vae.audio_vae
-_orig_audio_encode = comfy.ldm.lightricks.vae.audio_vae.AudioVAE.encode
-def _patched_audio_encode(self, mel_spec):
-    target_dtype = next(self.autoencoder.parameters()).dtype
-    return _orig_audio_encode(self, mel_spec.to(target_dtype))
-comfy.ldm.lightricks.vae.audio_vae.AudioVAE.encode = _patched_audio_encode
+import comfy.ldm.lightricks.vae.causal_audio_autoencoder
+
+_orig_causal_encode = comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.encode
+def _patched_causal_encode(self, x):
+    target_dtype = next(self.parameters()).dtype
+    return _orig_causal_encode(self, x.to(target_dtype))
+comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.encode = _patched_causal_encode
+
+_orig_causal_decode = comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.decode
+def _patched_causal_decode(self, z):
+    target_dtype = next(self.parameters()).dtype
+    return _orig_causal_decode(self, z.to(target_dtype))
+comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.decode = _patched_causal_decode
 
 LTX_CACHE = {}
 

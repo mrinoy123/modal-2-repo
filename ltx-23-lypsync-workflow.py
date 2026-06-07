@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "422"  # Bumped for caching reset
+    "FORCE_REBUILD_INDEX": "422"  # ⚠️ Bumped to force fresh install of missing Audio dependencies
 })
 
 build_image = base_image.env({
@@ -42,7 +42,8 @@ build_image = base_image.env({
     "CXX": "g++"
 }).run_commands(
     "python3.12 -m pip install --no-cache-dir fastapi aiohttp boto3 triton>=3.1.0 ninja setuptools>=70.0.0 wheel pip>=24.0 Pillow",
-    "python3.12 -m pip install --no-cache-dir pandas numexpr pytz python-dateutil scipy matplotlib colorama torchvision librosa soundfile decord imageio scikit-image numba einops bitsandbytes"
+    # ⚠️ CRITICAL FIX: "rotary_embedding_torch" explicitly added here because Kijai moved to pyproject.toml
+    "python3.12 -m pip install --no-cache-dir pandas numexpr pytz python-dateutil scipy matplotlib colorama torchvision librosa soundfile decord imageio scikit-image numba einops bitsandbytes rotary_embedding_torch"
 )
 
 # ==============================================================================
@@ -61,7 +62,6 @@ clone_image = torch_image.run_commands(
     "git clone --depth 1 https://github.com/WhatDreamsCost/WhatDreamsCost-ComfyUI.git /workspace/ComfyUI/custom_nodes/WhatDreamsCost-ComfyUI",
     "git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git /workspace/ComfyUI/custom_nodes/ComfyUI-KJNodes",
     "git clone --depth 1 https://github.com/Deno2026/comfyui-deno-custom-nodes.git /workspace/ComfyUI/custom_nodes/comfyui-deno-custom-nodes",
-    # ⚠️ Added Core Audio Processing Suites for Voice Cloning & RoFormer
     "git clone --depth 1 https://github.com/kijai/ComfyUI-MelBandRoFormer.git /workspace/ComfyUI/custom_nodes/ComfyUI-MelBandRoFormer",
     "git clone --depth 1 https://github.com/filliptm/ComfyUI_FL-CosyVoice3.git /workspace/ComfyUI/custom_nodes/ComfyUI_FL-CosyVoice3"
 )
@@ -151,8 +151,6 @@ class MemoryCacheReader:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {"scene_id": ("STRING", {"default": "0"})}}
-    # ⚠️ CRITICAL FIX: We inject a dummy 'MODEL' output at index 0 
-    # This prevents your exact Subgraph 2 JSON links [301, 1], [301, 2], etc. from misaligning!
     RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "LATENT")
     RETURN_NAMES = ("model", "positive", "negative", "video_latent", "audio_latent")
     FUNCTION = "read_cache"
@@ -184,25 +182,21 @@ NODE_CLASS_MAPPINGS = {
         dirs = ["unet", "vae", "clip", "text_encoders", "checkpoints", "loras", "upscale_models", "latent_upscale_models", "cosyvoice", "melbandroformer"]
         for d in dirs: os.makedirs(os.path.join(base_models_dir, d), exist_ok=True)
 
-        # ⚠️ CRITICAL FIX: CosyVoice strictly relies on the internal architecture alongside its `.yaml` & `.onnx` configurations.
-        # Direct folder symlinking is utilized here specifically so that its internal structure isn't flattened.
         cv_source = "/mnt/weights/cosyvoice3"
         cv_dest = os.path.join(base_models_dir, "cosyvoice", "Fun-CosyVoice3-0.5B")
         if os.path.exists(cv_source) and not os.path.exists(cv_dest):
             os.symlink(cv_source, cv_dest)
             print(f"🔗 Symlinked strictly structured CosyVoice3 folder to {cv_dest}")
 
-        # Fallback flat file linker for everything else natively.
         if os.path.exists("/mnt/weights"):
             for root_dir, _, files in os.walk("/mnt/weights"):
-                # Avoid destroying the folder tree if it's already mapped
                 if "cosyvoice3" in root_dir.split(os.sep): 
                     continue 
                 for filename in files:
                     if not filename.endswith((".safetensors", ".gguf", ".pth", ".pt", ".bin", ".onnx", ".yaml", ".json")): continue
                     src_path = os.path.join(root_dir, filename)
                     for target_dir in dirs:
-                        if target_dir == "cosyvoice": continue # Skip flattened link for cosyvoice 
+                        if target_dir == "cosyvoice": continue 
                         dest = os.path.join(base_models_dir, target_dir, filename)
                         if not os.path.exists(dest):
                             try: os.symlink(src_path, dest)

@@ -14,7 +14,7 @@ import asyncio
 import ctypes
 import base64
 import math
-import numpy as np
+# Removed "import numpy as np" from here to prevent local GitHub Actions deployment crashes.
 from fastapi import Request, Response, HTTPException, Header
 from fastapi.responses import StreamingResponse
 from typing import Optional
@@ -30,7 +30,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "424"  
+    "FORCE_REBUILD_INDEX": "422"  
 })
 
 build_image = base_image.env({
@@ -361,8 +361,11 @@ NODE_CLASS_MAPPINGS = {
                         await download_asset(scene.get("speaker1_audio_url"), spk1_path)
                         await download_asset(scene.get("speaker2_audio_url"), spk2_path)
                         
+                        # IMPORTS DELAYED UNTIL INSIDE THE CONTAINER ENVIRONMENT
                         import soundfile as sf
                         import librosa
+                        import numpy as np 
+                        
                         for aud_p in [spk1_path, spk2_path]:
                             if not os.path.exists(aud_p):
                                 print(f"⚠️ Audio not found, generating safety silence: {aud_p}")

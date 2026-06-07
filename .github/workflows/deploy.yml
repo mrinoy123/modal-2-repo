@@ -20,6 +20,7 @@ on:
           - LTX-23-new
           - ltx-19b
           - sonic-1vpsync
+          - ltx-23-lypsync-workflow
 
 # ==============================================================================
 # PART 2: ISOLATED DEPLOYMENT ENVIRONMENT ORCHESTRATION
@@ -78,6 +79,11 @@ jobs:
           elif [ "$TARGET" = "sonic-1vpsync" ]; then
             echo "Deploying sonic-1vpsync Video API to Account 2..."
             modal deploy sonic-1vpsync.py
+
+          elif [ "$TARGET" = "ltx-23-lypsync-workflow" ]; then
+            echo "🚀 Deploying completely brand-new ltx-23-lypsync-workflow Video API to Account 2..."
+            echo "ℹ️ This execution thread establishes an independent, unshared container snapshot image."
+            modal deploy ltx-23-lypsync-workflow.py
             
           else
             echo "❌ Error: Unknown deployment target '$TARGET'"

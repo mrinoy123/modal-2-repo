@@ -357,7 +357,7 @@ NODE_CLASS_MAPPINGS = {
     # ==============================================================================
     # PART 6: LYPSYNC BATCH ENDPOINT 
     # ==============================================================================
-    @modal.web_endpoint(method="POST")
+    @modal.fastapi_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
         if x_api_key != "testing-modal-workflow-2": 
             raise HTTPException(status_code=403, detail="Unauthorized Pipeline Request")

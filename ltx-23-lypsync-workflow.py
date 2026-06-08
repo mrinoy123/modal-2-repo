@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "429"  # ⚠️ Bumped to force full rebuild with SafeLatentUpscale
+    "FORCE_REBUILD_INDEX": "429"  # ⚠️ Bumped to ensure clean pipeline refresh
 })
 
 build_image = base_image.env({
@@ -460,7 +460,8 @@ NODE_CLASS_MAPPINGS = {
                         sg1 = json.loads(json.dumps(subgraph_1))
                         
                         if "1" in sg1: sg1["1"]["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
-                        if "369" in sg1: sg1["369"]["inputs"]["model"] = "MelBandRoformer_fp32.safetensors"
+                        # 🛡️ THE FIX: Restored "model_name" for KJNodes MelBandRoformer 
+                        if "369" in sg1: sg1["369"]["inputs"]["model_name"] = "MelBandRoformer_fp32.safetensors"
                         if "367" in sg1: sg1["367"]["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
                         
                         if "368" in sg1:

@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "427"  # ⚠️ Bumped to force the new transformers installation
+    "FORCE_REBUILD_INDEX": "428"  # ⚠️ Bumped to 428 to force a clean cache rebuild with the new patches
 })
 
 build_image = base_image.env({
@@ -78,6 +78,10 @@ final_image = deps_image.run_commands(
     "python3.12 -m pip install --no-cache-dir transformers>=4.49.0",
     "echo '' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     "echo 'sageattn_qk_int8_pv_fp16_triton = sageattn' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
+    
+    # 👇 ADDED PATCH: Mocks the missing dtype in PyTorch 2.5.1 so transformers doesn't crash CosyVoice3's Qwen2 import
+    "echo 'import sys; sys.modules[\"torch\"].float8_e8m0fnu = getattr(sys.modules[\"torch\"], \"float8_e8m0fnu\", sys.modules[\"torch\"].float32)' >> /usr/local/lib/python3.12/site-packages/torch/__init__.py",
+    
     env={"CUDA_HOME": "/usr/local/cuda", "PATH": "/usr/local/cuda/bin:" + os.environ.get("PATH", ""), "FORCE_CUDA": "1", "TORCH_CUDA_ARCH_LIST": "8.9"}
 )
 

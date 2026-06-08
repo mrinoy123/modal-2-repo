@@ -113,7 +113,7 @@ class LTX23LypsyncEngine:
     def start_comfy(self):
         import boto3
         
-        print("🎨 Injecting Smart Nodes, Caches & Lypsync Memory Protections...")
+        print("🎨 Injecting Smart Nodes, Caches & Global AV Latent Protections...")
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline.py"
         with open(custom_nodes_path, "w") as f:
             f.write("""
@@ -121,6 +121,8 @@ import torch
 import torchvision.transforms.functional as TF
 import nodes
 import comfy.utils
+import comfy_extras.nodes_lt
+import comfy.samplers
 
 # ====================================================================
 # ⚠️ CRITICAL AUDIO VAE BFLOAT16 TYPE-MATCHING HACK ⚠️
@@ -162,7 +164,6 @@ class MemoryCacheWriter:
             "positive": positive, "negative": negative,
             "video_latent": video_latent, "audio_latent": audio_latent
         }
-        print(f"\\n[Lypsync System] 💾 Saved Conditionings & Dual-Audio Latent for Scene {scene_id} into RAM\\n")
         return ()
 
 class MemoryCacheReader:
@@ -177,20 +178,76 @@ class MemoryCacheReader:
     def read_cache(self, scene_id):
         global LTX_CACHE
         data = LTX_CACHE.get(str(scene_id))
-        if data is None:
-            raise ValueError(f"Cache for Scene {scene_id} not found in RAM! Subgraph 1 Pass failed.")
+        if data is None: raise ValueError(f"Cache for Scene {scene_id} not found in RAM!")
         return (None, data["positive"], data["negative"], data["video_latent"], data["audio_latent"])
 
 class FastVAEDecode(nodes.VAEDecode):
     def decode(self, vae, samples):
-        try:
-            return (vae.decode_tiled(samples["samples"], tile_x=512, tile_y=512), )
-        except Exception:
-            return super().decode(vae, samples)
+        try: return (vae.decode_tiled(samples["samples"], tile_x=512, tile_y=512), )
+        except Exception: return super().decode(vae, samples)
 
 # ====================================================================
-# 🛡️ THE BULLETPROOF NESTED-TENSOR UPSCALER 
+# 🛡️ THE BULLETPROOF NODE OVERRIDES (PyTorch 2.5 Fix) 🛡️
+# Hard-replaces ComfyUI's default nodes to intercept NestedTensors safely.
 # ====================================================================
+
+# 1. Override the Scheduler Node
+class SafeLTXVScheduler(comfy_extras.nodes_lt.LTXVScheduler):
+    def execute(self, steps, max_shift, base_shift, stretch, terminal, latent):
+        s = latent["samples"]
+        if getattr(s, "is_nested", False):
+            # Secretly extract only the video tensor to calculate math.prod(shape)
+            vid_tensor = s.unbind()[0]
+            dummy_latent = latent.copy()
+            dummy_latent["samples"] = vid_tensor
+            # Calculate scheduling using only video shape, avoiding PyTorch crash
+            return super().execute(steps, max_shift, base_shift, stretch, terminal, dummy_latent)
+        return super().execute(steps, max_shift, base_shift, stretch, terminal, latent)
+
+# 2. Override the Noise Generator Object
+_orig_generate_noise = comfy.samplers.Noise_RandomNoise.generate_noise
+def _patched_generate_noise(self, latent):
+    samples = latent["samples"]
+    if getattr(samples, "is_nested", False):
+        # Generate noise for audio and video separately, then safely repack
+        tensors = samples.unbind()
+        noises = [torch.randn_like(t) for t in tensors]
+        try: return torch.nested.as_nested_tensor(noises)
+        except Exception: return torch.nested.nested_tensor(noises)
+    return _orig_generate_noise(self, latent)
+comfy.samplers.Noise_RandomNoise.generate_noise = _patched_generate_noise
+
+# 3. Override the Native Concat Node (Forces Dimension Padding on Upscaled Zips)
+class SafeLTXVConcatAVLatent(comfy_extras.nodes_lt.LTXVConcatAVLatent):
+    def execute(self, video_latent, audio_latent):
+        vid_s = video_latent["samples"]
+        aud_s = audio_latent["samples"]
+        
+        # Strip preexisting containers if they exist
+        if getattr(vid_s, "is_nested", False): vid_s = vid_s.unbind()[0]
+        if getattr(aud_s, "is_nested", False): aud_s = aud_s.unbind()[-1]
+
+        # Sync device and dtype
+        aud_s = aud_s.to(dtype=vid_s.dtype, device=vid_s.device)
+        
+        # 🛡️ Invisibly pad the audio with silent dimensions so it perfectly 
+        # matches the upscaled video's new rank, and zip them together flawlessly.
+        padded_aud = aud_s
+        while padded_aud.dim() < vid_s.dim():
+            padded_aud = padded_aud.unsqueeze(-1)
+        while vid_s.dim() < padded_aud.dim():
+            vid_s = vid_s.unsqueeze(-1)
+            
+        try: res = torch.nested.as_nested_tensor([vid_s, padded_aud])
+        except Exception:
+            try: res = torch._nested_tensor_from_tensor_list([vid_s, padded_aud])
+            except Exception: res = torch.nested.nested_tensor([vid_s, padded_aud])
+                
+        out = video_latent.copy()
+        out["samples"] = res
+        return (out,)
+
+# 4. Safe Latent Upscale Fallback mapping
 class SafeLatentUpscale:
     @classmethod
     def INPUT_TYPES(s):
@@ -205,10 +262,8 @@ class SafeLatentUpscale:
 
     def upscale(self, samples, upscale_method, scale_by):
         import comfy.utils
-        import torch
         s = samples.copy()
         tensor = samples["samples"]
-        
         is_nested = getattr(tensor, "is_nested", False)
         if is_nested:
             tensors = tensor.unbind()
@@ -223,72 +278,33 @@ class SafeLatentUpscale:
         new_H, new_W = int(H * scale_by), int(W * scale_by)
         
         flat_B = 1
-        for d in shape[:-2]:
-            flat_B *= d
+        for d in shape[:-2]: flat_B *= d
             
         vid_reshaped = vid_tensor.reshape(flat_B, 1, H, W).to(torch.float32)
         up_vid = comfy.utils.common_upscale(vid_reshaped, new_W, new_H, upscale_method, "disabled")
-        
         new_shape = shape[:-2] + [new_H, new_W]
         up_vid = up_vid.reshape(*new_shape).contiguous().to(dtype=vid_tensor.dtype, device=vid_tensor.device)
 
         if is_nested and aud_tensor is not None:
             aud_tensor = aud_tensor.to(dtype=up_vid.dtype, device=up_vid.device)
             padded_aud = aud_tensor
-            while padded_aud.dim() < up_vid.dim():
-                padded_aud = padded_aud.unsqueeze(-1)
-            while up_vid.dim() < padded_aud.dim():
-                up_vid = up_vid.unsqueeze(-1)
-            s["samples"] = torch.nested.nested_tensor([up_vid, padded_aud])
+            while padded_aud.dim() < up_vid.dim(): padded_aud = padded_aud.unsqueeze(-1)
+            while up_vid.dim() < padded_aud.dim(): up_vid = up_vid.unsqueeze(-1)
+            try: s["samples"] = torch.nested.as_nested_tensor([up_vid, padded_aud])
+            except Exception: s["samples"] = torch.nested.nested_tensor([up_vid, padded_aud])
         else:
             s["samples"] = up_vid
-
         return (s,)
 
+# Force ComfyUI to use our Safe Interceptors globally
 NODE_CLASS_MAPPINGS = {
     "MemoryCacheWriter": MemoryCacheWriter,
     "MemoryCacheReader": MemoryCacheReader, 
     "VAEDecode": FastVAEDecode,
+    "LTXVScheduler": SafeLTXVScheduler,
+    "LTXVConcatAVLatent": SafeLTXVConcatAVLatent,
     "SafeLatentUpscale": SafeLatentUpscale
 }
-
-# ====================================================================
-# 🛡️ THE MAGIC MOCKS: PyTorch 2.5 NestedTensor Bypasses 🛡️
-# Resolves `NestedTensorImpl doesn't support sizes` crashes completely.
-# ====================================================================
-import comfy_extras.nodes_lt
-import comfy.samplers
-
-# 1. Bypass shape reading crash inside LTXVScheduler
-if hasattr(comfy_extras.nodes_lt, "LTXVScheduler"):
-    _orig_ltxv_scheduler = comfy_extras.nodes_lt.LTXVScheduler.execute
-    
-    def _patched_ltxv_scheduler(self, steps, max_shift, base_shift, stretch, terminal, latent):
-        samples = latent["samples"]
-        if getattr(samples, "is_nested", False):
-            # Extract only the video tensor. The scheduler only needs it to read `.shape[2:]`
-            vid_tensor = samples.unbind()[0]
-            dummy_latent = latent.copy()
-            dummy_latent["samples"] = vid_tensor
-            return _orig_ltxv_scheduler(self, steps, max_shift, base_shift, stretch, terminal, dummy_latent)
-        return _orig_ltxv_scheduler(self, steps, max_shift, base_shift, stretch, terminal, latent)
-
-    comfy_extras.nodes_lt.LTXVScheduler.execute = _patched_ltxv_scheduler
-
-# 2. Bypass randn_like crashes inside the Noise Generator
-if hasattr(comfy.samplers, "Noise_RandomNoise"):
-    _orig_generate_noise = comfy.samplers.Noise_RandomNoise.generate_noise
-    
-    def _patched_generate_noise(self, latent):
-        samples = latent["samples"]
-        if getattr(samples, "is_nested", False):
-            # Apply randn_like individually to each tensor and repack!
-            tensors = samples.unbind()
-            noises = [torch.randn_like(t) for t in tensors]
-            return torch.nested.nested_tensor(noises)
-        return _orig_generate_noise(self, latent)
-        
-    comfy.samplers.Noise_RandomNoise.generate_noise = _patched_generate_noise
 """)
 
         print("🔗 Running Atomic Model Folder Linker for LTX 2.3 & CosyVoice3...")

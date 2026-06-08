@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "428"  # ⚠️ Bumped to 428 to force a clean cache rebuild with the new patches
+    "FORCE_REBUILD_INDEX": "428"  # ⚠️ Bumped to force a clean cache rebuild with the new patches
 })
 
 build_image = base_image.env({
@@ -405,9 +405,17 @@ NODE_CLASS_MAPPINGS = {
                         if "1" in sg1: sg1["1"]["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
                         if "369" in sg1: sg1["369"]["inputs"]["model_name"] = "MelBandRoformer_fp32.safetensors"
                         if "367" in sg1: sg1["367"]["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
+                        
+                        # ==============================================================
+                        # ⚠️ CRITICAL FIX FOR TENSOR SIZE MISMATCH (4096 vs 2048) ⚠️
+                        # ==============================================================
                         if "368" in sg1:
                             sg1["368"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
                             sg1["368"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
+                            
+                            # The node in your JSON was hardcoded to "sdxl" which outputs 2048-dim tensors.
+                            # Gemma 3 requires 4096-dim tensors. Forcing "ltxv" fixes this native ComfyUI bug!
+                            sg1["368"]["inputs"]["type"] = "ltxv"
 
                         if "12" in sg1: sg1["12"]["inputs"]["text"] = scene.get("positive_prompt", "")
                         if "13" in sg1: sg1["13"]["inputs"]["text"] = scene.get("negative_prompt", "blurry, distorted, bad quality")

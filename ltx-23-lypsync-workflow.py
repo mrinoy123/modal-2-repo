@@ -189,7 +189,7 @@ class FastVAEDecode(nodes.VAEDecode):
             return super().decode(vae, samples)
 
 # ====================================================================
-# 🛡️ THE BULLETPROOF NESTED-TENSOR UPSCALER 🛡️
+# 🛡️ THE BULLETPROOF NESTED-TENSOR UPSCALER (PyTorch 2.5 Fix) 🛡️
 # ====================================================================
 class SafeLatentUpscale:
     @classmethod
@@ -226,14 +226,29 @@ class SafeLatentUpscale:
         for d in shape[:-2]:
             flat_B *= d
             
-        vid_reshaped = vid_tensor.reshape(flat_B, 1, H, W)
+        vid_reshaped = vid_tensor.reshape(flat_B, 1, H, W).to(torch.float32)
         up_vid = comfy.utils.common_upscale(vid_reshaped, new_W, new_H, upscale_method, "disabled")
         
         new_shape = shape[:-2] + [new_H, new_W]
-        up_vid = up_vid.reshape(*new_shape).contiguous()
+        up_vid = up_vid.reshape(*new_shape).contiguous().to(dtype=vid_tensor.dtype, device=vid_tensor.device)
 
         if is_nested and aud_tensor is not None:
-            s["samples"] = torch.nested.nested_tensor([up_vid, aud_tensor])
+            # Sync device and dtype strictly
+            aud_tensor = aud_tensor.to(dtype=up_vid.dtype, device=up_vid.device)
+            # 🛡️ BYPASS PYTORCH 2.5 STRICT NDIM CHECKS 🛡️
+            try:
+                s["samples"] = torch.nested.as_nested_tensor([up_vid, aud_tensor])
+            except Exception:
+                try:
+                    s["samples"] = torch._nested_tensor_from_tensor_list([up_vid, aud_tensor])
+                except Exception:
+                    # Final Fallback: Pad audio tensor to strictly match video tensor dimensions dynamically
+                    padded_aud = aud_tensor
+                    while padded_aud.dim() < up_vid.dim():
+                        padded_aud = padded_aud.unsqueeze(-1)
+                    while up_vid.dim() < padded_aud.dim():
+                        up_vid = up_vid.unsqueeze(-1)
+                    s["samples"] = torch.nested.nested_tensor([up_vid, padded_aud])
         else:
             s["samples"] = up_vid
 
@@ -488,7 +503,6 @@ NODE_CLASS_MAPPINGS = {
 
                         if "301" in sg2: sg2["301"]["inputs"]["scene_id"] = str(idx)
 
-                        # 🟢 THE FIX IS HERE: Correct mapping to 'model_name' required by KJNodes
                         if "422" in sg2: sg2["422"]["inputs"]["model_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
                         if "428" in sg2: sg2["428"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                         if "431" in sg2: sg2["431"]["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
@@ -498,11 +512,9 @@ NODE_CLASS_MAPPINGS = {
                                 sg2["426"]["inputs"]["lora_name"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
                                 sg2["426"]["inputs"]["strength"] = 1.0
                             else:
-                                # 🟢 THE LORA FIX IS HERE: Enforcing correct node parameters dict mapping
                                 sg2["426"]["inputs"]["lora_1"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
                                 sg2["426"]["inputs"]["strength_1"] = 1.0
 
-                        # 🟢 THE JSON SELF-HEALING FIX: Fixing faulty node parameters mapping
                         if "421" in sg2:
                             sg2["421"]["inputs"]["pingpong"] = False
                             sg2["421"]["inputs"]["save_output"] = True

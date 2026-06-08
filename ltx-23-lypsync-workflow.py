@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "422"  
+    "FORCE_REBUILD_INDEX": "427"  # ⚠️ Bumped to force the new transformers installation
 })
 
 build_image = base_image.env({
@@ -50,14 +50,15 @@ build_image = base_image.env({
 # ==============================================================================
 torch_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124",
-    "python3.12 -m pip install --no-cache-dir diffusers accelerate transformers==4.48.3 torchsde numpy==1.26.4 kornia==0.7.3",
+    # ⚠️ CRITICAL FIX: Upgraded transformers to >=4.49.0 to support Gemma3Config for LTXVideo
+    "python3.12 -m pip install --no-cache-dir diffusers accelerate transformers>=4.49.0 torchsde numpy==1.26.4 kornia==0.7.3",
     "python3.12 -m pip install --no-cache-dir sageattention==1.0.6"
 )
 
 clone_image = torch_image.run_commands(
     "git clone --depth 1 https://github.com/comfyanonymous/ComfyUI /workspace/ComfyUI",
     "GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git /workspace/ComfyUI/custom_nodes/ComfyUI-VideoHelperSuite",
-    "GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 https://github.com/Lightricks/ComfyUI-LTXVideo.git /workspace/ComfyUI/custom_nodes/ComfyUI-LTXVideo",
+    "git clone --depth 1 https://github.com/Lightricks/ComfyUI-LTXVideo.git /workspace/ComfyUI/custom_nodes/ComfyUI-LTXVideo",
     "git clone --depth 1 https://github.com/WhatDreamsCost/WhatDreamsCost-ComfyUI.git /workspace/ComfyUI/custom_nodes/WhatDreamsCost-ComfyUI",
     "git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git /workspace/ComfyUI/custom_nodes/ComfyUI-KJNodes",
     "git clone --depth 1 https://github.com/Deno2026/comfyui-deno-custom-nodes.git /workspace/ComfyUI/custom_nodes/comfyui-deno-custom-nodes",
@@ -73,7 +74,8 @@ deps_image = clone_image.run_commands(
 )
 
 final_image = deps_image.run_commands(
-    "python3.12 -m pip install --no-cache-dir transformers==4.48.3",
+    # ⚠️ CRITICAL FIX: Ensure the final layer also respects the upgraded transformers requirement
+    "python3.12 -m pip install --no-cache-dir transformers>=4.49.0",
     "echo '' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     "echo 'sageattn_qk_int8_pv_fp16_triton = sageattn' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     env={"CUDA_HOME": "/usr/local/cuda", "PATH": "/usr/local/cuda/bin:" + os.environ.get("PATH", ""), "FORCE_CUDA": "1", "TORCH_CUDA_ARCH_LIST": "8.9"}

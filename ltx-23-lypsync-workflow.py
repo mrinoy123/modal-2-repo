@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "428"  # ⚠️ Bumped to force a clean cache rebuild with the new patches
+    "FORCE_REBUILD_INDEX": "429"  # ⚠️ Bumped to force a clean cache rebuild with the new tensor patch
 })
 
 build_image = base_image.env({
@@ -125,6 +125,7 @@ class LTX23LypsyncEngine:
 import torch
 import torchvision.transforms.functional as TF
 import nodes
+import comfy.utils
 
 # ====================================================================
 # ⚠️ CRITICAL AUDIO VAE BFLOAT16 TYPE-MATCHING HACK ⚠️
@@ -193,10 +194,32 @@ class FastVAEDecode(nodes.VAEDecode):
         except Exception:
             return super().decode(vae, samples)
 
+# ====================================================================
+# ⚠️ TENSOR CONVERTER HACK ⚠️
+# Fixes 'NestedTensor object has no attribute reshape' during upscale
+# ====================================================================
+class TensorConverter:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {"samples": ("LATENT",)}}
+    RETURN_TYPES = ("LATENT",)
+    FUNCTION = "convert"
+    CATEGORY = "LTXBatch"
+
+    def convert(self, samples):
+        if hasattr(samples["samples"], "to_tensor"):
+            samples["samples"] = samples["samples"].to_tensor()
+        elif not isinstance(samples["samples"], torch.Tensor):
+            samples["samples"] = torch.as_tensor(samples["samples"])
+        
+        samples["samples"] = samples["samples"].contiguous()
+        return (samples,)
+
 NODE_CLASS_MAPPINGS = {
     "MemoryCacheWriter": MemoryCacheWriter,
     "MemoryCacheReader": MemoryCacheReader, 
-    "VAEDecode": FastVAEDecode
+    "VAEDecode": FastVAEDecode,
+    "TensorConverter": TensorConverter
 }
 """)
 
@@ -340,6 +363,9 @@ NODE_CLASS_MAPPINGS = {
                             if not url: return False
                             if "pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev" in url:
                                 key = url.split(".dev/")[-1]
+                                # ⚠️ FIX: Strip the bucket name from the URL path if it accidentally gets included
+                                if key.startswith("video-asset-files-storage-workflow/"):
+                                    key = key.replace("video-asset-files-storage-workflow/", "", 1)
                                 try:
                                     print(f"📥 Authenticated download via boto3 for private R2 asset: {key}")
                                     await asyncio.get_event_loop().run_in_executor(
@@ -347,7 +373,7 @@ NODE_CLASS_MAPPINGS = {
                                     )
                                     return True
                                 except Exception as e:
-                                    print(f"❌ Failed to download private R2 asset: {e}")
+                                    print(f"❌ Failed to download private R2 asset ({key}): {e}")
                                     return False
                             else:
                                 try:
@@ -412,9 +438,6 @@ NODE_CLASS_MAPPINGS = {
                         if "368" in sg1:
                             sg1["368"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
                             sg1["368"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
-                            
-                            # The node in your JSON was hardcoded to "sdxl" which outputs 2048-dim tensors.
-                            # Gemma 3 requires 4096-dim tensors. Forcing "ltxv" fixes this native ComfyUI bug!
                             sg1["368"]["inputs"]["type"] = "ltxv"
 
                         if "12" in sg1: sg1["12"]["inputs"]["text"] = scene.get("positive_prompt", "")
@@ -464,6 +487,20 @@ NODE_CLASS_MAPPINGS = {
                         if "501" in sg2:
                             sg2["501"]["inputs"]["steps"] = 8
                             if "terminal" in sg2["501"]["inputs"]: sg2["501"]["inputs"]["terminal"] = 0.1 
+
+                        # ==============================================================
+                        # ⚠️ DYNAMICALLY INJECT THE TENSOR CONVERTER INTO SUBGRAPH 2 ⚠️
+                        # Intercepts the NestedTensor between the Sampler (416) and Upscale (500)
+                        # ==============================================================
+                        if "500" in sg2 and "416" in sg2:
+                            sg2["999"] = {
+                                "class_type": "TensorConverter",
+                                "inputs": {
+                                    "samples": ["416", 0]
+                                }
+                            }
+                            # Route the Upscaler to take inputs from the TensorConverter
+                            sg2["500"]["inputs"]["samples"] = ["999", 0]
 
                         await self.execute_comfy_workflow(session, sg2)
 

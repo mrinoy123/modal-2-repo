@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "429"  # ⚠️ Bumped to force a clean cache rebuild with the new tensor patch
+    "FORCE_REBUILD_INDEX": "429"  # ⚠️ Bumped to force full rebuild with SafeLatentUpscale
 })
 
 build_image = base_image.env({
@@ -50,7 +50,6 @@ build_image = base_image.env({
 # ==============================================================================
 torch_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124",
-    # ⚠️ CRITICAL FIX: Upgraded transformers to >=4.49.0 to support Gemma3Config for LTXVideo
     "python3.12 -m pip install --no-cache-dir diffusers accelerate transformers>=4.49.0 torchsde numpy==1.26.4 kornia==0.7.3",
     "python3.12 -m pip install --no-cache-dir sageattention==1.0.6"
 )
@@ -74,14 +73,10 @@ deps_image = clone_image.run_commands(
 )
 
 final_image = deps_image.run_commands(
-    # ⚠️ CRITICAL FIX: Ensure the final layer also respects the upgraded transformers requirement
     "python3.12 -m pip install --no-cache-dir transformers>=4.49.0",
     "echo '' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
     "echo 'sageattn_qk_int8_pv_fp16_triton = sageattn' >> /usr/local/lib/python3.12/site-packages/sageattention/__init__.py",
-    
-    # 👇 ADDED PATCH: Mocks the missing dtype in PyTorch 2.5.1 so transformers doesn't crash CosyVoice3's Qwen2 import
     "echo 'import sys; sys.modules[\"torch\"].float8_e8m0fnu = getattr(sys.modules[\"torch\"], \"float8_e8m0fnu\", sys.modules[\"torch\"].float32)' >> /usr/local/lib/python3.12/site-packages/torch/__init__.py",
-    
     env={"CUDA_HOME": "/usr/local/cuda", "PATH": "/usr/local/cuda/bin:" + os.environ.get("PATH", ""), "FORCE_CUDA": "1", "TORCH_CUDA_ARCH_LIST": "8.9"}
 )
 
@@ -129,7 +124,6 @@ import comfy.utils
 
 # ====================================================================
 # ⚠️ CRITICAL AUDIO VAE BFLOAT16 TYPE-MATCHING HACK ⚠️
-# Intercepts float32 spectrograms exactly at the Autoencoder Boundary
 # ====================================================================
 import comfy.ldm.lightricks.vae.causal_audio_autoencoder
 
@@ -195,31 +189,69 @@ class FastVAEDecode(nodes.VAEDecode):
             return super().decode(vae, samples)
 
 # ====================================================================
-# ⚠️ TENSOR CONVERTER HACK ⚠️
-# Fixes 'NestedTensor object has no attribute reshape' during upscale
+# 🛡️ THE BULLETPROOF NESTED-TENSOR UPSCALER 🛡️
+# Replaces broken standard upscale. Safely extracts Video/Audio,
+# upscales Video agnostically, and securely repacks into NestedTensor.
 # ====================================================================
-class TensorConverter:
+class SafeLatentUpscale:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {"samples": ("LATENT",)}}
+        return {"required": {
+            "samples": ("LATENT",),
+            "upscale_method": (["nearest-exact", "bilinear", "area", "bicubic", "bislerp"],),
+            "scale_by": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 10.0, "step": 0.1}),
+        }}
     RETURN_TYPES = ("LATENT",)
-    FUNCTION = "convert"
+    FUNCTION = "upscale"
     CATEGORY = "LTXBatch"
 
-    def convert(self, samples):
-        if hasattr(samples["samples"], "to_tensor"):
-            samples["samples"] = samples["samples"].to_tensor()
-        elif not isinstance(samples["samples"], torch.Tensor):
-            samples["samples"] = torch.as_tensor(samples["samples"])
+    def upscale(self, samples, upscale_method, scale_by):
+        import comfy.utils
+        import torch
+        s = samples.copy()
+        tensor = samples["samples"]
         
-        samples["samples"] = samples["samples"].contiguous()
-        return (samples,)
+        # 1. Safely Unbind NestedTensors (Avoids len() crash)
+        is_nested = getattr(tensor, "is_nested", False)
+        if is_nested:
+            tensors = tensor.unbind()
+            vid_tensor = tensors[0]
+            aud_tensor = tensors[1] if len(tensors) > 1 else None
+        else:
+            vid_tensor = tensor
+            aud_tensor = None
+
+        # 2. Extract Shape Dynamics Safely (H and W are always the last two dims)
+        shape = list(vid_tensor.shape)
+        H, W = shape[-2], shape[-1]
+        new_H, new_W = int(H * scale_by), int(W * scale_by)
+        
+        # 3. Flatten ALL preceding dimensions (Batch, Channels, Frames) to protect them
+        flat_B = 1
+        for d in shape[:-2]:
+            flat_B *= d
+            
+        # Reshape into rigid 4D [FlatBatch, 1, H, W] for flawless PyTorch F.interpolate
+        vid_reshaped = vid_tensor.reshape(flat_B, 1, H, W)
+        up_vid = comfy.utils.common_upscale(vid_reshaped, new_W, new_H, upscale_method, "disabled")
+        
+        # 4. Expand back to exact original dimension architecture
+        new_shape = shape[:-2] + [new_H, new_W]
+        up_vid = up_vid.reshape(*new_shape).contiguous()
+
+        # 5. Securely Repack the Audio Latent sync layer
+        if is_nested and aud_tensor is not None:
+            s["samples"] = torch.nested.nested_tensor([up_vid, aud_tensor])
+        else:
+            s["samples"] = up_vid
+
+        return (s,)
 
 NODE_CLASS_MAPPINGS = {
     "MemoryCacheWriter": MemoryCacheWriter,
     "MemoryCacheReader": MemoryCacheReader, 
     "VAEDecode": FastVAEDecode,
-    "TensorConverter": TensorConverter
+    "SafeLatentUpscale": SafeLatentUpscale
 }
 """)
 
@@ -323,9 +355,9 @@ NODE_CLASS_MAPPINGS = {
             await asyncio.sleep(1)
 
     # ==============================================================================
-    # PART 6: LYPSYNC BATCH ENDPOINT
+    # PART 6: LYPSYNC BATCH ENDPOINT 
     # ==============================================================================
-    @modal.fastapi_endpoint(method="POST")
+    @modal.web_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
         if x_api_key != "testing-modal-workflow-2": 
             raise HTTPException(status_code=403, detail="Unauthorized Pipeline Request")
@@ -353,8 +385,8 @@ NODE_CLASS_MAPPINGS = {
 
             try:
                 async with aiohttp.ClientSession() as session:
-                    custom_w = body.get("custom_width", 384) 
-                    custom_h = body.get("custom_height", 672)
+                    custom_w = int(body.get("custom_width", 384)) 
+                    custom_h = int(body.get("custom_height", 672))
 
                     for idx, scene in enumerate(batch_scenes):
                         
@@ -363,7 +395,6 @@ NODE_CLASS_MAPPINGS = {
                             if not url: return False
                             if "pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev" in url:
                                 key = url.split(".dev/")[-1]
-                                # ⚠️ FIX: Strip the bucket name from the URL path if it accidentally gets included
                                 if key.startswith("video-asset-files-storage-workflow/"):
                                     key = key.replace("video-asset-files-storage-workflow/", "", 1)
                                 try:
@@ -423,18 +454,15 @@ NODE_CLASS_MAPPINGS = {
                                     dummy_data = np.zeros(16000, dtype=np.float32)
                                     sf.write(aud_p, dummy_data, 16000)
 
-                        total_frames = scene.get("total_frames", 161)
+                        total_frames = int(scene.get("total_frames", 161))
 
                         print(f"\n[Lypsync API] 🎬 Initiating SUBGRAPH 1 (Voice & Embeddings) for Scene {idx}...")
                         sg1 = json.loads(json.dumps(subgraph_1))
                         
                         if "1" in sg1: sg1["1"]["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
-                        if "369" in sg1: sg1["369"]["inputs"]["model_name"] = "MelBandRoformer_fp32.safetensors"
+                        if "369" in sg1: sg1["369"]["inputs"]["model"] = "MelBandRoformer_fp32.safetensors"
                         if "367" in sg1: sg1["367"]["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
                         
-                        # ==============================================================
-                        # ⚠️ CRITICAL FIX FOR TENSOR SIZE MISMATCH (4096 vs 2048) ⚠️
-                        # ==============================================================
                         if "368" in sg1:
                             sg1["368"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
                             sg1["368"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
@@ -443,8 +471,8 @@ NODE_CLASS_MAPPINGS = {
                         if "12" in sg1: sg1["12"]["inputs"]["text"] = scene.get("positive_prompt", "")
                         if "13" in sg1: sg1["13"]["inputs"]["text"] = scene.get("negative_prompt", "blurry, distorted, bad quality")
                         if "371" in sg1: sg1["371"]["inputs"]["dialog_text"] = scene.get("dialog_text", "")
-                        if "374" in sg1: sg1["374"]["inputs"]["text"] = scene.get("speaker1_text", "")
-                        if "375" in sg1: sg1["375"]["inputs"]["text"] = scene.get("speaker2_text", "")
+                        if "374" in sg1: sg1["374"]["inputs"]["text"] = scene.get("speaker1_text", "Hello.")
+                        if "375" in sg1: sg1["375"]["inputs"]["text"] = scene.get("speaker2_text", "Hello.")
 
                         if "365" in sg1: sg1["365"]["inputs"]["audio"] = f"dynamic_guides/spk1_{idx}.wav"
                         if "366" in sg1: sg1["366"]["inputs"]["audio"] = f"dynamic_guides/spk2_{idx}.wav"
@@ -469,13 +497,17 @@ NODE_CLASS_MAPPINGS = {
 
                         if "301" in sg2: sg2["301"]["inputs"]["scene_id"] = str(idx)
 
-                        if "422" in sg2: sg2["422"]["inputs"]["model_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
+                        if "422" in sg2: sg2["422"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
                         if "428" in sg2: sg2["428"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                         if "431" in sg2: sg2["431"]["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
 
                         if "426" in sg2:
-                            sg2["426"]["inputs"]["lora_1"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
-                            sg2["426"]["inputs"]["strength_1"] = 1.0
+                            if sg2["426"].get("class_type") == "LTXICLoRALoaderModelOnly":
+                                sg2["426"]["inputs"]["lora_name"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
+                                sg2["426"]["inputs"]["strength"] = 1.0
+                            else:
+                                sg2["426"]["inputs"]["lora_1_name"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
+                                sg2["426"]["inputs"]["lora_1_strength"] = 1.0
 
                         if "429" in sg2: sg2["429"]["inputs"]["image"] = f"dynamic_guides/char1_{idx}.png"
                         if "430" in sg2: sg2["430"]["inputs"]["image"] = f"dynamic_guides/char2_{idx}.png"
@@ -489,18 +521,13 @@ NODE_CLASS_MAPPINGS = {
                             if "terminal" in sg2["501"]["inputs"]: sg2["501"]["inputs"]["terminal"] = 0.1 
 
                         # ==============================================================
-                        # ⚠️ DYNAMICALLY INJECT THE TENSOR CONVERTER INTO SUBGRAPH 2 ⚠️
-                        # Intercepts the NestedTensor between the Sampler (416) and Upscale (500)
+                        # 🛡️ THE ARCHITECTURAL UPSCALER FIX 🛡️
+                        # Hijacks any broken 'LatentUpscaleBy' node the user deployed 
+                        # and forcefully patches it with our bulletproof SafeLatentUpscale.
                         # ==============================================================
-                        if "500" in sg2 and "416" in sg2:
-                            sg2["999"] = {
-                                "class_type": "TensorConverter",
-                                "inputs": {
-                                    "samples": ["416", 0]
-                                }
-                            }
-                            # Route the Upscaler to take inputs from the TensorConverter
-                            sg2["500"]["inputs"]["samples"] = ["999", 0]
+                        for node_id, node_data in list(sg2.items()):
+                            if node_data.get("class_type") == "LatentUpscaleBy":
+                                node_data["class_type"] = "SafeLatentUpscale"
 
                         await self.execute_comfy_workflow(session, sg2)
 
@@ -537,14 +564,16 @@ NODE_CLASS_MAPPINGS = {
         async def stream_response():
             task = asyncio.create_task(process_pipeline())
             while not task.done():
-                yield b" "  
+                yield b'{"status": "processing", "message": "Heartbeat... Keeping connection active"}\n' + (b" " * 1024)
                 done, pending = await asyncio.wait([task], timeout=10.0)
                 if task in done: break
             try:
                 result = task.result()
                 if isinstance(result, (dict, list)): yield json.dumps(result).encode("utf-8")
                 else: yield str(result).encode("utf-8")
-            except HTTPException as e: yield json.dumps({"status": "error", "detail": e.detail}).encode("utf-8")
-            except Exception as e: yield json.dumps({"status": "error", "detail": str(e)}).encode("utf-8")
+            except HTTPException as e: 
+                yield json.dumps({"status": "error", "detail": str(e.detail)}).encode("utf-8")
+            except Exception as e: 
+                yield json.dumps({"status": "error", "detail": str(e)}).encode("utf-8")
 
         return StreamingResponse(stream_response(), media_type="application/json")

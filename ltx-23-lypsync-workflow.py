@@ -189,7 +189,7 @@ class FastVAEDecode(nodes.VAEDecode):
             return super().decode(vae, samples)
 
 # ====================================================================
-# 🛡️ THE BULLETPROOF NESTED-TENSOR UPSCALER (PyTorch 2.5 Fix) 🛡️
+# 🛡️ THE BULLETPROOF NESTED-TENSOR UPSCALER 
 # ====================================================================
 class SafeLatentUpscale:
     @classmethod
@@ -233,22 +233,13 @@ class SafeLatentUpscale:
         up_vid = up_vid.reshape(*new_shape).contiguous().to(dtype=vid_tensor.dtype, device=vid_tensor.device)
 
         if is_nested and aud_tensor is not None:
-            # Sync device and dtype strictly
             aud_tensor = aud_tensor.to(dtype=up_vid.dtype, device=up_vid.device)
-            # 🛡️ BYPASS PYTORCH 2.5 STRICT NDIM CHECKS 🛡️
-            try:
-                s["samples"] = torch.nested.as_nested_tensor([up_vid, aud_tensor])
-            except Exception:
-                try:
-                    s["samples"] = torch._nested_tensor_from_tensor_list([up_vid, aud_tensor])
-                except Exception:
-                    # Final Fallback: Pad audio tensor to strictly match video tensor dimensions dynamically
-                    padded_aud = aud_tensor
-                    while padded_aud.dim() < up_vid.dim():
-                        padded_aud = padded_aud.unsqueeze(-1)
-                    while up_vid.dim() < padded_aud.dim():
-                        up_vid = up_vid.unsqueeze(-1)
-                    s["samples"] = torch.nested.nested_tensor([up_vid, padded_aud])
+            padded_aud = aud_tensor
+            while padded_aud.dim() < up_vid.dim():
+                padded_aud = padded_aud.unsqueeze(-1)
+            while up_vid.dim() < padded_aud.dim():
+                up_vid = up_vid.unsqueeze(-1)
+            s["samples"] = torch.nested.nested_tensor([up_vid, padded_aud])
         else:
             s["samples"] = up_vid
 
@@ -260,6 +251,44 @@ NODE_CLASS_MAPPINGS = {
     "VAEDecode": FastVAEDecode,
     "SafeLatentUpscale": SafeLatentUpscale
 }
+
+# ====================================================================
+# 🛡️ THE MAGIC MOCKS: PyTorch 2.5 NestedTensor Bypasses 🛡️
+# Resolves `NestedTensorImpl doesn't support sizes` crashes completely.
+# ====================================================================
+import comfy_extras.nodes_lt
+import comfy.samplers
+
+# 1. Bypass shape reading crash inside LTXVScheduler
+if hasattr(comfy_extras.nodes_lt, "LTXVScheduler"):
+    _orig_ltxv_scheduler = comfy_extras.nodes_lt.LTXVScheduler.execute
+    
+    def _patched_ltxv_scheduler(self, steps, max_shift, base_shift, stretch, terminal, latent):
+        samples = latent["samples"]
+        if getattr(samples, "is_nested", False):
+            # Extract only the video tensor. The scheduler only needs it to read `.shape[2:]`
+            vid_tensor = samples.unbind()[0]
+            dummy_latent = latent.copy()
+            dummy_latent["samples"] = vid_tensor
+            return _orig_ltxv_scheduler(self, steps, max_shift, base_shift, stretch, terminal, dummy_latent)
+        return _orig_ltxv_scheduler(self, steps, max_shift, base_shift, stretch, terminal, latent)
+
+    comfy_extras.nodes_lt.LTXVScheduler.execute = _patched_ltxv_scheduler
+
+# 2. Bypass randn_like crashes inside the Noise Generator
+if hasattr(comfy.samplers, "Noise_RandomNoise"):
+    _orig_generate_noise = comfy.samplers.Noise_RandomNoise.generate_noise
+    
+    def _patched_generate_noise(self, latent):
+        samples = latent["samples"]
+        if getattr(samples, "is_nested", False):
+            # Apply randn_like individually to each tensor and repack!
+            tensors = samples.unbind()
+            noises = [torch.randn_like(t) for t in tensors]
+            return torch.nested.nested_tensor(noises)
+        return _orig_generate_noise(self, latent)
+        
+    comfy.samplers.Noise_RandomNoise.generate_noise = _patched_generate_noise
 """)
 
         print("🔗 Running Atomic Model Folder Linker for LTX 2.3 & CosyVoice3...")
@@ -396,7 +425,6 @@ NODE_CLASS_MAPPINGS = {
 
                     for idx, scene in enumerate(batch_scenes):
                         
-                        # --- SECURE ASSET DOWNLOAD UTILITY (Handles Private R2 Links) ---
                         async def download_asset(url, target_path):
                             if not url: return False
                             if "pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev" in url:

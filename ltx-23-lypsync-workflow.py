@@ -190,8 +190,6 @@ class FastVAEDecode(nodes.VAEDecode):
 
 # ====================================================================
 # 🛡️ THE BULLETPROOF NESTED-TENSOR UPSCALER 🛡️
-# Replaces broken standard upscale. Safely extracts Video/Audio,
-# upscales Video agnostically, and securely repacks into NestedTensor.
 # ====================================================================
 class SafeLatentUpscale:
     @classmethod
@@ -211,7 +209,6 @@ class SafeLatentUpscale:
         s = samples.copy()
         tensor = samples["samples"]
         
-        # 1. Safely Unbind NestedTensors (Avoids len() crash)
         is_nested = getattr(tensor, "is_nested", False)
         if is_nested:
             tensors = tensor.unbind()
@@ -221,25 +218,20 @@ class SafeLatentUpscale:
             vid_tensor = tensor
             aud_tensor = None
 
-        # 2. Extract Shape Dynamics Safely (H and W are always the last two dims)
         shape = list(vid_tensor.shape)
         H, W = shape[-2], shape[-1]
         new_H, new_W = int(H * scale_by), int(W * scale_by)
         
-        # 3. Flatten ALL preceding dimensions (Batch, Channels, Frames) to protect them
         flat_B = 1
         for d in shape[:-2]:
             flat_B *= d
             
-        # Reshape into rigid 4D [FlatBatch, 1, H, W] for flawless PyTorch F.interpolate
         vid_reshaped = vid_tensor.reshape(flat_B, 1, H, W)
         up_vid = comfy.utils.common_upscale(vid_reshaped, new_W, new_H, upscale_method, "disabled")
         
-        # 4. Expand back to exact original dimension architecture
         new_shape = shape[:-2] + [new_H, new_W]
         up_vid = up_vid.reshape(*new_shape).contiguous()
 
-        # 5. Securely Repack the Audio Latent sync layer
         if is_nested and aud_tensor is not None:
             s["samples"] = torch.nested.nested_tensor([up_vid, aud_tensor])
         else:
@@ -257,14 +249,13 @@ NODE_CLASS_MAPPINGS = {
 
         print("🔗 Running Atomic Model Folder Linker for LTX 2.3 & CosyVoice3...")
         base_models_dir = "/workspace/ComfyUI/models"
-        dirs = ["unet", "vae", "clip", "text_encoders", "checkpoints", "loras", "upscale_models", "latent_upscale_models", "cosyvoice", "melbandroformer"]
+        dirs = ["unet", "vae", "clip", "text_encoders", "checkpoints", "loras", "upscale_models", "latent_upscale_models", "cosyvoice", "melbandroformer", "diffusion_models"]
         for d in dirs: os.makedirs(os.path.join(base_models_dir, d), exist_ok=True)
 
         cv_source = "/mnt/weights/cosyvoice3"
         cv_dest = os.path.join(base_models_dir, "cosyvoice", "Fun-CosyVoice3-0.5B")
         if os.path.exists(cv_source) and not os.path.exists(cv_dest):
             os.symlink(cv_source, cv_dest)
-            print(f"🔗 Symlinked strictly structured CosyVoice3 folder to {cv_dest}")
 
         if os.path.exists("/mnt/weights"):
             for root_dir, _, files in os.walk("/mnt/weights"):
@@ -460,7 +451,6 @@ NODE_CLASS_MAPPINGS = {
                         sg1 = json.loads(json.dumps(subgraph_1))
                         
                         if "1" in sg1: sg1["1"]["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
-                        # 🛡️ THE FIX: Restored "model_name" for KJNodes MelBandRoformer 
                         if "369" in sg1: sg1["369"]["inputs"]["model_name"] = "MelBandRoformer_fp32.safetensors"
                         if "367" in sg1: sg1["367"]["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
                         
@@ -498,7 +488,8 @@ NODE_CLASS_MAPPINGS = {
 
                         if "301" in sg2: sg2["301"]["inputs"]["scene_id"] = str(idx)
 
-                        if "422" in sg2: sg2["422"]["inputs"]["unet_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
+                        # 🟢 THE FIX IS HERE: Correct mapping to 'model_name' required by KJNodes
+                        if "422" in sg2: sg2["422"]["inputs"]["model_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
                         if "428" in sg2: sg2["428"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                         if "431" in sg2: sg2["431"]["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
 
@@ -507,8 +498,14 @@ NODE_CLASS_MAPPINGS = {
                                 sg2["426"]["inputs"]["lora_name"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
                                 sg2["426"]["inputs"]["strength"] = 1.0
                             else:
-                                sg2["426"]["inputs"]["lora_1_name"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
-                                sg2["426"]["inputs"]["lora_1_strength"] = 1.0
+                                # 🟢 THE LORA FIX IS HERE: Enforcing correct node parameters dict mapping
+                                sg2["426"]["inputs"]["lora_1"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
+                                sg2["426"]["inputs"]["strength_1"] = 1.0
+
+                        # 🟢 THE JSON SELF-HEALING FIX: Fixing faulty node parameters mapping
+                        if "421" in sg2:
+                            sg2["421"]["inputs"]["pingpong"] = False
+                            sg2["421"]["inputs"]["save_output"] = True
 
                         if "429" in sg2: sg2["429"]["inputs"]["image"] = f"dynamic_guides/char1_{idx}.png"
                         if "430" in sg2: sg2["430"]["inputs"]["image"] = f"dynamic_guides/char2_{idx}.png"

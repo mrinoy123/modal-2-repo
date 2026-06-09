@@ -33,7 +33,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "432"  # ⚠️ Bumped to refresh the custom nodes loader
+    "FORCE_REBUILD_INDEX": "432"  # ⚠️ Bumped for clean pipeline refresh
 })
 
 build_image = base_image.env({
@@ -458,15 +458,18 @@ except Exception as e:
                         spk2_path = os.path.join(dynamic_guides_dir, f"spk2_{idx}.wav")
 
                         await download_asset(scene.get("speaker1_audio_url"), spk1_path)
-                        await download_asset(scene.get("speaker2_audio_url"), spk2_path)
                         
+                        if has_two_chars:
+                            await download_asset(scene.get("speaker2_audio_url"), spk2_path)
+                        else:
+                            print(f"🎙️ Single Character Mode: Speaker 2 audio bypassed. Generating structural silence.")
+                            
                         import soundfile as sf
                         import librosa
                         import numpy as np 
                         
                         for aud_p in [spk1_path, spk2_path]:
                             if not os.path.exists(aud_p):
-                                print(f"⚠️ Audio not found, generating safety silence: {aud_p}")
                                 dummy_data = np.zeros(16000, dtype=np.float32)
                                 sf.write(aud_p, dummy_data, 16000)
                             else:
@@ -479,20 +482,35 @@ except Exception as e:
                                     sf.write(aud_p, dummy_data, 16000)
 
                         total_frames = int(scene.get("total_frames", 161))
+                        scene_seed = scene.get("seed", int(time.time() * 1000) % 1000000)
 
                         print(f"\n[Lypsync API] 🎬 Initiating SUBGRAPH 1 (Voice & Embeddings) for Scene {idx}...")
                         sg1 = json.loads(json.dumps(subgraph_1))
                         
-                        # RESTORED PROPER VOLUME FILENAMES
-                        if "1" in sg1: sg1["1"]["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
-                        if "369" in sg1: sg1["369"]["inputs"]["model_name"] = "MelBandRoformer_fp32.safetensors"
-                        if "367" in sg1: sg1["367"]["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
-                        
-                        if "368" in sg1:
-                            sg1["368"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
-                            sg1["368"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
-                            sg1["368"]["inputs"]["type"] = "ltxv"
+                        # ---------------------------------------------------------
+                        # 🔥 FOOLPROOF CLASS_TYPE INJECTOR FOR SUBGRAPH 1 🔥
+                        # Replaces model names directly regardless of what Node IDs n8n sends
+                        # ---------------------------------------------------------
+                        for node_id, node_data in list(sg1.items()):
+                            c_type = node_data.get("class_type")
+                            if c_type == "FL_CosyVoice3_ModelLoader":
+                                node_data["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
+                            elif c_type == "MelBandRoFormerModelLoader":
+                                node_data["inputs"]["model_name"] = "MelBandRoformer_fp32.safetensors"
+                            elif c_type == "LTXVAudioVAELoader":
+                                node_data["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
+                            elif c_type == "DualCLIPLoader":
+                                node_data["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
+                                node_data["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
+                                node_data["inputs"]["type"] = "ltxv"
+                            elif c_type == "MemoryCacheWriter":
+                                node_data["inputs"]["scene_id"] = str(idx)
+                            elif c_type == "EmptyLTXVLatentVideo":
+                                node_data["inputs"]["width"] = custom_w
+                                node_data["inputs"]["height"] = custom_h
+                                node_data["inputs"]["length"] = total_frames
 
+                        # Inject text strings (Fallback to explicit IDs since they contain unique logic)
                         if "12" in sg1: sg1["12"]["inputs"]["text"] = scene.get("positive_prompt", "")
                         if "13" in sg1: sg1["13"]["inputs"]["text"] = scene.get("negative_prompt", "blurry, distorted, bad quality")
                         if "371" in sg1: sg1["371"]["inputs"]["dialog_text"] = scene.get("dialog_text", "")
@@ -501,13 +519,6 @@ except Exception as e:
 
                         if "365" in sg1: sg1["365"]["inputs"]["audio"] = f"dynamic_guides/spk1_{idx}.wav"
                         if "366" in sg1: sg1["366"]["inputs"]["audio"] = f"dynamic_guides/spk2_{idx}.wav"
-
-                        if "14" in sg1:
-                            sg1["14"]["inputs"]["width"] = custom_w
-                            sg1["14"]["inputs"]["height"] = custom_h
-                            sg1["14"]["inputs"]["length"] = total_frames
-
-                        if "300" in sg1: sg1["300"]["inputs"]["scene_id"] = str(idx)
 
                         await self.execute_comfy_workflow(session, sg1)
                         await self.clear_comfy_memory(session, unload_models=False)
@@ -518,37 +529,44 @@ except Exception as e:
                         if os.path.exists(out_dir): shutil.rmtree(out_dir)
                         os.makedirs(out_dir)
 
-                        scene_seed = scene.get("seed", int(time.time() * 1000) % 1000000)
-
-                        if "100" in sg2: sg2["100"]["inputs"]["scene_id"] = str(idx)
-
-                        # RESTORED PROPER VOLUME FILENAMES
-                        if "103" in sg2: sg2["103"]["inputs"]["model_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
-                        if "101" in sg2: sg2["101"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
-                        if "102" in sg2: sg2["102"]["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
-
-                        if "104" in sg2:
-                            if sg2["104"].get("class_type") == "LTXICLoRALoaderModelOnly":
-                                sg2["104"]["inputs"]["lora_name"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
-                                sg2["104"]["inputs"]["strength"] = 1.0
-                            else:
-                                sg2["104"]["inputs"]["lora_1"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
-                                sg2["104"]["inputs"]["strength_1"] = 1.0
-
-                        if "137" in sg2:
-                            sg2["137"]["inputs"]["pingpong"] = False
-                            sg2["137"]["inputs"]["save_output"] = True
+                        # ---------------------------------------------------------
+                        # 🔥 FOOLPROOF CLASS_TYPE INJECTOR FOR SUBGRAPH 2 🔥
+                        # Forces the correct Model Weights regardless of Node ID
+                        # ---------------------------------------------------------
+                        for node_id, node_data in list(sg2.items()):
+                            c_type = node_data.get("class_type")
+                            if c_type == "DiffusionModelLoaderKJ":
+                                node_data["inputs"]["model_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
+                            elif c_type == "VAELoader":
+                                node_data["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
+                            elif c_type == "LTXVAudioVAELoader":
+                                node_data["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
+                            elif c_type == "DenoLTXMultiLoraLoader":
+                                node_data["inputs"]["lora_1"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
+                                node_data["inputs"]["strength_1"] = 1.0
+                            elif c_type == "LTXICLoRALoaderModelOnly":
+                                node_data["inputs"]["lora_name"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
+                                node_data["inputs"]["strength"] = 1.0
+                            elif c_type == "MemoryCacheReader":
+                                node_data["inputs"]["scene_id"] = str(idx)
+                            elif c_type == "VHS_VideoCombine":
+                                node_data["inputs"]["pingpong"] = False
+                                node_data["inputs"]["save_output"] = True
+                            elif c_type == "RandomNoise":
+                                node_data["inputs"]["noise_seed"] = scene_seed
+                            elif c_type == "LTXVScheduler":
+                                node_data["inputs"]["steps"] = 12
 
                         # DYNAMIC IMAGE AND MASK ROUTING
+                        # (Covers the IDs from the newest generated JSON layout)
                         if "142" in sg2: sg2["142"]["inputs"]["image"] = f"dynamic_guides/char1_{idx}.png"
                         if "143" in sg2: sg2["143"]["inputs"]["image"] = f"dynamic_guides/mask1_{idx}.png"
                         if "144" in sg2: sg2["144"]["inputs"]["image"] = f"dynamic_guides/char2_{idx}.png"
                         if "145" in sg2: sg2["145"]["inputs"]["image"] = f"dynamic_guides/mask2_{idx}.png"
 
-                        if "119" in sg2: sg2["119"]["inputs"]["noise_seed"] = scene_seed
-                        if "118" in sg2: sg2["118"]["inputs"]["steps"] = 12
-
-                        if "130" in sg2: sg2["130"]["inputs"]["noise_seed"] = scene_seed
+                        # (Covers the IDs from the old JSON layout just in case)
+                        if "429" in sg2: sg2["429"]["inputs"]["image"] = f"dynamic_guides/char1_{idx}.png"
+                        if "430" in sg2: sg2["430"]["inputs"]["image"] = f"dynamic_guides/char2_{idx}.png"
 
                         await self.execute_comfy_workflow(session, sg2)
 

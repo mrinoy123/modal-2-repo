@@ -584,6 +584,11 @@ except Exception as e:
                             c_type = node_data.get("class_type")
                             if c_type == "DiffusionModelLoaderKJ":
                                 node_data["inputs"]["model_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
+                            
+                            # 🔥 [FIX APPLIED HERE] Dynamically injects the missing Upscale model!
+                            elif c_type == "LowVRAMLatentUpscaleModelLoader":
+                                node_data["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+                            
                             elif c_type == "VAELoader":
                                 node_data["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                             elif c_type == "LTXVAudioVAELoader":

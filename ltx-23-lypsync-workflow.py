@@ -118,7 +118,6 @@ class LTX23LypsyncEngine:
         import boto3
         
         print("🎨 Building Robust Custom Pipeline Nodes...")
-        # Guarantee ComfyUI loads this as an extension module by putting it inside __init__.py
         os.makedirs("/workspace/ComfyUI/custom_nodes/LTXCustomPipeline", exist_ok=True)
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline/__init__.py"
         with open(custom_nodes_path, "w") as f:
@@ -186,7 +185,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 # BULLETPROOF HACKS (Wrapped in try/except to prevent load failures)
 # ====================================================================
 
-# 1. Audio VAE BFloat16 Hack
 try:
     import comfy.ldm.lightricks.vae.causal_audio_autoencoder
     _orig_causal_encode = comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.encode
@@ -202,9 +200,8 @@ try:
     comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.decode = _patched_causal_decode
     print("[LTX Custom] ✅ Audio VAE BFloat16 hack applied.")
 except Exception as e:
-    print(f"[LTX Custom] ⚠️ Skipping Audio VAE hack: {e}")
+    pass
 
-# 2. Nested Tensor Hacks (PyTorch 2.5 safety)
 try:
     import comfy_extras.nodes_lt
     
@@ -236,11 +233,8 @@ try:
             
     NODE_CLASS_MAPPINGS["LTXVScheduler"] = SafeLTXVScheduler
     NODE_CLASS_MAPPINGS["LTXVConcatAVLatent"] = SafeLTXVConcatAVLatent
-    NODE_DISPLAY_NAME_MAPPINGS["LTXVScheduler"] = "LTXVScheduler (Safe)"
-    NODE_DISPLAY_NAME_MAPPINGS["LTXVConcatAVLatent"] = "LTXVConcatAVLatent (Safe)"
-    print("[LTX Custom] ✅ Nested Tensor safety overrides applied.")
 except Exception as e:
-    print(f"[LTX Custom] ⚠️ Skipping Nested Tensor overrides: {e}")
+    pass
 
 try:
     _orig_generate_noise = comfy.samplers.Noise_RandomNoise.generate_noise
@@ -489,13 +483,14 @@ except Exception as e:
                         print(f"\n[Lypsync API] 🎬 Initiating SUBGRAPH 1 (Voice & Embeddings) for Scene {idx}...")
                         sg1 = json.loads(json.dumps(subgraph_1))
                         
+                        # RESTORED PROPER VOLUME FILENAMES
                         if "1" in sg1: sg1["1"]["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
                         if "369" in sg1: sg1["369"]["inputs"]["model_name"] = "MelBandRoformer_fp32.safetensors"
-                        if "367" in sg1: sg1["367"]["inputs"]["ckpt_name"] = "ltx-2-3-22b-audio_vae.safetensors"
+                        if "367" in sg1: sg1["367"]["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
                         
                         if "368" in sg1:
-                            sg1["368"]["inputs"]["clip_name1"] = "gemma_3_12B_it.safetensors"
-                            sg1["368"]["inputs"]["clip_name2"] = "ltx-2-3-22b-text_encoder.safetensors"
+                            sg1["368"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
+                            sg1["368"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
                             sg1["368"]["inputs"]["type"] = "ltxv"
 
                         if "12" in sg1: sg1["12"]["inputs"]["text"] = scene.get("positive_prompt", "")
@@ -527,13 +522,18 @@ except Exception as e:
 
                         if "100" in sg2: sg2["100"]["inputs"]["scene_id"] = str(idx)
 
-                        if "103" in sg2: sg2["103"]["inputs"]["model_name"] = "ltx-2-3-22b-distilled-model.safetensors"
-                        if "101" in sg2: sg2["101"]["inputs"]["vae_name"] = "ltx-2-3-22b-VAE.safetensors"
-                        if "102" in sg2: sg2["102"]["inputs"]["ckpt_name"] = "ltx-2-3-22b-audio_vae.safetensors"
+                        # RESTORED PROPER VOLUME FILENAMES
+                        if "103" in sg2: sg2["103"]["inputs"]["model_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
+                        if "101" in sg2: sg2["101"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
+                        if "102" in sg2: sg2["102"]["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
 
                         if "104" in sg2:
-                            sg2["104"]["inputs"]["lora_1"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
-                            sg2["104"]["inputs"]["strength_1"] = 1.0
+                            if sg2["104"].get("class_type") == "LTXICLoRALoaderModelOnly":
+                                sg2["104"]["inputs"]["lora_name"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
+                                sg2["104"]["inputs"]["strength"] = 1.0
+                            else:
+                                sg2["104"]["inputs"]["lora_1"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
+                                sg2["104"]["inputs"]["strength_1"] = 1.0
 
                         if "137" in sg2:
                             sg2["137"]["inputs"]["pingpong"] = False

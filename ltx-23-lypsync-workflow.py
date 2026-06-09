@@ -205,20 +205,22 @@ try:
 except Exception as e:
     pass
 
-# 2. Audio VAE BFloat16 Hack
+# 2. Audio VAE BFloat16 Hack (Fixed with **kwargs support)
 try:
     import comfy.ldm.lightricks.vae.causal_audio_autoencoder
+    
     _orig_causal_encode = comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.encode
-    def _patched_causal_encode(self, x):
+    def _patched_causal_encode(self, x, **kwargs):
         target_dtype = next(self.parameters()).dtype
-        return _orig_causal_encode(self, x.to(target_dtype))
+        return _orig_causal_encode(self, x.to(target_dtype), **kwargs)
     comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.encode = _patched_causal_encode
 
     _orig_causal_decode = comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.decode
-    def _patched_causal_decode(self, z):
+    def _patched_causal_decode(self, z, **kwargs):
         target_dtype = next(self.parameters()).dtype
-        return _orig_causal_decode(self, z.to(target_dtype))
+        return _orig_causal_decode(self, z.to(target_dtype), **kwargs)
     comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.decode = _patched_causal_decode
+    
     print("[LTX Custom] ✅ Audio VAE BFloat16 hack applied.")
 except Exception as e:
     pass

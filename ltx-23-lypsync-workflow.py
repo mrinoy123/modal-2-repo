@@ -33,7 +33,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "432"  # ⚠️ Bumped to refresh the custom nodes loader & un-nester
+    "FORCE_REBUILD_INDEX": "432"  # ⚠️ Bumped for clean pipeline refresh (OOM fixes)
 })
 
 build_image = base_image.env({
@@ -117,7 +117,7 @@ class LTX23LypsyncEngine:
     def start_comfy(self):
         import boto3
         
-        print("🎨 Building Robust Custom Pipeline Nodes & Un-Nesters...")
+        print("🎨 Building Robust Custom Pipeline Nodes & CPU-Offload Un-Nesters...")
         os.makedirs("/workspace/ComfyUI/custom_nodes/LTXCustomPipeline", exist_ok=True)
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline/__init__.py"
         with open(custom_nodes_path, "w") as f:
@@ -129,9 +129,16 @@ import comfy.utils
 import comfy.samplers
 
 # ====================================================================
-# GLOBAL MEMORY CACHE ARCHITECTURE
+# GLOBAL MEMORY CACHE ARCHITECTURE WITH VRAM PROTECTION
 # ====================================================================
 LTX_CACHE = {}
+
+def move_to_cpu(item):
+    if isinstance(item, torch.Tensor): return item.cpu()
+    if isinstance(item, dict): return {k: move_to_cpu(v) for k, v in item.items()}
+    if isinstance(item, list): return [move_to_cpu(v) for v in item]
+    if isinstance(item, tuple): return tuple(move_to_cpu(v) for v in item)
+    return item
 
 class MemoryCacheWriter:
     @classmethod
@@ -151,10 +158,12 @@ class MemoryCacheWriter:
 
     def write_cache(self, positive, negative, video_latent, audio_latent, scene_id="0"):
         global LTX_CACHE
-        LTX_CACHE[str(scene_id)] = {
+        # Deep move to CPU so no Tensors get trapped in VRAM between subgraphs!
+        cpu_data = move_to_cpu({
             "positive": positive, "negative": negative,
             "video_latent": video_latent, "audio_latent": audio_latent
-        }
+        })
+        LTX_CACHE[str(scene_id)] = cpu_data
         return ()
 
 class MemoryCacheReader:
@@ -346,6 +355,7 @@ except Exception as e:
 
     async def clear_comfy_memory(self, session, unload_models=False):
         try:
+            # Tell ComfyUI to drop models from VRAM
             async with session.post("http://127.0.0.1:8188/free", json={"unload_models": unload_models, "free_memory": True}) as r: await r.read()
         except Exception: pass
         import gc, torch
@@ -551,7 +561,14 @@ except Exception as e:
                         if "366" in sg1: sg1["366"]["inputs"]["audio"] = f"dynamic_guides/spk2_{idx}.wav"
 
                         await self.execute_comfy_workflow(session, sg1)
-                        await self.clear_comfy_memory(session, unload_models=False)
+                        
+                        # -------------------------------------------------------------
+                        # ⚠️ CRITICAL FIX: UNLOAD_MODELS=TRUE 
+                        # Completely drops the 15GB of Text/Audio models from the GPU
+                        # before allowing Subgraph 2 to run its heavy Video DiT upscale!
+                        # -------------------------------------------------------------
+                        print(f"[Lypsync API] 🧹 Flushing 15GB of Text/Audio Models from VRAM...")
+                        await self.clear_comfy_memory(session, unload_models=True)
 
                         print(f"\n[Lypsync API] 🚀 Initiating SUBGRAPH 2 (Video Render) for Scene {idx}...")
                         sg2 = json.loads(json.dumps(subgraph_2))
@@ -618,7 +635,7 @@ except Exception as e:
                             "public_url": f"https://pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev/{target_key}",
                             "filename": saved_filename
                         })
-                        await self.clear_comfy_memory(session, unload_models=False)
+                        await self.clear_comfy_memory(session, unload_models=True)
                     
                     return generated_outputs
 

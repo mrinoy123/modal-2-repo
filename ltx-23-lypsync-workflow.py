@@ -14,6 +14,7 @@ import asyncio
 import ctypes
 import base64
 import math
+import re
 import warnings
 from fastapi import Request, Response, HTTPException, Header
 from fastapi.responses import StreamingResponse
@@ -33,7 +34,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "432"  # ⚠️ Bumped for clean pipeline refresh (OOM fixes)
+    "FORCE_REBUILD_INDEX": "440"  # ⚠️ Bumped for clean pipeline refresh (OOM fixes)
 })
 
 build_image = base_image.env({
@@ -205,7 +206,7 @@ try:
 except Exception as e:
     pass
 
-# 2. Audio VAE BFloat16 Hack (Fixed with **kwargs support)
+# 2. Audio VAE BFloat16 Hack
 try:
     import comfy.ldm.lightricks.vae.causal_audio_autoencoder
     
@@ -523,12 +524,44 @@ except Exception as e:
                                     dummy_data = np.zeros(16000, dtype=np.float32)
                                     sf.write(aud_p, dummy_data, 16000)
 
-                        total_frames = int(scene.get("total_frames", 161))
+                        # ==============================================================================
+                        # 🔥 AUTO-CALCULATE AUDIO/VIDEO LENGTH FROM DIALOGUE PROMPT 🔥
+                        # ==============================================================================
+                        manual_frames = scene.get("total_frames")
+                        if manual_frames and int(manual_frames) > 0:
+                            # Use exact manual override if explicitly provided
+                            total_frames = int(manual_frames)
+                            total_frames = (math.ceil(total_frames / 8) * 8) + 1
+                            exact_audio_duration = float(total_frames) / 25.0
+                            print(f"⏱️ Using manual frame count override: {total_frames} frames ({exact_audio_duration:.2f}s).")
+                        else:
+                            # Auto-calculate purely based on the dialogue text!
+                            dialog_text = scene.get("dialog_text", "")
+                            if not dialog_text.strip():
+                                dialog_text = f"{scene.get('speaker1_text', '')} {scene.get('speaker2_text', '')}"
+                                
+                            # Clean out speaker labels to get an accurate word count
+                            clean_text = re.sub(r'SPEAKER\s+[a-zA-Z0-9]+:', '', dialog_text)
+                            word_count = max(len(clean_text.split()), 1)
+                            
+                            # Estimate duration (Average speech = ~2 words per second)
+                            # Plus add a 0.4 second buffer for every punctuation mark (pauses)
+                            pauses = len(re.findall(r'[.,!?]', clean_text))
+                            estimated_seconds = (word_count / 2.0) + (pauses * 0.4) + 1.5
+                            
+                            # Constrain it (Max 20 seconds to prevent out of memory, Min 3 seconds)
+                            estimated_seconds = max(min(estimated_seconds, 20.0), 3.0)
+                            
+                            # Snap to the strict LTXV video requirement: ((N * 8) + 1) frames
+                            raw_frames = int(estimated_seconds * 25)
+                            total_frames = (math.ceil(raw_frames / 8) * 8) + 1
+                            
+                            # The audio duration automatically exactly matches the LTXV Video frame count
+                            exact_audio_duration = float(total_frames) / 25.0
+                            
+                            print(f"⏱️ Auto-calculated dialog length: {word_count} words -> {estimated_seconds:.2f}s -> {total_frames} frames.")
+
                         scene_seed = scene.get("seed", int(time.time() * 1000) % 1000000)
-                        
-                        # 🔥 NEW: Mathematically sync the audio length to the video length
-                        # LTX Video runs natively at 25 fps.
-                        exact_audio_duration = float(total_frames) / 25.0
 
                         print(f"\n[Lypsync API] 🎬 Initiating SUBGRAPH 1 (Voice & Embeddings) for Scene {idx}...")
                         sg1 = json.loads(json.dumps(subgraph_1))
@@ -555,7 +588,7 @@ except Exception as e:
                                 node_data["inputs"]["width"] = custom_w
                                 node_data["inputs"]["height"] = custom_h
                                 node_data["inputs"]["length"] = total_frames
-                            # 🔥 APPLY THE AUDIO SYNC FIX HERE
+                            # 🔥 DYNAMIC AUDIO-SYNC INJECTION APPLIED HERE
                             elif c_type == "TrimAudioDuration":
                                 node_data["inputs"]["duration"] = exact_audio_duration
                                 node_data["inputs"]["start_index"] = 0
@@ -615,7 +648,6 @@ except Exception as e:
                                 node_data["inputs"]["noise_seed"] = scene_seed
                             elif c_type == "LTXVScheduler":
                                 node_data["inputs"]["steps"] = 12
-                            # 🔥 ADDED SAMPLER BULLETPROOFING
                             elif c_type == "KSamplerSelect":
                                 node_data["inputs"]["sampler_name"] = "euler"
 

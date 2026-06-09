@@ -525,6 +525,10 @@ except Exception as e:
 
                         total_frames = int(scene.get("total_frames", 161))
                         scene_seed = scene.get("seed", int(time.time() * 1000) % 1000000)
+                        
+                        # 🔥 NEW: Mathematically sync the audio length to the video length
+                        # LTX Video runs natively at 25 fps.
+                        exact_audio_duration = float(total_frames) / 25.0
 
                         print(f"\n[Lypsync API] 🎬 Initiating SUBGRAPH 1 (Voice & Embeddings) for Scene {idx}...")
                         sg1 = json.loads(json.dumps(subgraph_1))
@@ -551,6 +555,10 @@ except Exception as e:
                                 node_data["inputs"]["width"] = custom_w
                                 node_data["inputs"]["height"] = custom_h
                                 node_data["inputs"]["length"] = total_frames
+                            # 🔥 APPLY THE AUDIO SYNC FIX HERE
+                            elif c_type == "TrimAudioDuration":
+                                node_data["inputs"]["duration"] = exact_audio_duration
+                                node_data["inputs"]["start_index"] = 0
 
                         # Inject text strings (Fallback to explicit IDs since they contain unique logic)
                         if "12" in sg1: sg1["12"]["inputs"]["text"] = scene.get("positive_prompt", "")
@@ -586,11 +594,8 @@ except Exception as e:
                             c_type = node_data.get("class_type")
                             if c_type == "DiffusionModelLoaderKJ":
                                 node_data["inputs"]["model_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
-                            
-                            # 🔥 [FIX APPLIED HERE] Dynamically injects the missing Upscale model!
                             elif c_type == "LowVRAMLatentUpscaleModelLoader":
                                 node_data["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
-                            
                             elif c_type == "VAELoader":
                                 node_data["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                             elif c_type == "LTXVAudioVAELoader":
@@ -610,6 +615,9 @@ except Exception as e:
                                 node_data["inputs"]["noise_seed"] = scene_seed
                             elif c_type == "LTXVScheduler":
                                 node_data["inputs"]["steps"] = 12
+                            # 🔥 ADDED SAMPLER BULLETPROOFING
+                            elif c_type == "KSamplerSelect":
+                                node_data["inputs"]["sampler_name"] = "euler"
 
                         # DYNAMIC IMAGE AND MASK ROUTING
                         if "142" in sg2: sg2["142"]["inputs"]["image"] = f"dynamic_guides/char1_{idx}.png"

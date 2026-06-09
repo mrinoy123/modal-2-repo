@@ -636,9 +636,6 @@ except Exception as e:
                             elif c_type == "DenoLTXMultiLoraLoader":
                                 node_data["inputs"]["lora_1"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
                                 node_data["inputs"]["strength_1"] = 1.0
-                            elif c_type == "LTXICLoRALoaderModelOnly":
-                                node_data["inputs"]["lora_name"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
-                                node_data["inputs"]["strength"] = 1.0
                             elif c_type == "MemoryCacheReader":
                                 node_data["inputs"]["scene_id"] = str(idx)
                             elif c_type == "VHS_VideoCombine":

@@ -14,9 +14,13 @@ import asyncio
 import ctypes
 import base64
 import math
+import warnings
 from fastapi import Request, Response, HTTPException, Header
 from fastapi.responses import StreamingResponse
 from typing import Optional
+
+# Suppress harmless Librosa/Numba hashing warnings in logs
+warnings.filterwarnings("ignore", category=UserWarning, module="numba")
 
 # ==============================================================================
 # PART 2 & 3: BASE IMAGE & OS CONFIGURATION
@@ -29,7 +33,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "432"  # ⚠️ Bumped for clean pipeline refresh
+    "FORCE_REBUILD_INDEX": "432"  # ⚠️ Bumped to refresh the custom nodes loader
 })
 
 build_image = base_image.env({
@@ -113,34 +117,21 @@ class LTX23LypsyncEngine:
     def start_comfy(self):
         import boto3
         
-        print("🎨 Injecting Smart Nodes & RAM Caches...")
-        custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline.py"
+        print("🎨 Building Robust Custom Pipeline Nodes...")
+        # Guarantee ComfyUI loads this as an extension module by putting it inside __init__.py
+        os.makedirs("/workspace/ComfyUI/custom_nodes/LTXCustomPipeline", exist_ok=True)
+        custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline/__init__.py"
         with open(custom_nodes_path, "w") as f:
             f.write("""
 import torch
 import torchvision.transforms.functional as TF
 import nodes
 import comfy.utils
-import comfy_extras.nodes_lt
 import comfy.samplers
 
 # ====================================================================
-# ⚠️ CRITICAL AUDIO VAE BFLOAT16 TYPE-MATCHING HACK ⚠️
+# GLOBAL MEMORY CACHE ARCHITECTURE
 # ====================================================================
-import comfy.ldm.lightricks.vae.causal_audio_autoencoder
-
-_orig_causal_encode = comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.encode
-def _patched_causal_encode(self, x):
-    target_dtype = next(self.parameters()).dtype
-    return _orig_causal_encode(self, x.to(target_dtype))
-comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.encode = _patched_causal_encode
-
-_orig_causal_decode = comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.decode
-def _patched_causal_decode(self, z):
-    target_dtype = next(self.parameters()).dtype
-    return _orig_causal_decode(self, z.to(target_dtype))
-comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.decode = _patched_causal_decode
-
 LTX_CACHE = {}
 
 class MemoryCacheWriter:
@@ -151,6 +142,7 @@ class MemoryCacheWriter:
             "negative": ("CONDITIONING",),
             "video_latent": ("LATENT",),
             "audio_latent": ("LATENT",),
+        }, "optional": {
             "scene_id": ("STRING", {"default": "0"})
         }}
     RETURN_TYPES = ()
@@ -158,7 +150,7 @@ class MemoryCacheWriter:
     FUNCTION = "write_cache"
     CATEGORY = "LTXBatch"
 
-    def write_cache(self, positive, negative, video_latent, audio_latent, scene_id):
+    def write_cache(self, positive, negative, video_latent, audio_latent, scene_id="0"):
         global LTX_CACHE
         LTX_CACHE[str(scene_id)] = {
             "positive": positive, "negative": negative,
@@ -169,66 +161,100 @@ class MemoryCacheWriter:
 class MemoryCacheReader:
     @classmethod
     def INPUT_TYPES(s):
-        return {"required": {"scene_id": ("STRING", {"default": "0"})}}
+        return {"required": {}, "optional": {"scene_id": ("STRING", {"default": "0"})}}
     RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "LATENT")
     RETURN_NAMES = ("model", "positive", "negative", "video_latent", "audio_latent")
     FUNCTION = "read_cache"
     CATEGORY = "LTXBatch"
 
-    def read_cache(self, scene_id):
+    def read_cache(self, scene_id="0"):
         global LTX_CACHE
         data = LTX_CACHE.get(str(scene_id))
         if data is None: raise ValueError(f"Cache for Scene {scene_id} not found in RAM!")
         return (None, data["positive"], data["negative"], data["video_latent"], data["audio_latent"])
 
-# ====================================================================
-# 🛡️ THE BULLETPROOF NESTED TENSOR FALLBACKS 🛡️
-# Protects PyTorch 2.5 against crashes when AV Latents temporarily merge
-# ====================================================================
-
-class SafeLTXVScheduler(comfy_extras.nodes_lt.LTXVScheduler):
-    def execute(self, steps, max_shift, base_shift, stretch, terminal, latent):
-        s = latent["samples"]
-        if getattr(s, "is_nested", False):
-            vid_tensor = s.unbind()[0]
-            dummy_latent = latent.copy()
-            dummy_latent["samples"] = vid_tensor
-            return super().execute(steps, max_shift, base_shift, stretch, terminal, dummy_latent)
-        return super().execute(steps, max_shift, base_shift, stretch, terminal, latent)
-
-_orig_generate_noise = comfy.samplers.Noise_RandomNoise.generate_noise
-def _patched_generate_noise(self, latent):
-    samples = latent["samples"]
-    if getattr(samples, "is_nested", False):
-        tensors = samples.unbind()
-        noises = [torch.randn_like(t) for t in tensors]
-        try: return torch.nested.as_nested_tensor(noises)
-        except Exception: return torch.nested.nested_tensor(noises)
-    return _orig_generate_noise(self, latent)
-comfy.samplers.Noise_RandomNoise.generate_noise = _patched_generate_noise
-
-class SafeLTXVConcatAVLatent(comfy_extras.nodes_lt.LTXVConcatAVLatent):
-    def execute(self, video_latent, audio_latent):
-        vid_s = video_latent["samples"]
-        aud_s = audio_latent["samples"]
-        if getattr(vid_s, "is_nested", False): vid_s = vid_s.unbind()[0]
-        if getattr(aud_s, "is_nested", False): aud_s = aud_s.unbind()[-1]
-        aud_s = aud_s.to(dtype=vid_s.dtype, device=vid_s.device)
-        padded_aud = aud_s
-        while padded_aud.dim() < vid_s.dim(): padded_aud = padded_aud.unsqueeze(-1)
-        while vid_s.dim() < padded_aud.dim(): vid_s = vid_s.unsqueeze(-1)
-        try: res = torch.nested.as_nested_tensor([vid_s, padded_aud])
-        except Exception: res = torch.nested.nested_tensor([vid_s, padded_aud])
-        out = video_latent.copy()
-        out["samples"] = res
-        return (out,)
-
 NODE_CLASS_MAPPINGS = {
     "MemoryCacheWriter": MemoryCacheWriter,
-    "MemoryCacheReader": MemoryCacheReader, 
-    "LTXVScheduler": SafeLTXVScheduler,
-    "LTXVConcatAVLatent": SafeLTXVConcatAVLatent
+    "MemoryCacheReader": MemoryCacheReader
 }
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "MemoryCacheWriter": "Memory Cache Writer",
+    "MemoryCacheReader": "Memory Cache Reader"
+}
+
+# ====================================================================
+# BULLETPROOF HACKS (Wrapped in try/except to prevent load failures)
+# ====================================================================
+
+# 1. Audio VAE BFloat16 Hack
+try:
+    import comfy.ldm.lightricks.vae.causal_audio_autoencoder
+    _orig_causal_encode = comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.encode
+    def _patched_causal_encode(self, x):
+        target_dtype = next(self.parameters()).dtype
+        return _orig_causal_encode(self, x.to(target_dtype))
+    comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.encode = _patched_causal_encode
+
+    _orig_causal_decode = comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.decode
+    def _patched_causal_decode(self, z):
+        target_dtype = next(self.parameters()).dtype
+        return _orig_causal_decode(self, z.to(target_dtype))
+    comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.decode = _patched_causal_decode
+    print("[LTX Custom] ✅ Audio VAE BFloat16 hack applied.")
+except Exception as e:
+    print(f"[LTX Custom] ⚠️ Skipping Audio VAE hack: {e}")
+
+# 2. Nested Tensor Hacks (PyTorch 2.5 safety)
+try:
+    import comfy_extras.nodes_lt
+    
+    class SafeLTXVScheduler(comfy_extras.nodes_lt.LTXVScheduler):
+        def execute(self, steps, max_shift, base_shift, stretch, terminal, latent):
+            s = latent["samples"]
+            if getattr(s, "is_nested", False):
+                vid_tensor = s.unbind()[0]
+                dummy_latent = latent.copy()
+                dummy_latent["samples"] = vid_tensor
+                return super().execute(steps, max_shift, base_shift, stretch, terminal, dummy_latent)
+            return super().execute(steps, max_shift, base_shift, stretch, terminal, latent)
+
+    class SafeLTXVConcatAVLatent(comfy_extras.nodes_lt.LTXVConcatAVLatent):
+        def execute(self, video_latent, audio_latent):
+            vid_s = video_latent["samples"]
+            aud_s = audio_latent["samples"]
+            if getattr(vid_s, "is_nested", False): vid_s = vid_s.unbind()[0]
+            if getattr(aud_s, "is_nested", False): aud_s = aud_s.unbind()[-1]
+            aud_s = aud_s.to(dtype=vid_s.dtype, device=vid_s.device)
+            padded_aud = aud_s
+            while padded_aud.dim() < vid_s.dim(): padded_aud = padded_aud.unsqueeze(-1)
+            while vid_s.dim() < padded_aud.dim(): vid_s = vid_s.unsqueeze(-1)
+            try: res = torch.nested.as_nested_tensor([vid_s, padded_aud])
+            except Exception: res = torch.nested.nested_tensor([vid_s, padded_aud])
+            out = video_latent.copy()
+            out["samples"] = res
+            return (out,)
+            
+    NODE_CLASS_MAPPINGS["LTXVScheduler"] = SafeLTXVScheduler
+    NODE_CLASS_MAPPINGS["LTXVConcatAVLatent"] = SafeLTXVConcatAVLatent
+    NODE_DISPLAY_NAME_MAPPINGS["LTXVScheduler"] = "LTXVScheduler (Safe)"
+    NODE_DISPLAY_NAME_MAPPINGS["LTXVConcatAVLatent"] = "LTXVConcatAVLatent (Safe)"
+    print("[LTX Custom] ✅ Nested Tensor safety overrides applied.")
+except Exception as e:
+    print(f"[LTX Custom] ⚠️ Skipping Nested Tensor overrides: {e}")
+
+try:
+    _orig_generate_noise = comfy.samplers.Noise_RandomNoise.generate_noise
+    def _patched_generate_noise(self, latent):
+        samples = latent["samples"]
+        if getattr(samples, "is_nested", False):
+            tensors = samples.unbind()
+            noises = [torch.randn_like(t) for t in tensors]
+            try: return torch.nested.as_nested_tensor(noises)
+            except Exception: return torch.nested.nested_tensor(noises)
+        return _orig_generate_noise(self, latent)
+    comfy.samplers.Noise_RandomNoise.generate_noise = _patched_generate_noise
+except Exception as e:
+    pass
 """)
 
         print("🔗 Running Atomic Model Folder Linker for LTX 2.3 & CosyVoice3...")
@@ -476,7 +502,7 @@ NODE_CLASS_MAPPINGS = {
                         if "13" in sg1: sg1["13"]["inputs"]["text"] = scene.get("negative_prompt", "blurry, distorted, bad quality")
                         if "371" in sg1: sg1["371"]["inputs"]["dialog_text"] = scene.get("dialog_text", "")
                         if "374" in sg1: sg1["374"]["inputs"]["text"] = scene.get("speaker1_text", "Hello.")
-                        if "375" in sg1: sg1["375"]["inputs"]["text"] = scene.get("speaker2_text", "Hello.")
+                        if "375" in sg1: sg1["375"]["inputs"]["text"] = scene.get("speaker2_text", ".")
 
                         if "365" in sg1: sg1["365"]["inputs"]["audio"] = f"dynamic_guides/spk1_{idx}.wav"
                         if "366" in sg1: sg1["366"]["inputs"]["audio"] = f"dynamic_guides/spk2_{idx}.wav"

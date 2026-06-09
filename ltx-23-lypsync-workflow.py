@@ -33,7 +33,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "432"  # ⚠️ Bumped for clean pipeline refresh
+    "FORCE_REBUILD_INDEX": "432"  # ⚠️ Bumped to refresh the custom nodes loader & un-nester
 })
 
 build_image = base_image.env({
@@ -117,7 +117,7 @@ class LTX23LypsyncEngine:
     def start_comfy(self):
         import boto3
         
-        print("🎨 Building Robust Custom Pipeline Nodes...")
+        print("🎨 Building Robust Custom Pipeline Nodes & Un-Nesters...")
         os.makedirs("/workspace/ComfyUI/custom_nodes/LTXCustomPipeline", exist_ok=True)
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline/__init__.py"
         with open(custom_nodes_path, "w") as f:
@@ -185,6 +185,18 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 # BULLETPROOF HACKS (Wrapped in try/except to prevent load failures)
 # ====================================================================
 
+# 1. Global Upscaler Failsafe (Cracks open rogue Nested Tensors)
+try:
+    _orig_common_upscale = comfy.utils.common_upscale
+    def _patched_common_upscale(samples, width, height, upscale_method, crop):
+        if getattr(samples, "is_nested", False):
+            samples = samples.unbind()[0]
+        return _orig_common_upscale(samples, width, height, upscale_method, crop)
+    comfy.utils.common_upscale = _patched_common_upscale
+except Exception as e:
+    pass
+
+# 2. Audio VAE BFloat16 Hack
 try:
     import comfy.ldm.lightricks.vae.causal_audio_autoencoder
     _orig_causal_encode = comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.encode
@@ -202,6 +214,7 @@ try:
 except Exception as e:
     pass
 
+# 3. LTX Component Safety Overrides
 try:
     import comfy_extras.nodes_lt
     
@@ -231,10 +244,26 @@ try:
             out["samples"] = res
             return (out,)
             
+    # THE UN-NESTER FIX FOR STAGE 2
+    class SafeLTXVSeparateAVLatent(comfy_extras.nodes_lt.LTXVSeparateAVLatent):
+        def execute(self, av_latent):
+            s = av_latent["samples"]
+            if getattr(s, "is_nested", False):
+                tensors = s.unbind()
+                vid_out = av_latent.copy()
+                aud_out = av_latent.copy()
+                # Violently strip out the nested class structure so Upscalers receive raw tensors!
+                vid_out["samples"] = tensors[0].contiguous()
+                aud_out["samples"] = tensors[-1].contiguous() if len(tensors) > 1 else tensors[0].contiguous()
+                return (vid_out, aud_out)
+            return super().execute(av_latent)
+            
     NODE_CLASS_MAPPINGS["LTXVScheduler"] = SafeLTXVScheduler
     NODE_CLASS_MAPPINGS["LTXVConcatAVLatent"] = SafeLTXVConcatAVLatent
+    NODE_CLASS_MAPPINGS["LTXVSeparateAVLatent"] = SafeLTXVSeparateAVLatent
+    print("[LTX Custom] ✅ Nested Tensor safety & UN-NESTER overrides applied.")
 except Exception as e:
-    pass
+    print(f"[LTX Custom] ⚠️ Skipping Nested Tensor overrides: {e}")
 
 try:
     _orig_generate_noise = comfy.samplers.Noise_RandomNoise.generate_noise
@@ -380,6 +409,7 @@ except Exception as e:
 
             try:
                 async with aiohttp.ClientSession() as session:
+                    # ✅ ENFORCING STRICT 9:16 VERTICAL RESOLUTION AS REQUESTED
                     custom_w = int(body.get("custom_width", 384)) 
                     custom_h = int(body.get("custom_height", 672))
 
@@ -558,15 +588,10 @@ except Exception as e:
                                 node_data["inputs"]["steps"] = 12
 
                         # DYNAMIC IMAGE AND MASK ROUTING
-                        # (Covers the IDs from the newest generated JSON layout)
                         if "142" in sg2: sg2["142"]["inputs"]["image"] = f"dynamic_guides/char1_{idx}.png"
                         if "143" in sg2: sg2["143"]["inputs"]["image"] = f"dynamic_guides/mask1_{idx}.png"
                         if "144" in sg2: sg2["144"]["inputs"]["image"] = f"dynamic_guides/char2_{idx}.png"
                         if "145" in sg2: sg2["145"]["inputs"]["image"] = f"dynamic_guides/mask2_{idx}.png"
-
-                        # (Covers the IDs from the old JSON layout just in case)
-                        if "429" in sg2: sg2["429"]["inputs"]["image"] = f"dynamic_guides/char1_{idx}.png"
-                        if "430" in sg2: sg2["430"]["inputs"]["image"] = f"dynamic_guides/char2_{idx}.png"
 
                         await self.execute_comfy_workflow(session, sg2)
 

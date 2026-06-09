@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "429"  # ⚠️ Bumped to ensure clean pipeline refresh
+    "FORCE_REBUILD_INDEX": "432"  # ⚠️ Bumped for clean pipeline refresh
 })
 
 build_image = base_image.env({
@@ -113,7 +113,7 @@ class LTX23LypsyncEngine:
     def start_comfy(self):
         import boto3
         
-        print("🎨 Injecting Smart Nodes, Caches & Global AV Latent Protections...")
+        print("🎨 Injecting Smart Nodes & RAM Caches...")
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline.py"
         with open(custom_nodes_path, "w") as f:
             f.write("""
@@ -181,35 +181,25 @@ class MemoryCacheReader:
         if data is None: raise ValueError(f"Cache for Scene {scene_id} not found in RAM!")
         return (None, data["positive"], data["negative"], data["video_latent"], data["audio_latent"])
 
-class FastVAEDecode(nodes.VAEDecode):
-    def decode(self, vae, samples):
-        try: return (vae.decode_tiled(samples["samples"], tile_x=512, tile_y=512), )
-        except Exception: return super().decode(vae, samples)
-
 # ====================================================================
-# 🛡️ THE BULLETPROOF NODE OVERRIDES (PyTorch 2.5 Fix) 🛡️
-# Hard-replaces ComfyUI's default nodes to intercept NestedTensors safely.
+# 🛡️ THE BULLETPROOF NESTED TENSOR FALLBACKS 🛡️
+# Protects PyTorch 2.5 against crashes when AV Latents temporarily merge
 # ====================================================================
 
-# 1. Override the Scheduler Node
 class SafeLTXVScheduler(comfy_extras.nodes_lt.LTXVScheduler):
     def execute(self, steps, max_shift, base_shift, stretch, terminal, latent):
         s = latent["samples"]
         if getattr(s, "is_nested", False):
-            # Secretly extract only the video tensor to calculate math.prod(shape)
             vid_tensor = s.unbind()[0]
             dummy_latent = latent.copy()
             dummy_latent["samples"] = vid_tensor
-            # Calculate scheduling using only video shape, avoiding PyTorch crash
             return super().execute(steps, max_shift, base_shift, stretch, terminal, dummy_latent)
         return super().execute(steps, max_shift, base_shift, stretch, terminal, latent)
 
-# 2. Override the Noise Generator Object
 _orig_generate_noise = comfy.samplers.Noise_RandomNoise.generate_noise
 def _patched_generate_noise(self, latent):
     samples = latent["samples"]
     if getattr(samples, "is_nested", False):
-        # Generate noise for audio and video separately, then safely repack
         tensors = samples.unbind()
         noises = [torch.randn_like(t) for t in tensors]
         try: return torch.nested.as_nested_tensor(noises)
@@ -217,93 +207,27 @@ def _patched_generate_noise(self, latent):
     return _orig_generate_noise(self, latent)
 comfy.samplers.Noise_RandomNoise.generate_noise = _patched_generate_noise
 
-# 3. Override the Native Concat Node (Forces Dimension Padding on Upscaled Zips)
 class SafeLTXVConcatAVLatent(comfy_extras.nodes_lt.LTXVConcatAVLatent):
     def execute(self, video_latent, audio_latent):
         vid_s = video_latent["samples"]
         aud_s = audio_latent["samples"]
-        
-        # Strip preexisting containers if they exist
         if getattr(vid_s, "is_nested", False): vid_s = vid_s.unbind()[0]
         if getattr(aud_s, "is_nested", False): aud_s = aud_s.unbind()[-1]
-
-        # Sync device and dtype
         aud_s = aud_s.to(dtype=vid_s.dtype, device=vid_s.device)
-        
-        # 🛡️ Invisibly pad the audio with silent dimensions so it perfectly 
-        # matches the upscaled video's new rank, and zip them together flawlessly.
         padded_aud = aud_s
-        while padded_aud.dim() < vid_s.dim():
-            padded_aud = padded_aud.unsqueeze(-1)
-        while vid_s.dim() < padded_aud.dim():
-            vid_s = vid_s.unsqueeze(-1)
-            
+        while padded_aud.dim() < vid_s.dim(): padded_aud = padded_aud.unsqueeze(-1)
+        while vid_s.dim() < padded_aud.dim(): vid_s = vid_s.unsqueeze(-1)
         try: res = torch.nested.as_nested_tensor([vid_s, padded_aud])
-        except Exception:
-            try: res = torch._nested_tensor_from_tensor_list([vid_s, padded_aud])
-            except Exception: res = torch.nested.nested_tensor([vid_s, padded_aud])
-                
+        except Exception: res = torch.nested.nested_tensor([vid_s, padded_aud])
         out = video_latent.copy()
         out["samples"] = res
         return (out,)
 
-# 4. Safe Latent Upscale Fallback mapping
-class SafeLatentUpscale:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {"required": {
-            "samples": ("LATENT",),
-            "upscale_method": (["nearest-exact", "bilinear", "area", "bicubic", "bislerp"],),
-            "scale_by": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 10.0, "step": 0.1}),
-        }}
-    RETURN_TYPES = ("LATENT",)
-    FUNCTION = "upscale"
-    CATEGORY = "LTXBatch"
-
-    def upscale(self, samples, upscale_method, scale_by):
-        import comfy.utils
-        s = samples.copy()
-        tensor = samples["samples"]
-        is_nested = getattr(tensor, "is_nested", False)
-        if is_nested:
-            tensors = tensor.unbind()
-            vid_tensor = tensors[0]
-            aud_tensor = tensors[1] if len(tensors) > 1 else None
-        else:
-            vid_tensor = tensor
-            aud_tensor = None
-
-        shape = list(vid_tensor.shape)
-        H, W = shape[-2], shape[-1]
-        new_H, new_W = int(H * scale_by), int(W * scale_by)
-        
-        flat_B = 1
-        for d in shape[:-2]: flat_B *= d
-            
-        vid_reshaped = vid_tensor.reshape(flat_B, 1, H, W).to(torch.float32)
-        up_vid = comfy.utils.common_upscale(vid_reshaped, new_W, new_H, upscale_method, "disabled")
-        new_shape = shape[:-2] + [new_H, new_W]
-        up_vid = up_vid.reshape(*new_shape).contiguous().to(dtype=vid_tensor.dtype, device=vid_tensor.device)
-
-        if is_nested and aud_tensor is not None:
-            aud_tensor = aud_tensor.to(dtype=up_vid.dtype, device=up_vid.device)
-            padded_aud = aud_tensor
-            while padded_aud.dim() < up_vid.dim(): padded_aud = padded_aud.unsqueeze(-1)
-            while up_vid.dim() < padded_aud.dim(): up_vid = up_vid.unsqueeze(-1)
-            try: s["samples"] = torch.nested.as_nested_tensor([up_vid, padded_aud])
-            except Exception: s["samples"] = torch.nested.nested_tensor([up_vid, padded_aud])
-        else:
-            s["samples"] = up_vid
-        return (s,)
-
-# Force ComfyUI to use our Safe Interceptors globally
 NODE_CLASS_MAPPINGS = {
     "MemoryCacheWriter": MemoryCacheWriter,
     "MemoryCacheReader": MemoryCacheReader, 
-    "VAEDecode": FastVAEDecode,
     "LTXVScheduler": SafeLTXVScheduler,
-    "LTXVConcatAVLatent": SafeLTXVConcatAVLatent,
-    "SafeLatentUpscale": SafeLatentUpscale
+    "LTXVConcatAVLatent": SafeLTXVConcatAVLatent
 }
 """)
 
@@ -465,21 +389,51 @@ NODE_CLASS_MAPPINGS = {
                                 except Exception: pass
                             return False
 
+                        has_two_chars = bool(scene.get("image2_url"))
+
                         img1_path = os.path.join(dynamic_guides_dir, f"char1_{idx}.png")
                         img2_path = os.path.join(dynamic_guides_dir, f"char2_{idx}.png")
+                        mask1_path = os.path.join(dynamic_guides_dir, f"mask1_{idx}.png")
+                        mask2_path = os.path.join(dynamic_guides_dir, f"mask2_{idx}.png")
                         
                         await download_asset(scene.get("image1_url"), img1_path)
-                        await download_asset(scene.get("image2_url"), img2_path)
-                        
-                        from PIL import Image
-                        for img_p in [img1_path, img2_path]:
-                            if not os.path.exists(img_p):
-                                print(f"⚠️ Image not found, generating safety dummy: {img_p}")
-                                Image.new('RGB', (custom_w, custom_h), color='black').save(img_p)
-                            else:
-                                i = Image.open(img_p).convert("RGB")
-                                i.resize((custom_w, custom_h), Image.Resampling.LANCZOS).save(img_p)
+                        if has_two_chars:
+                            success2 = await download_asset(scene.get("image2_url"), img2_path)
+                            if not success2: has_two_chars = False
 
+                        from PIL import Image, ImageDraw
+                        
+                        # Process Image 1
+                        if not os.path.exists(img1_path):
+                            print(f"⚠️ Image 1 not found, generating safety dummy: {img1_path}")
+                            Image.new('RGB', (custom_w, custom_h), color='black').save(img1_path)
+                        else:
+                            i = Image.open(img1_path).convert("RGB")
+                            i.resize((custom_w, custom_h), Image.Resampling.LANCZOS).save(img1_path)
+
+                        # Process Image 2
+                        if not os.path.exists(img2_path):
+                            Image.new('RGB', (custom_w, custom_h), color='black').save(img2_path)
+                        else:
+                            i = Image.open(img2_path).convert("RGB")
+                            i.resize((custom_w, custom_h), Image.Resampling.LANCZOS).save(img2_path)
+
+                        # GENERATE DYNAMIC MASKS (1 Person vs 2 Persons)
+                        mask1 = Image.new('RGB', (custom_w, custom_h), color='white')
+                        mask2 = Image.new('RGB', (custom_w, custom_h), color='black')
+
+                        if has_two_chars:
+                            # 2 Characters: Split the screen in half
+                            draw1 = ImageDraw.Draw(mask1)
+                            draw1.rectangle([custom_w // 2, 0, custom_w, custom_h], fill="black") # White left, Black right
+                            
+                            draw2 = ImageDraw.Draw(mask2)
+                            draw2.rectangle([custom_w // 2, 0, custom_w, custom_h], fill="white") # Black left, White right
+
+                        mask1.save(mask1_path)
+                        mask2.save(mask2_path)
+
+                        # Process Audio
                         spk1_path = os.path.join(dynamic_guides_dir, f"spk1_{idx}.wav")
                         spk2_path = os.path.join(dynamic_guides_dir, f"spk2_{idx}.wav")
 
@@ -511,11 +465,11 @@ NODE_CLASS_MAPPINGS = {
                         
                         if "1" in sg1: sg1["1"]["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
                         if "369" in sg1: sg1["369"]["inputs"]["model_name"] = "MelBandRoformer_fp32.safetensors"
-                        if "367" in sg1: sg1["367"]["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
+                        if "367" in sg1: sg1["367"]["inputs"]["ckpt_name"] = "ltx-2-3-22b-audio_vae.safetensors"
                         
                         if "368" in sg1:
-                            sg1["368"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
-                            sg1["368"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
+                            sg1["368"]["inputs"]["clip_name1"] = "gemma_3_12B_it.safetensors"
+                            sg1["368"]["inputs"]["clip_name2"] = "ltx-2-3-22b-text_encoder.safetensors"
                             sg1["368"]["inputs"]["type"] = "ltxv"
 
                         if "12" in sg1: sg1["12"]["inputs"]["text"] = scene.get("positive_prompt", "")
@@ -545,43 +499,30 @@ NODE_CLASS_MAPPINGS = {
 
                         scene_seed = scene.get("seed", int(time.time() * 1000) % 1000000)
 
-                        if "301" in sg2: sg2["301"]["inputs"]["scene_id"] = str(idx)
+                        if "100" in sg2: sg2["100"]["inputs"]["scene_id"] = str(idx)
 
-                        if "422" in sg2: sg2["422"]["inputs"]["model_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
-                        if "428" in sg2: sg2["428"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
-                        if "431" in sg2: sg2["431"]["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
+                        if "103" in sg2: sg2["103"]["inputs"]["model_name"] = "ltx-2-3-22b-distilled-model.safetensors"
+                        if "101" in sg2: sg2["101"]["inputs"]["vae_name"] = "ltx-2-3-22b-VAE.safetensors"
+                        if "102" in sg2: sg2["102"]["inputs"]["ckpt_name"] = "ltx-2-3-22b-audio_vae.safetensors"
 
-                        if "426" in sg2:
-                            if sg2["426"].get("class_type") == "LTXICLoRALoaderModelOnly":
-                                sg2["426"]["inputs"]["lora_name"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
-                                sg2["426"]["inputs"]["strength"] = 1.0
-                            else:
-                                sg2["426"]["inputs"]["lora_1"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
-                                sg2["426"]["inputs"]["strength_1"] = 1.0
+                        if "104" in sg2:
+                            sg2["104"]["inputs"]["lora_1"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
+                            sg2["104"]["inputs"]["strength_1"] = 1.0
 
-                        if "421" in sg2:
-                            sg2["421"]["inputs"]["pingpong"] = False
-                            sg2["421"]["inputs"]["save_output"] = True
+                        if "137" in sg2:
+                            sg2["137"]["inputs"]["pingpong"] = False
+                            sg2["137"]["inputs"]["save_output"] = True
 
-                        if "429" in sg2: sg2["429"]["inputs"]["image"] = f"dynamic_guides/char1_{idx}.png"
-                        if "430" in sg2: sg2["430"]["inputs"]["image"] = f"dynamic_guides/char2_{idx}.png"
+                        # DYNAMIC IMAGE AND MASK ROUTING
+                        if "142" in sg2: sg2["142"]["inputs"]["image"] = f"dynamic_guides/char1_{idx}.png"
+                        if "143" in sg2: sg2["143"]["inputs"]["image"] = f"dynamic_guides/mask1_{idx}.png"
+                        if "144" in sg2: sg2["144"]["inputs"]["image"] = f"dynamic_guides/char2_{idx}.png"
+                        if "145" in sg2: sg2["145"]["inputs"]["image"] = f"dynamic_guides/mask2_{idx}.png"
 
-                        if "413" in sg2: sg2["413"]["inputs"]["noise_seed"] = scene_seed
-                        if "412" in sg2: sg2["412"]["inputs"]["steps"] = 12
+                        if "119" in sg2: sg2["119"]["inputs"]["noise_seed"] = scene_seed
+                        if "118" in sg2: sg2["118"]["inputs"]["steps"] = 12
 
-                        if "502" in sg2: sg2["502"]["inputs"]["noise_seed"] = scene_seed
-                        if "501" in sg2:
-                            sg2["501"]["inputs"]["steps"] = 8
-                            if "terminal" in sg2["501"]["inputs"]: sg2["501"]["inputs"]["terminal"] = 0.1 
-
-                        # ==============================================================
-                        # 🛡️ THE ARCHITECTURAL UPSCALER FIX 🛡️
-                        # Hijacks any broken 'LatentUpscaleBy' node the user deployed 
-                        # and forcefully patches it with our bulletproof SafeLatentUpscale.
-                        # ==============================================================
-                        for node_id, node_data in list(sg2.items()):
-                            if node_data.get("class_type") == "LatentUpscaleBy":
-                                node_data["class_type"] = "SafeLatentUpscale"
+                        if "130" in sg2: sg2["130"]["inputs"]["noise_seed"] = scene_seed
 
                         await self.execute_comfy_workflow(session, sg2)
 

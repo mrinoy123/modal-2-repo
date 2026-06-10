@@ -34,7 +34,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "450"  # ⚠️ Bumped to apply Clean Split VRAM Purge Architecture
+    "FORCE_REBUILD_INDEX": "450"  # ⚠️ Bumped to apply PromptRelay Mock
 })
 
 build_image = base_image.env({
@@ -159,7 +159,6 @@ class MemoryCacheWriter:
     def write_cache(self, positive, negative, video_latent, audio_latent, scene_id="0"):
         global LTX_CACHE
         
-        # 🚀 Only physical tensors are cached here. The model is completely dropped so VRAM can be purged.
         LTX_CACHE[str(scene_id)] = {
             "positive": move_to_cpu(positive),
             "negative": move_to_cpu(negative),
@@ -173,7 +172,6 @@ class MemoryCacheReader:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {}, "optional": {"scene_id": ("STRING", {"default": "0"})}}
-    # 🚀 'MODEL' is still returned purely to keep the JSON wiring intact, but it outputs 'None'.
     RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "LATENT")
     RETURN_NAMES = ("model", "positive", "negative", "video_latent", "audio_latent")
     FUNCTION = "read_cache"
@@ -198,15 +196,21 @@ class DummyModelLoader:
             unet_config = {"target": "LTXVideo"}
             supported_inference_dtypes = [torch.float16, torch.bfloat16, torch.float32]
 
+        # 🔥 FIX: Mock the exact name 'LTXVideo' so PromptRelay Encode node doesn't crash!
+        LTXVideoMock = type("LTXVideo", (torch.nn.Module,), {})
+
         class EmptyModel(torch.nn.Module):
             def __init__(self):
                 super().__init__()
                 self.latent_format = None
                 self.model_config = DummyConfig()
                 self.supported_inference_dtypes = DummyConfig.supported_inference_dtypes
+                
+                # Assign the mocked class so PromptRelay detect_model_type() succeeds
+                self.diffusion_model = LTXVideoMock()
 
         patcher = comfy.model_patcher.ModelPatcher(EmptyModel(), load_device=torch.device("cpu"), offload_device=torch.device("cpu"))
-        print("[LTX Custom] 🚀 Intercepted! Loaded DUMMY UNet to save ~23GB VRAM in Subgraph 1!")
+        print("[LTX Custom] 🚀 Intercepted! Loaded DUMMY UNet (with LTXVideo Mock) to save ~23GB VRAM in Subgraph 1!")
         return (patcher,)
 
 NODE_CLASS_MAPPINGS = {

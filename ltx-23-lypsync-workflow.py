@@ -34,7 +34,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "446"  # ⚠️ Bumped to apply Pointer Passing Strategy
+    "FORCE_REBUILD_INDEX": "450"  # ⚠️ Bumped to apply Clean Split VRAM Purge Architecture
 })
 
 build_image = base_image.env({
@@ -119,7 +119,7 @@ class LTX23LypsyncEngineV2:
     def start_comfy(self):
         import boto3
         
-        print("🎨 Building Robust Pointer-Pass Cache Nodes...")
+        print("🎨 Building Robust Cache Nodes & Deep VRAM Purgers...")
         os.makedirs("/workspace/ComfyUI/custom_nodes/LTXCustomPipeline", exist_ok=True)
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline/__init__.py"
         with open(custom_nodes_path, "w") as f:
@@ -144,7 +144,6 @@ class MemoryCacheWriter:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-            "model": ("MODEL",),  # 🚀 POINTER PASS ADDITION
             "positive": ("CONDITIONING",),
             "negative": ("CONDITIONING",),
             "video_latent": ("LATENT",),
@@ -157,24 +156,24 @@ class MemoryCacheWriter:
     FUNCTION = "write_cache"
     CATEGORY = "LTXBatch"
 
-    def write_cache(self, model, positive, negative, video_latent, audio_latent, scene_id="0"):
+    def write_cache(self, positive, negative, video_latent, audio_latent, scene_id="0"):
         global LTX_CACHE
         
-        # 🚀 Model pointer is saved EXPLICITLY (no cpu move), keeping it live in VRAM
+        # 🚀 Only physical tensors are cached here. The model is completely dropped so VRAM can be purged.
         LTX_CACHE[str(scene_id)] = {
-            "model": model, 
             "positive": move_to_cpu(positive),
             "negative": move_to_cpu(negative),
             "video_latent": move_to_cpu(video_latent),
             "audio_latent": move_to_cpu(audio_latent)
         }
-        print(f"[LTX Cache] 💾 Saved Scene {scene_id} to RAM (Live Model Pointer Captured).")
+        print(f"[LTX Cache] 💾 Saved Scene {scene_id} Conditionings to CPU RAM.")
         return ()
 
 class MemoryCacheReader:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {}, "optional": {"scene_id": ("STRING", {"default": "0"})}}
+    # 🚀 'MODEL' is still returned purely to keep the JSON wiring intact, but it outputs 'None'.
     RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "LATENT")
     RETURN_NAMES = ("model", "positive", "negative", "video_latent", "audio_latent")
     FUNCTION = "read_cache"
@@ -184,16 +183,41 @@ class MemoryCacheReader:
         global LTX_CACHE
         data = LTX_CACHE.get(str(scene_id))
         if data is None: raise ValueError(f"Cache for Scene {scene_id} not found in RAM!")
-        print(f"[LTX Cache] 📂 Loaded Scene {scene_id} from RAM (Serving Live Model Pointer).")
-        return (data["model"], data["positive"], data["negative"], data["video_latent"], data["audio_latent"])
+        print(f"[LTX Cache] 📂 Loaded Scene {scene_id} Conditionings from CPU RAM.")
+        return (None, data["positive"], data["negative"], data["video_latent"], data["audio_latent"])
+
+class DummyModelLoader:
+    @classmethod
+    def INPUT_TYPES(s): return {"required": {}}
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "load_dummy"
+    CATEGORY = "LTXBatch"
+
+    def load_dummy(self):
+        class DummyConfig:
+            unet_config = {"target": "LTXVideo"}
+            supported_inference_dtypes = [torch.float16, torch.bfloat16, torch.float32]
+
+        class EmptyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.latent_format = None
+                self.model_config = DummyConfig()
+                self.supported_inference_dtypes = DummyConfig.supported_inference_dtypes
+
+        patcher = comfy.model_patcher.ModelPatcher(EmptyModel(), load_device=torch.device("cpu"), offload_device=torch.device("cpu"))
+        print("[LTX Custom] 🚀 Intercepted! Loaded DUMMY UNet to save ~23GB VRAM in Subgraph 1!")
+        return (patcher,)
 
 NODE_CLASS_MAPPINGS = {
     "MemoryCacheWriter": MemoryCacheWriter,
-    "MemoryCacheReader": MemoryCacheReader
+    "MemoryCacheReader": MemoryCacheReader,
+    "DummyModelLoader": DummyModelLoader
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "MemoryCacheWriter": "Memory Cache Writer (Pointer Pass)",
-    "MemoryCacheReader": "Memory Cache Reader (Pointer Pass)"
+    "MemoryCacheWriter": "Memory Cache Writer",
+    "MemoryCacheReader": "Memory Cache Reader",
+    "DummyModelLoader": "Dummy Model Loader"
 }
 
 # ====================================================================
@@ -376,35 +400,22 @@ except Exception: pass
             def inject_node_overrides(sg, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene_data):
                 is_subgraph_1 = total_frames > 0  
                 
-                # 🚀 DYNAMIC GRAPH WIRING FOR POINTER PASSING
-                if is_subgraph_1:
-                    # Wire the LoRA output 'model' into MemoryCacheWriter so it can save the pointer
-                    writer_id = None
-                    lora_id = None
-                    for n_id, n_data in sg.items():
-                        if n_data.get("class_type") == "MemoryCacheWriter": writer_id = n_id
-                        if n_data.get("class_type") == "DenoLTXMultiLoraLoader": lora_id = n_id
-                    if writer_id and lora_id:
-                        sg[writer_id]["inputs"]["model"] = [lora_id, 0]
-                else:
-                    # In Subgraph 2: Reroute the actual model pipeline to pull DIRECTLY from the Reader
-                    # This bypasses the duplicate ModelLoader and duplicate LoraLoaders
-                    reader_id = None
-                    nag_id = None
-                    for n_id, n_data in sg.items():
-                        if n_data.get("class_type") == "MemoryCacheReader": reader_id = n_id
-                        if n_data.get("class_type") == "LTX2_NAG": nag_id = n_id
-                    if reader_id and nag_id:
-                        sg[nag_id]["inputs"]["model"] = [reader_id, 0]
-
                 for node_id, node_data in list(sg.items()):
                     c_type = node_data.get("class_type")
                     if "inputs" not in node_data: continue
                     
                     if c_type == "DiffusionModelLoaderKJ":
-                        node_data["inputs"]["model_name"] = "ltx-2.3-22b-dev-fp8.safetensors"
-                        node_data["inputs"]["patch_cublaslinear"] = True        # Prevents linear memory spikes
-                        node_data["inputs"]["enable_fp16_accumulation"] = False # Prevents attention fp32 blowout
+                        if is_subgraph_1:
+                            # 🚀 COMPLETELY REPLACE NODE TO AVOID LOADING UNET in SUBGRAPH 1!
+                            # Note: The "lora key not loaded" warnings that follow this in the console
+                            # are completely benign and safe. The CLIP text encoder STILL gets patched properly.
+                            node_data["class_type"] = "DummyModelLoader"
+                            node_data["inputs"] = {}
+                        else:
+                            # 🎥 Phase 2 - Load real model & Prevent NAG Batch OOM
+                            node_data["inputs"]["model_name"] = "ltx-2.3-22b-dev-fp8.safetensors"
+                            node_data["inputs"]["patch_cublaslinear"] = True        # Reduces linear memory spikes
+                            node_data["inputs"]["enable_fp16_accumulation"] = False # Disables fp32 bloat on Attention layers
 
                     elif c_type == "DualCLIPLoader":
                         node_data["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
@@ -522,8 +533,9 @@ except Exception: pass
                         print(f"🎬 Processing Audio & Text Cache for Scene {idx}...")
                         await self.execute_comfy_workflow(session, sg1)
 
-                        # 🚀 PREVENT MODEL UNLOADING: Preserve the UNet Memory Pointer for Phase 2!
-                        await self.clear_comfy_memory(session, unload_models=False)
+                    print(f"\n[Lypsync API] 🧹 Flushing VRAM completely before Rendering Phase...")
+                    # 🚀 FULL UNLOAD: VRAM drops to ~0GB. Tensors are safe in RAM.
+                    await self.clear_comfy_memory(session, unload_models=True)
 
                     print(f"\n[Lypsync API] 🎥 STARTING PHASE 2: RENDERING {len(batch_scenes)} VIDEOS")
                     out_dir = "/workspace/ComfyUI/output"
@@ -544,11 +556,11 @@ except Exception: pass
                         sg2 = json.loads(json.dumps(subgraph_2))
                         sg2 = inject_node_overrides(sg2, idx, custom_w, custom_h, 0, 0, scene)
 
-                        print(f"🎬 Rendering Video for Scene {idx} (Executing using Live Memory Pointer)...")
+                        print(f"🎬 Rendering Video for Scene {idx} (Loading real UNet + LoRAs into pristine VRAM)...")
                         await self.execute_comfy_workflow(session, sg2)
 
-                        # 🚀 KEEP MODEL FOR NEXT SCENE IN BATCH
-                        await self.clear_comfy_memory(session, unload_models=False)
+                        # 🚀 FULL UNLOAD FOR BATCH HEADROOM: Keeps VRAM pristine between scenes
+                        await self.clear_comfy_memory(session, unload_models=True)
 
                         output_files = []
                         for root_p, _, filenames in os.walk(out_dir):
@@ -574,8 +586,7 @@ except Exception: pass
                         })
                         os.remove(target_video_file)
 
-                    print(f"\n[Lypsync API] 🎉 All Scenes Rendered. Final VRAM Purge.")
-                    await self.clear_comfy_memory(session, unload_models=True)
+                    print(f"\n[Lypsync API] 🎉 All Scenes Rendered. Pipeline Finished.")
                     
                     return generated_outputs
 

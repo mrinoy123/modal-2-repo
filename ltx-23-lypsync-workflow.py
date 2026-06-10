@@ -134,10 +134,19 @@ import comfy.model_patcher
 LTX_CACHE = {}
 
 def move_to_cpu(item):
-    if isinstance(item, torch.Tensor): return item.cpu()
-    if isinstance(item, dict): return {k: move_to_cpu(v) for k, v in item.items()}
-    if isinstance(item, list): return [move_to_cpu(v) for v in item]
-    if isinstance(item, tuple): return tuple(move_to_cpu(v) for v in item)
+    if isinstance(item, torch.Tensor): 
+        return item.cpu()
+    if isinstance(item, dict): 
+        # ✅ FIX 3: Preserves exact subclass (like PromptRelay objects) instead of downgrading to basic dict
+        new_dict = type(item)()
+        for k, v in item.items(): new_dict[k] = move_to_cpu(v)
+        return new_dict
+    if isinstance(item, list): 
+        # ✅ FIX 3: Preserves exact subclass
+        return type(item)(move_to_cpu(v) for v in item)
+    if isinstance(item, tuple): 
+        # ✅ FIX 3: Preserves exact subclass
+        return type(item)(move_to_cpu(v) for v in item)
     return item
 
 class MemoryCacheWriter:
@@ -374,19 +383,9 @@ except Exception: pass
             generated_outputs = []
 
             def inject_node_overrides(sg, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene_data):
-                is_subgraph_1 = total_frames > 0  
-                
-                # 🚀 DYNAMIC GRAPH WIRING FOR POINTER PASSING
-                if is_subgraph_1:
-                    # Physically wire the patched LoRA output (the live UNet) into the MemoryCacheWriter
-                    writer_id = None
-                    lora_id = None
-                    for n_id, n_data in sg.items():
-                        if n_data.get("class_type") == "MemoryCacheWriter": writer_id = n_id
-                        if n_data.get("class_type") == "DenoLTXMultiLoraLoader": lora_id = n_id
-                    if writer_id and lora_id:
-                        sg[writer_id]["inputs"]["model"] = [lora_id, 0]
-                
+                # ✅ FIX 1: Removed the destructive wiring bypass that skipped PromptRelayEncode.
+                # The workflow is now correctly guided by your JSON wiring!
+
                 for node_id, node_data in list(sg.items()):
                     c_type = node_data.get("class_type")
                     if "inputs" not in node_data: continue
@@ -410,10 +409,12 @@ except Exception: pass
                     elif c_type == "FL_CosyVoice3_ModelLoader":
                         node_data["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
                     elif c_type == "DenoLTXMultiLoraLoader":
-                        node_data["inputs"]["lora_1"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
-                        node_data["inputs"]["lora_2"] = "VBVR-official-comfyui.safetensors"
-                        node_data["inputs"]["lora_3"] = "LTX2.3rl-lora-zghhui-OmniNFT.safetensors"
-                        for i in range(1, 9):
+                        # ✅ FIX 2: Restored the Distilled LoRA so generation isn't destroyed at low step count
+                        node_data["inputs"]["lora_1"] = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
+                        node_data["inputs"]["lora_2"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
+                        node_data["inputs"]["lora_3"] = "VBVR-official-comfyui.safetensors"
+                        node_data["inputs"]["lora_4"] = "LTX2.3rl-lora-zghhui-OmniNFT.safetensors"
+                        for i in range(5, 9):
                             k = f"lora_{i}"
                             if k in node_data["inputs"] and node_data["inputs"][k] in ["", "None", None]:
                                 node_data["inputs"][k] = "__none__"

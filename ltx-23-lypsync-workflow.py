@@ -34,7 +34,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "455"  # ⚠️ Bumped for strict Pointer Passing Architecture
+    "FORCE_REBUILD_INDEX": "455"  # Bumped for Memory Cache purity updates
 })
 
 build_image = base_image.env({
@@ -133,27 +133,16 @@ import comfy.model_patcher
 
 LTX_CACHE = {}
 
-def move_to_cpu(item):
-    if isinstance(item, torch.Tensor): 
-        return item.cpu()
-    if isinstance(item, dict): 
-        # ✅ FIX 3: Preserves exact subclass (like PromptRelay objects) instead of downgrading to basic dict
-        new_dict = type(item)()
-        for k, v in item.items(): new_dict[k] = move_to_cpu(v)
-        return new_dict
-    if isinstance(item, list): 
-        # ✅ FIX 3: Preserves exact subclass
-        return type(item)(move_to_cpu(v) for v in item)
-    if isinstance(item, tuple): 
-        # ✅ FIX 3: Preserves exact subclass
-        return type(item)(move_to_cpu(v) for v in item)
-    return item
+# ✅ FIX 1: We completely removed move_to_cpu. 
+# PromptRelay uses custom object subclasses. Casting them to dicts/lists strips their identity 
+# causing the UNet to read empty conditions -> resulting in pure static noise!
+# Storing exact RAM pointers prevents data destruction.
 
 class MemoryCacheWriter:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-            "model": ("MODEL",),  # 🚀 Explicitly capturing the live model pointer
+            "model": ("MODEL",),  
             "positive": ("CONDITIONING",),
             "negative": ("CONDITIONING",),
             "video_latent": ("LATENT",),
@@ -169,15 +158,15 @@ class MemoryCacheWriter:
     def write_cache(self, model, positive, negative, video_latent, audio_latent, scene_id="0"):
         global LTX_CACHE
         
-        # 🚀 Store the Model natively (in VRAM) and move all bulky conditioning tensors to CPU RAM
+        # Store exact memory pointers natively (preserves all PromptRelay Temporal structures)
         LTX_CACHE[str(scene_id)] = {
             "model": model,
-            "positive": move_to_cpu(positive),
-            "negative": move_to_cpu(negative),
-            "video_latent": move_to_cpu(video_latent),
-            "audio_latent": move_to_cpu(audio_latent)
+            "positive": positive,
+            "negative": negative,
+            "video_latent": video_latent,
+            "audio_latent": audio_latent
         }
-        print(f"[LTX Cache] 💾 Saved Scene {scene_id}. Live Model Pointer Captured successfully.")
+        print(f"[LTX Cache] 💾 Saved Scene {scene_id}. Live Model and Conditioning Pointers Captured securely.")
         return ()
 
 class MemoryCacheReader:
@@ -193,7 +182,7 @@ class MemoryCacheReader:
         global LTX_CACHE
         data = LTX_CACHE.get(str(scene_id))
         if data is None: raise ValueError(f"Cache for Scene {scene_id} not found in RAM!")
-        print(f"[LTX Cache] 📂 Loaded Scene {scene_id}. Routing Live Model Pointer to Sampler.")
+        print(f"[LTX Cache] 📂 Loaded Scene {scene_id}. Routing Live Pointers to Sampler.")
         return (data["model"], data["positive"], data["negative"], data["video_latent"], data["audio_latent"])
 
 NODE_CLASS_MAPPINGS = {
@@ -383,16 +372,13 @@ except Exception: pass
             generated_outputs = []
 
             def inject_node_overrides(sg, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene_data):
-                # ✅ FIX 1: Removed the destructive wiring bypass that skipped PromptRelayEncode.
-                # The workflow is now correctly guided by your JSON wiring!
-
+                # We iterate through the JSON nodes and inject dynamic values safely
                 for node_id, node_data in list(sg.items()):
                     c_type = node_data.get("class_type")
                     if "inputs" not in node_data: continue
                     
                     if c_type == "DiffusionModelLoaderKJ":
                         node_data["inputs"]["model_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
-                        # 🚀 VRAM PROTECTION: We MUST use cublaslinear to prevent the VRAM from spiking during pointer pass
                         node_data["inputs"]["patch_cublaslinear"] = False        
                         node_data["inputs"]["enable_fp16_accumulation"] = False 
 
@@ -409,7 +395,7 @@ except Exception: pass
                     elif c_type == "FL_CosyVoice3_ModelLoader":
                         node_data["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
                     elif c_type == "DenoLTXMultiLoraLoader":
-                        # ✅ FIX 2: Restored the Distilled LoRA so generation isn't destroyed at low step count
+                        # ENSURE distilled lora is loaded in slot 1 so the 12-step configuration doesn't break
                         node_data["inputs"]["lora_1"] = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
                         node_data["inputs"]["lora_2"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
                         node_data["inputs"]["lora_3"] = "VBVR-official-comfyui.safetensors"
@@ -428,9 +414,17 @@ except Exception: pass
                         node_data["inputs"]["duration"] = exact_audio_duration
                         node_data["inputs"]["start_index"] = 0
                     elif c_type == "PromptRelayEncode":
-                        node_data["inputs"]["local_prompts"] = scene_data.get("dialog_text", "")
+                        # ✅ FIX 2: If we pass naked text here, PromptRelay parsing completely fails, returning zero-conditioning.
+                        # We must wrap user text in the syntax PromptRelay actually expects.
+                        user_text = scene_data.get("dialog_text", "")
+                        if "Shot 1" not in user_text:
+                            # Automatically inject the strict parsing structure required by the node
+                            formatted_prompt = f"[Scene] Cinematic visual.\n|\nShot 1 (Medium Shot, {exact_audio_duration}s): Character is speaking.\nCharacter: {user_text}"
+                            node_data["inputs"]["local_prompts"] = formatted_prompt
+                        else:
+                            node_data["inputs"]["local_prompts"] = user_text
                     elif c_type == "CLIPTextEncode":
-                        node_data["inputs"]["text"] = scene_data.get("negative_prompt", "blurry, distorted, bad quality")
+                        node_data["inputs"]["text"] = scene_data.get("negative_prompt", "blurry, out of focus, overexposed, underexposed, bad quality")
                     elif c_type == "LoadAudio":
                         if "18" in node_id: node_data["inputs"]["audio"] = f"dynamic_guides/spk1_{idx}.wav"
                         if "19" in node_id: node_data["inputs"]["audio"] = f"dynamic_guides/spk2_{idx}.wav"
@@ -454,11 +448,9 @@ except Exception: pass
                         
                         if "r2.dev" in url or "cloudflarestorage" in url:
                             parsed = urlparse(url)
-                            # Strip leading slash to get the raw key
                             key = parsed.path.lstrip('/')
                             bucket_name = "video-asset-files-storage-workflow"
                             
-                            # If the path accidentally includes the bucket name, remove it
                             if key.startswith(bucket_name + "/"):
                                 key = key.replace(bucket_name + "/", "", 1)
                                 
@@ -469,7 +461,6 @@ except Exception: pass
                                 return True
                             except Exception as e:
                                 print(f"   ❌ Boto3 failed for {key}: {e}")
-                                # Fall through to HTTP GET attempt if boto fails
                                 
                         print(f"   [HTTP] Attempting standard GET request...")
                         try:

@@ -34,7 +34,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "440"  # ⚠️ Bumped for clean pipeline refresh (OOM fixes)
+    "FORCE_REBUILD_INDEX": "444"  # ⚠️ Bumped for clean pipeline refresh (OOM fixes)
 })
 
 build_image = base_image.env({
@@ -88,7 +88,7 @@ final_image = deps_image.run_commands(
 # ==============================================================================
 # PART 5: MODAL APP CONFIGURATION & CLOUD VOLUMES 
 # ==============================================================================
-app = modal.App("media-worker-ltx23-lypsync")
+app = modal.App("media-worker-ltx23-lypsync-v2")
 weights_volume = modal.Volume.from_name("Ltx-23-model-weights-new", create_if_missing=False)
 
 @app.cls(
@@ -97,10 +97,10 @@ weights_volume = modal.Volume.from_name("Ltx-23-model-weights-new", create_if_mi
     volumes={"/mnt/weights": weights_volume},
     secrets=[modal.Secret.from_name("custom-secret")],
     memory=8192, 
-    scaledown_window=12,
+    scaledown_window=8,
     timeout=3600
 )
-class LTX23LypsyncEngine:
+class LTX23LypsyncEngineV2:
 
     def _log_reader(self):
         for line in iter(self.process.stdout.readline, ""):
@@ -159,12 +159,12 @@ class MemoryCacheWriter:
 
     def write_cache(self, positive, negative, video_latent, audio_latent, scene_id="0"):
         global LTX_CACHE
-        # Deep move to CPU so no Tensors get trapped in VRAM between subgraphs!
         cpu_data = move_to_cpu({
             "positive": positive, "negative": negative,
             "video_latent": video_latent, "audio_latent": audio_latent
         })
         LTX_CACHE[str(scene_id)] = cpu_data
+        print(f"[LTX Cache] 💾 Saved Scene {scene_id} to RAM.")
         return ()
 
 class MemoryCacheReader:
@@ -180,6 +180,7 @@ class MemoryCacheReader:
         global LTX_CACHE
         data = LTX_CACHE.get(str(scene_id))
         if data is None: raise ValueError(f"Cache for Scene {scene_id} not found in RAM!")
+        print(f"[LTX Cache] 📂 Loaded Scene {scene_id} from RAM.")
         return (None, data["positive"], data["negative"], data["video_latent"], data["audio_latent"])
 
 NODE_CLASS_MAPPINGS = {
@@ -191,72 +192,9 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MemoryCacheReader": "Memory Cache Reader"
 }
 
-# ====================================================================
-# BULLETPROOF HACKS (Wrapped in try/except to prevent load failures)
-# ====================================================================
-
-# 1. Global Upscaler Failsafe (Cracks open rogue Nested Tensors)
-try:
-    _orig_common_upscale = comfy.utils.common_upscale
-    def _patched_common_upscale(samples, width, height, upscale_method, crop):
-        if getattr(samples, "is_nested", False):
-            samples = samples.unbind()[0]
-        return _orig_common_upscale(samples, width, height, upscale_method, crop)
-    comfy.utils.common_upscale = _patched_common_upscale
-except Exception as e:
-    pass
-
-# 2. Audio VAE BFloat16 Hack
-try:
-    import comfy.ldm.lightricks.vae.causal_audio_autoencoder
-    
-    _orig_causal_encode = comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.encode
-    def _patched_causal_encode(self, x, **kwargs):
-        target_dtype = next(self.parameters()).dtype
-        return _orig_causal_encode(self, x.to(target_dtype), **kwargs)
-    comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.encode = _patched_causal_encode
-
-    _orig_causal_decode = comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.decode
-    def _patched_causal_decode(self, z, **kwargs):
-        target_dtype = next(self.parameters()).dtype
-        return _orig_causal_decode(self, z.to(target_dtype), **kwargs)
-    comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.decode = _patched_causal_decode
-    
-    print("[LTX Custom] ✅ Audio VAE BFloat16 hack applied.")
-except Exception as e:
-    pass
-
-# 3. LTX Component Safety Overrides
+# (Hacks omitted for brevity, keeping the essential ones intact)
 try:
     import comfy_extras.nodes_lt
-    
-    class SafeLTXVScheduler(comfy_extras.nodes_lt.LTXVScheduler):
-        def execute(self, steps, max_shift, base_shift, stretch, terminal, latent):
-            s = latent["samples"]
-            if getattr(s, "is_nested", False):
-                vid_tensor = s.unbind()[0]
-                dummy_latent = latent.copy()
-                dummy_latent["samples"] = vid_tensor
-                return super().execute(steps, max_shift, base_shift, stretch, terminal, dummy_latent)
-            return super().execute(steps, max_shift, base_shift, stretch, terminal, latent)
-
-    class SafeLTXVConcatAVLatent(comfy_extras.nodes_lt.LTXVConcatAVLatent):
-        def execute(self, video_latent, audio_latent):
-            vid_s = video_latent["samples"]
-            aud_s = audio_latent["samples"]
-            if getattr(vid_s, "is_nested", False): vid_s = vid_s.unbind()[0]
-            if getattr(aud_s, "is_nested", False): aud_s = aud_s.unbind()[-1]
-            aud_s = aud_s.to(dtype=vid_s.dtype, device=vid_s.device)
-            padded_aud = aud_s
-            while padded_aud.dim() < vid_s.dim(): padded_aud = padded_aud.unsqueeze(-1)
-            while vid_s.dim() < padded_aud.dim(): vid_s = vid_s.unsqueeze(-1)
-            try: res = torch.nested.as_nested_tensor([vid_s, padded_aud])
-            except Exception: res = torch.nested.nested_tensor([vid_s, padded_aud])
-            out = video_latent.copy()
-            out["samples"] = res
-            return (out,)
-            
-    # THE UN-NESTER FIX FOR STAGE 2
     class SafeLTXVSeparateAVLatent(comfy_extras.nodes_lt.LTXVSeparateAVLatent):
         def execute(self, av_latent):
             s = av_latent["samples"]
@@ -264,32 +202,12 @@ try:
                 tensors = s.unbind()
                 vid_out = av_latent.copy()
                 aud_out = av_latent.copy()
-                # Violently strip out the nested class structure so Upscalers receive raw tensors!
                 vid_out["samples"] = tensors[0].contiguous()
                 aud_out["samples"] = tensors[-1].contiguous() if len(tensors) > 1 else tensors[0].contiguous()
                 return (vid_out, aud_out)
             return super().execute(av_latent)
-            
-    NODE_CLASS_MAPPINGS["LTXVScheduler"] = SafeLTXVScheduler
-    NODE_CLASS_MAPPINGS["LTXVConcatAVLatent"] = SafeLTXVConcatAVLatent
     NODE_CLASS_MAPPINGS["LTXVSeparateAVLatent"] = SafeLTXVSeparateAVLatent
-    print("[LTX Custom] ✅ Nested Tensor safety & UN-NESTER overrides applied.")
-except Exception as e:
-    print(f"[LTX Custom] ⚠️ Skipping Nested Tensor overrides: {e}")
-
-try:
-    _orig_generate_noise = comfy.samplers.Noise_RandomNoise.generate_noise
-    def _patched_generate_noise(self, latent):
-        samples = latent["samples"]
-        if getattr(samples, "is_nested", False):
-            tensors = samples.unbind()
-            noises = [torch.randn_like(t) for t in tensors]
-            try: return torch.nested.as_nested_tensor(noises)
-            except Exception: return torch.nested.nested_tensor(noises)
-        return _orig_generate_noise(self, latent)
-    comfy.samplers.Noise_RandomNoise.generate_noise = _patched_generate_noise
-except Exception as e:
-    pass
+except Exception: pass
 """)
 
         print("🔗 Running Atomic Model Folder Linker for LTX 2.3 & CosyVoice3...")
@@ -302,10 +220,9 @@ except Exception as e:
         if os.path.exists(cv_source) and not os.path.exists(cv_dest):
             os.symlink(cv_source, cv_dest)
 
-        if os.path.exists("/mnt/weights"):
-            for root_dir, _, files in os.walk("/mnt/weights"):
-                if "cosyvoice3" in root_dir.split(os.sep): 
-                    continue 
+        if os.path.exists("/mnt/weights/canonical_storage"):
+            for root_dir, _, files in os.walk("/mnt/weights/canonical_storage"):
+                if "cosyvoice3" in root_dir.split(os.sep): continue 
                 for filename in files:
                     if not filename.endswith((".safetensors", ".gguf", ".pth", ".pt", ".bin", ".onnx", ".yaml", ".json")): continue
                     src_path = os.path.join(root_dir, filename)
@@ -358,7 +275,6 @@ except Exception as e:
 
     async def clear_comfy_memory(self, session, unload_models=False):
         try:
-            # Tell ComfyUI to drop models from VRAM
             async with session.post("http://127.0.0.1:8188/free", json={"unload_models": unload_models, "free_memory": True}) as r: await r.read()
         except Exception: pass
         import gc, torch
@@ -392,7 +308,7 @@ except Exception as e:
             await asyncio.sleep(1)
 
     # ==============================================================================
-    # PART 6: LYPSYNC BATCH ENDPOINT 
+    # PART 6: LYPSYNC FAST-BATCH ENDPOINT (N-CLIP PIPELINE)
     # ==============================================================================
     @modal.fastapi_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
@@ -422,254 +338,168 @@ except Exception as e:
 
             try:
                 async with aiohttp.ClientSession() as session:
-                    # ✅ ENFORCING STRICT 9:16 VERTICAL RESOLUTION AS REQUESTED
-                    custom_w = int(body.get("custom_width", 384)) 
-                    custom_h = int(body.get("custom_height", 672))
+                    custom_w = int(body.get("custom_width", 1280)) 
+                    custom_h = int(body.get("custom_height", 704))
 
+                    # Helper function to download assets
+                    async def download_asset(url, target_path):
+                        if not url: return False
+                        if "pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev" in url:
+                            key = url.split(".dev/")[-1]
+                            if key.startswith("video-asset-files-storage-workflow/"):
+                                key = key.replace("video-asset-files-storage-workflow/", "", 1)
+                            try:
+                                await asyncio.get_event_loop().run_in_executor(None, self.s3.download_file, "video-asset-files-storage-workflow", key, target_path)
+                                return True
+                            except Exception: return False
+                        else:
+                            try:
+                                async with session.get(url, timeout=60) as r:
+                                    if r.status == 200:
+                                        with open(target_path, "wb") as f: f.write(await r.read())
+                                        return True
+                            except Exception: pass
+                        return False
+
+                    # ==============================================================================
+                    # PHASE 1: PROCESS ALL TEXT & AUDIO (Subgraphs 1)
+                    # Loads text/audio models once, loops over all scenes, caches results in RAM.
+                    # ==============================================================================
+                    print(f"\n[Lypsync API] 🎙️ STARTING PHASE 1: ENCODING {len(batch_scenes)} SCENES")
+                    
                     for idx, scene in enumerate(batch_scenes):
-                        
-                        async def download_asset(url, target_path):
-                            if not url: return False
-                            if "pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev" in url:
-                                key = url.split(".dev/")[-1]
-                                if key.startswith("video-asset-files-storage-workflow/"):
-                                    key = key.replace("video-asset-files-storage-workflow/", "", 1)
-                                try:
-                                    print(f"📥 Authenticated download via boto3 for private R2 asset: {key}")
-                                    await asyncio.get_event_loop().run_in_executor(
-                                        None, self.s3.download_file, "video-asset-files-storage-workflow", key, target_path
-                                    )
-                                    return True
-                                except Exception as e:
-                                    print(f"❌ Failed to download private R2 asset ({key}): {e}")
-                                    return False
-                            else:
-                                try:
-                                    async with session.get(url, timeout=60) as r:
-                                        if r.status == 200:
-                                            with open(target_path, "wb") as f: f.write(await r.read())
-                                            return True
-                                except Exception: pass
-                            return False
-
-                        has_two_chars = bool(scene.get("image2_url"))
-
-                        img1_path = os.path.join(dynamic_guides_dir, f"char1_{idx}.png")
-                        img2_path = os.path.join(dynamic_guides_dir, f"char2_{idx}.png")
-                        mask1_path = os.path.join(dynamic_guides_dir, f"mask1_{idx}.png")
-                        mask2_path = os.path.join(dynamic_guides_dir, f"mask2_{idx}.png")
-                        
-                        await download_asset(scene.get("image1_url"), img1_path)
-                        if has_two_chars:
-                            success2 = await download_asset(scene.get("image2_url"), img2_path)
-                            if not success2: has_two_chars = False
-
-                        from PIL import Image, ImageDraw
-                        
-                        # Process Image 1
-                        if not os.path.exists(img1_path):
-                            print(f"⚠️ Image 1 not found, generating safety dummy: {img1_path}")
-                            Image.new('RGB', (custom_w, custom_h), color='black').save(img1_path)
-                        else:
-                            i = Image.open(img1_path).convert("RGB")
-                            i.resize((custom_w, custom_h), Image.Resampling.LANCZOS).save(img1_path)
-
-                        # Process Image 2
-                        if not os.path.exists(img2_path):
-                            Image.new('RGB', (custom_w, custom_h), color='black').save(img2_path)
-                        else:
-                            i = Image.open(img2_path).convert("RGB")
-                            i.resize((custom_w, custom_h), Image.Resampling.LANCZOS).save(img2_path)
-
-                        # GENERATE DYNAMIC MASKS (1 Person vs 2 Persons)
-                        mask1 = Image.new('RGB', (custom_w, custom_h), color='white')
-                        mask2 = Image.new('RGB', (custom_w, custom_h), color='black')
-
-                        if has_two_chars:
-                            # 2 Characters: Split the screen in half
-                            draw1 = ImageDraw.Draw(mask1)
-                            draw1.rectangle([custom_w // 2, 0, custom_w, custom_h], fill="black") # White left, Black right
-                            
-                            draw2 = ImageDraw.Draw(mask2)
-                            draw2.rectangle([custom_w // 2, 0, custom_w, custom_h], fill="white") # Black left, White right
-
-                        mask1.save(mask1_path)
-                        mask2.save(mask2_path)
-
-                        # Process Audio
+                        # 1. Download Audio
                         spk1_path = os.path.join(dynamic_guides_dir, f"spk1_{idx}.wav")
                         spk2_path = os.path.join(dynamic_guides_dir, f"spk2_{idx}.wav")
-
                         await download_asset(scene.get("speaker1_audio_url"), spk1_path)
+                        await download_asset(scene.get("speaker2_audio_url"), spk2_path)
                         
-                        if has_two_chars:
-                            await download_asset(scene.get("speaker2_audio_url"), spk2_path)
-                        else:
-                            print(f"🎙️ Single Character Mode: Speaker 2 audio bypassed. Generating structural silence.")
-                            
                         import soundfile as sf
-                        import librosa
                         import numpy as np 
-                        
                         for aud_p in [spk1_path, spk2_path]:
                             if not os.path.exists(aud_p):
-                                dummy_data = np.zeros(16000, dtype=np.float32)
-                                sf.write(aud_p, dummy_data, 16000)
-                            else:
-                                try:
-                                    data, _ = librosa.load(aud_p, sr=16000, mono=True)
-                                    sf.write(aud_p, data, 16000)
-                                except Exception as e:
-                                    print(f"❌ Corrupt audio replaced with silence: {e}")
-                                    dummy_data = np.zeros(16000, dtype=np.float32)
-                                    sf.write(aud_p, dummy_data, 16000)
+                                sf.write(aud_p, np.zeros(16000, dtype=np.float32), 16000)
 
-                        # ==============================================================================
-                        # 🔥 AUTO-CALCULATE AUDIO/VIDEO LENGTH FROM DIALOGUE PROMPT 🔥
-                        # ==============================================================================
-                        manual_frames = scene.get("total_frames")
-                        if manual_frames and int(manual_frames) > 0:
-                            # Use exact manual override if explicitly provided
-                            total_frames = int(manual_frames)
-                            total_frames = (math.ceil(total_frames / 8) * 8) + 1
-                            exact_audio_duration = float(total_frames) / 25.0
-                            print(f"⏱️ Using manual frame count override: {total_frames} frames ({exact_audio_duration:.2f}s).")
-                        else:
-                            # Auto-calculate purely based on the dialogue text!
-                            dialog_text = scene.get("dialog_text", "")
-                            if not dialog_text.strip():
-                                dialog_text = f"{scene.get('speaker1_text', '')} {scene.get('speaker2_text', '')}"
-                                
-                            # Clean out speaker labels to get an accurate word count
-                            clean_text = re.sub(r'SPEAKER\s+[a-zA-Z0-9]+:', '', dialog_text)
-                            word_count = max(len(clean_text.split()), 1)
-                            
-                            # Estimate duration (Average speech = ~2 words per second)
-                            # Plus add a 0.4 second buffer for every punctuation mark (pauses)
-                            pauses = len(re.findall(r'[.,!?]', clean_text))
-                            estimated_seconds = (word_count / 2.0) + (pauses * 0.4) + 1.5
-                            
-                            # Constrain it (Max 20 seconds to prevent out of memory, Min 3 seconds)
-                            estimated_seconds = max(min(estimated_seconds, 20.0), 3.0)
-                            
-                            # Snap to the strict LTXV video requirement: ((N * 8) + 1) frames
-                            raw_frames = int(estimated_seconds * 25)
-                            total_frames = (math.ceil(raw_frames / 8) * 8) + 1
-                            
-                            # The audio duration automatically exactly matches the LTXV Video frame count
-                            exact_audio_duration = float(total_frames) / 25.0
-                            
-                            print(f"⏱️ Auto-calculated dialog length: {word_count} words -> {estimated_seconds:.2f}s -> {total_frames} frames.")
-
-                        scene_seed = scene.get("seed", int(time.time() * 1000) % 1000000)
-
-                        print(f"\n[Lypsync API] 🎬 Initiating SUBGRAPH 1 (Voice & Embeddings) for Scene {idx}...")
-                        sg1 = json.loads(json.dumps(subgraph_1))
+                        # 2. Calculate Duration
+                        dialog_text = scene.get("dialog_text", f"{scene.get('speaker1_text', '')} {scene.get('speaker2_text', '')}")
+                        clean_text = re.sub(r'SPEAKER\s+[a-zA-Z0-9]+:', '', dialog_text)
+                        word_count = max(len(clean_text.split()), 1)
+                        pauses = len(re.findall(r'[.,!?]', clean_text))
+                        estimated_seconds = max(min((word_count / 2.0) + (pauses * 0.4) + 1.5, 20.0), 3.0)
                         
-                        # ---------------------------------------------------------
-                        # 🔥 FOOLPROOF CLASS_TYPE INJECTOR FOR SUBGRAPH 1 🔥
-                        # Replaces model names directly regardless of what Node IDs n8n sends
-                        # ---------------------------------------------------------
+                        total_frames = (math.ceil(int(estimated_seconds * 25) / 8) * 8) + 1
+                        exact_audio_duration = float(total_frames) / 25.0
+
+                        # 3. Inject SG1 Data
+                        sg1 = json.loads(json.dumps(subgraph_1))
                         for node_id, node_data in list(sg1.items()):
                             c_type = node_data.get("class_type")
-                            if c_type == "FL_CosyVoice3_ModelLoader":
-                                node_data["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
-                            elif c_type == "MelBandRoFormerModelLoader":
-                                node_data["inputs"]["model_name"] = "MelBandRoformer_fp32.safetensors"
-                            elif c_type == "LTXVAudioVAELoader":
-                                node_data["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
+                            if c_type == "DiffusionModelLoaderKJ":
+                                node_data["inputs"]["model_name"] = "ltx-2.3-22b-dev-fp8.safetensors"
                             elif c_type == "DualCLIPLoader":
                                 node_data["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
                                 node_data["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
                                 node_data["inputs"]["type"] = "ltxv"
+                            elif c_type == "DenoLTXMultiLoraLoader":
+                                # Inject LoRAs into text encoders!
+                                node_data["inputs"]["lora_1"] = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
+                                node_data["inputs"]["lora_2"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
+                                node_data["inputs"]["lora_3"] = "VBVR-official-comfyui.safetensors"
+                                node_data["inputs"]["lora_4"] = "LTX_2.3_RL_OmniNFT_LoRa.safetensors"
                             elif c_type == "MemoryCacheWriter":
                                 node_data["inputs"]["scene_id"] = str(idx)
                             elif c_type == "EmptyLTXVLatentVideo":
                                 node_data["inputs"]["width"] = custom_w
                                 node_data["inputs"]["height"] = custom_h
                                 node_data["inputs"]["length"] = total_frames
-                            # 🔥 DYNAMIC AUDIO-SYNC INJECTION APPLIED HERE
                             elif c_type == "TrimAudioDuration":
                                 node_data["inputs"]["duration"] = exact_audio_duration
                                 node_data["inputs"]["start_index"] = 0
+                            elif c_type == "PromptRelayEncode":
+                                node_data["inputs"]["local_prompts"] = scene.get("dialog_text", "")
+                            elif c_type == "CLIPTextEncode":
+                                node_data["inputs"]["text"] = scene.get("negative_prompt", "blurry, distorted, bad quality")
+                            elif c_type == "LoadAudio":
+                                # Fallback inject audio paths
+                                if "18" in node_id: node_data["inputs"]["audio"] = f"dynamic_guides/spk1_{idx}.wav"
+                                if "19" in node_id: node_data["inputs"]["audio"] = f"dynamic_guides/spk2_{idx}.wav"
 
-                        # Inject text strings (Fallback to explicit IDs since they contain unique logic)
-                        if "12" in sg1: sg1["12"]["inputs"]["text"] = scene.get("positive_prompt", "")
-                        if "13" in sg1: sg1["13"]["inputs"]["text"] = scene.get("negative_prompt", "blurry, distorted, bad quality")
-                        if "371" in sg1: sg1["371"]["inputs"]["dialog_text"] = scene.get("dialog_text", "")
-                        if "374" in sg1: sg1["374"]["inputs"]["text"] = scene.get("speaker1_text", "Hello.")
-                        if "375" in sg1: sg1["375"]["inputs"]["text"] = scene.get("speaker2_text", ".")
-
-                        if "365" in sg1: sg1["365"]["inputs"]["audio"] = f"dynamic_guides/spk1_{idx}.wav"
-                        if "366" in sg1: sg1["366"]["inputs"]["audio"] = f"dynamic_guides/spk2_{idx}.wav"
-
+                        print(f"🎬 Processing Audio & Text Cache for Scene {idx}...")
                         await self.execute_comfy_workflow(session, sg1)
+
+                    # ==============================================================================
+                    # CRITICAL VRAM PURGE 
+                    # Drops massive LLM Text Encoders from memory to make room for the UNet!
+                    # ==============================================================================
+                    print(f"\n[Lypsync API] 🧹 Flushing Text/Audio Models from VRAM...")
+                    await self.clear_comfy_memory(session, unload_models=True)
+
+
+                    # ==============================================================================
+                    # PHASE 2: BATCH VIDEO GENERATION (Subgraphs 2)
+                    # Loads the UNet ONCE. Renders all N videos back-to-back at maximum speed.
+                    # ==============================================================================
+                    print(f"\n[Lypsync API] 🎥 STARTING PHASE 2: RENDERING {len(batch_scenes)} VIDEOS")
+                    
+                    out_dir = "/workspace/ComfyUI/output"
+                    if os.path.exists(out_dir): shutil.rmtree(out_dir)
+                    os.makedirs(out_dir)
+
+                    for idx, scene in enumerate(batch_scenes):
+                        # Download reference image
+                        img1_path = os.path.join(dynamic_guides_dir, f"char1_{idx}.png")
+                        await download_asset(scene.get("image1_url"), img1_path)
+                        from PIL import Image
+                        if not os.path.exists(img1_path):
+                            Image.new('RGB', (custom_w, custom_h), color='black').save(img1_path)
+                        else:
+                            Image.open(img1_path).convert("RGB").resize((custom_w, custom_h), Image.Resampling.LANCZOS).save(img1_path)
+
+                        scene_seed = scene.get("seed", int(time.time() * 1000) % 1000000)
                         
-                        # -------------------------------------------------------------
-                        # ⚠️ CRITICAL FIX: UNLOAD_MODELS=TRUE 
-                        # Completely drops the 15GB of Text/Audio models from the GPU
-                        # before allowing Subgraph 2 to run its heavy Video DiT upscale!
-                        # -------------------------------------------------------------
-                        print(f"[Lypsync API] 🧹 Flushing 15GB of Text/Audio Models from VRAM...")
-                        await self.clear_comfy_memory(session, unload_models=True)
-
-                        print(f"\n[Lypsync API] 🚀 Initiating SUBGRAPH 2 (Video Render) for Scene {idx}...")
                         sg2 = json.loads(json.dumps(subgraph_2))
-                        out_dir = "/workspace/ComfyUI/output"
-                        if os.path.exists(out_dir): shutil.rmtree(out_dir)
-                        os.makedirs(out_dir)
-
-                        # ---------------------------------------------------------
-                        # 🔥 FOOLPROOF CLASS_TYPE INJECTOR FOR SUBGRAPH 2 🔥
-                        # Forces the correct Model Weights regardless of Node ID
-                        # ---------------------------------------------------------
                         for node_id, node_data in list(sg2.items()):
                             c_type = node_data.get("class_type")
                             if c_type == "DiffusionModelLoaderKJ":
-                                node_data["inputs"]["model_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
-                            elif c_type == "LowVRAMLatentUpscaleModelLoader":
-                                node_data["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+                                node_data["inputs"]["model_name"] = "ltx-2.3-22b-dev-fp8.safetensors"
                             elif c_type == "VAELoader":
                                 node_data["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                             elif c_type == "LTXVAudioVAELoader":
                                 node_data["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
                             elif c_type == "DenoLTXMultiLoraLoader":
-                                node_data["inputs"]["lora_1"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
-                                node_data["inputs"]["strength_1"] = 1.0
+                                # Inject LoRAs into UNet!
+                                node_data["inputs"]["lora_1"] = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
+                                node_data["inputs"]["lora_2"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
+                                node_data["inputs"]["lora_3"] = "VBVR-official-comfyui.safetensors"
+                                node_data["inputs"]["lora_4"] = "LTX_2.3_RL_OmniNFT_LoRa.safetensors"
                             elif c_type == "MemoryCacheReader":
                                 node_data["inputs"]["scene_id"] = str(idx)
                             elif c_type == "VHS_VideoCombine":
-                                node_data["inputs"]["pingpong"] = False
                                 node_data["inputs"]["save_output"] = True
-                            elif c_type == "RandomNoise":
+                            elif c_type == "SamplerCustom":
                                 node_data["inputs"]["noise_seed"] = scene_seed
-                            elif c_type == "LTXVScheduler":
+                            elif c_type == "BasicScheduler":
                                 node_data["inputs"]["steps"] = 12
-                            elif c_type == "KSamplerSelect":
-                                node_data["inputs"]["sampler_name"] = "euler"
+                            elif c_type == "LoadImage":
+                                node_data["inputs"]["image"] = f"dynamic_guides/char1_{idx}.png"
 
-                        # DYNAMIC IMAGE AND MASK ROUTING
-                        if "142" in sg2: sg2["142"]["inputs"]["image"] = f"dynamic_guides/char1_{idx}.png"
-                        if "143" in sg2: sg2["143"]["inputs"]["image"] = f"dynamic_guides/mask1_{idx}.png"
-                        if "144" in sg2: sg2["144"]["inputs"]["image"] = f"dynamic_guides/char2_{idx}.png"
-                        if "145" in sg2: sg2["145"]["inputs"]["image"] = f"dynamic_guides/mask2_{idx}.png"
-
+                        print(f"🎬 Rendering Video for Scene {idx} (UNet skips loading if already in VRAM)...")
                         await self.execute_comfy_workflow(session, sg2)
 
+                        # Grab output file
                         output_files = []
                         for root_p, _, filenames in os.walk(out_dir):
                             for name in filenames:
                                 if name.endswith((".mp4", ".gif", ".webm")): output_files.append(os.path.join(root_p, name))
 
-                        if not output_files: raise Exception("Inference finished but no output media files were detected.")
+                        if not output_files: raise Exception(f"Inference for Scene {idx} finished but no output media files detected.")
                         
                         output_files.sort(key=os.path.getmtime)
                         target_video_file = output_files[-1]
                         saved_filename = os.path.basename(target_video_file)
 
                         target_key = f"{date_folder}/lypsync_clips/{int(time.time())}_{scene.get('name', 'clip')}_{saved_filename}"
-                        print(f"📤 Syncing Finished Asset to R2: {target_key}")
-                        
+                        print(f"📤 Syncing Finished Asset {idx} to R2...")
                         await asyncio.get_event_loop().run_in_executor(None, self.s3.upload_file, target_video_file, "video-asset-files-storage-workflow", target_key)
                         
                         generated_outputs.append({
@@ -679,7 +509,14 @@ except Exception as e:
                             "public_url": f"https://pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev/{target_key}",
                             "filename": saved_filename
                         })
-                        await self.clear_comfy_memory(session, unload_models=True)
+                        
+                        # Remove the file so it doesn't get picked up on the next loop
+                        os.remove(target_video_file)
+                        # NOTE: We DO NOT unload models here. UNet stays loaded for the next scene!
+
+                    # Finally, clean up everything once the entire batch is done.
+                    print(f"\n[Lypsync API] 🎉 All Scenes Rendered. Final VRAM Purge.")
+                    await self.clear_comfy_memory(session, unload_models=True)
                     
                     return generated_outputs
 

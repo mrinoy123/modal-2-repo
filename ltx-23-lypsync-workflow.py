@@ -394,7 +394,7 @@ except Exception: pass
                     if c_type == "DiffusionModelLoaderKJ":
                         node_data["inputs"]["model_name"] = "ltx-2.3-22b-dev-fp8.safetensors"
                         # 🚀 VRAM PROTECTION: We MUST use cublaslinear to prevent the VRAM from spiking during pointer pass
-                        node_data["inputs"]["patch_cublaslinear"] = True        
+                        node_data["inputs"]["patch_cublaslinear"] = False        
                         node_data["inputs"]["enable_fp16_accumulation"] = False 
 
                     elif c_type == "DualCLIPLoader":

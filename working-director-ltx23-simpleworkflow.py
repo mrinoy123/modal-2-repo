@@ -29,7 +29,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "416"  # Bumped to force Modal rebuild with 16kHz Phoneme Fix
+    "FORCE_REBUILD_INDEX": "505"  # Bumped to force clean rebuild for transition LoRA addition
 })
 
 build_image = base_image.env({
@@ -42,7 +42,7 @@ build_image = base_image.env({
     "CXX": "g++"
 }).run_commands(
     "python3.12 -m pip install --no-cache-dir fastapi aiohttp boto3 triton>=3.1.0 ninja setuptools>=70.0.0 wheel pip>=24.0 Pillow",
-    "python3.12 -m pip install --no-cache-dir pandas numexpr pytz python-dateutil scipy matplotlib colorama torchvision librosa soundfile decord imageio scikit-image numba einops bitsandbytes"
+    "python3.12 -m pip install --no-cache-dir pandas numexpr pytz python-dateutil scipy matplotlib colorama torchvision decord imageio scikit-image numba einops bitsandbytes"
 )
 
 # ==============================================================================
@@ -153,7 +153,6 @@ class MemoryCacheWriter:
             "positive": ("CONDITIONING",),
             "negative": ("CONDITIONING",),
             "video_latent": ("LATENT",),
-            "audio_latent": ("LATENT",),
             "guide_data": ("GUIDE_DATA",),
             "frame_rate": ("FLOAT", {"default": 25.0, "forceInput": True}),
             "scene_id": ("STRING", {"default": "0"})
@@ -163,22 +162,22 @@ class MemoryCacheWriter:
     FUNCTION = "write_cache"
     CATEGORY = "LTXBatch"
 
-    def write_cache(self, model, positive, negative, video_latent, audio_latent, guide_data, frame_rate, scene_id):
+    def write_cache(self, model, positive, negative, video_latent, guide_data, frame_rate, scene_id):
         global LTX_CACHE
         LTX_CACHE[str(scene_id)] = {
             "model": model, "positive": positive, "negative": negative,
-            "video_latent": video_latent, "audio_latent": audio_latent,
+            "video_latent": video_latent,
             "guide_data": guide_data, "frame_rate": frame_rate
         }
-        print(f"\\n[Two-Pass System] 💾 Saved POS & NEG Conditionings + Audio Latent for Scene {scene_id} into RAM\\n")
+        print(f"\\n[Two-Pass System] 💾 Saved POS & NEG Conditionings + Video Latent for Scene {scene_id} into RAM\\n")
         return ()
 
 class MemoryCacheReader:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {"scene_id": ("STRING", {"default": "0"})}}
-    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "LATENT", "GUIDE_DATA", "FLOAT")
-    RETURN_NAMES = ("model", "positive", "negative", "video_latent", "audio_latent", "guide_data", "frame_rate")
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "GUIDE_DATA", "FLOAT")
+    RETURN_NAMES = ("model", "positive", "negative", "video_latent", "guide_data", "frame_rate")
     FUNCTION = "read_cache"
     CATEGORY = "LTXBatch"
 
@@ -187,7 +186,7 @@ class MemoryCacheReader:
         data = LTX_CACHE.get(str(scene_id))
         if data is None:
             raise ValueError(f"Cache for Scene {scene_id} not found in RAM! Text Encoder Pass failed.")
-        return (data["model"], data["positive"], data["negative"], data["video_latent"], data["audio_latent"], data["guide_data"], data["frame_rate"])
+        return (data["model"], data["positive"], data["negative"], data["video_latent"], data["guide_data"], data["frame_rate"])
 
 class FastVAEDecode(nodes.VAEDecode):
     def decode(self, vae, samples):
@@ -293,7 +292,7 @@ NODE_CLASS_MAPPINGS = {
             await asyncio.sleep(1)
 
     # ==============================================================================
-    # PART 6: TWO-PASS HIGH-SPEED BATCH ENDPOINT
+    # PART 6: TWO-PASS HIGH-SPEED BATCH ENDPOINT (AUDIO STRIPPED)
     # ==============================================================================
     @modal.fastapi_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
@@ -354,91 +353,29 @@ NODE_CLASS_MAPPINGS = {
                                 b64_img = base64.b64encode(f.read()).decode("utf-8")
                                 segments.append({"frame": frame, "image": f"data:image/png;base64,{b64_img}"})
 
-                        # --- PHONEME AUDIO LOGIC FIX (Solves Inaccurate Lip Syncing) ---
-                        audio_url = scene.get("audio_url", "")
-                        has_audio = False
-                        audio_path = None
-                        if audio_url:
-                            audio_ext = "wav"
-                            audio_path = os.path.join(dynamic_guides_dir, f"audio_{idx}.{audio_ext}")
-                            try:
-                                async with session.get(audio_url, timeout=120) as r:
-                                    if r.status == 200:
-                                        with open(audio_path, "wb") as f: f.write(await r.read())
-                                        has_audio = True
-                            except Exception as e: print(f"Audio download failed: {e}")
-
+                        # --- ANIMATION FRAMES & PROMPT CALCULATION (AUDIO LOGIC REMOVED) ---
                         actions = scene.get("kinetic_actions", ["The subject moves dynamically across the cinematic scene."])
-                        total_frames = 33 
                         
-                        if has_audio and os.path.exists(audio_path):
-                            import librosa
-                            import soundfile as sf
-                            import numpy as np
-                            try:
-                                # 🛡️ CRITICAL FIX: LTX Audio VAE *REQUIRES* exactly 16kHz Mono sample rate.
-                                # If TTS gives 44.1kHz and it isn't downsampled, phonemes distort heavily.
-                                data, samplerate = librosa.load(audio_path, sr=16000, mono=True)
-                                data = data.reshape(-1, 1) # Ensure 2D for stacking
-                                
-                                duration = len(data) / 16000.0
-                                raw_frames = duration * 25
-                                
-                                # Lock frames to exact LTX mathematical requirement
-                                total_frames = int(math.ceil((raw_frames - 1) / 8) * 8 + 1)
-                                total_frames = max(33, min(total_frames, 257))
-                                
-                                # PERFECT SYNC FIX: Physically Pad/Trim the Audio File to exactly match Frame duration
-                                target_duration = total_frames / 25.0
-                                target_samples = int(target_duration * 16000)
-                                
-                                if len(data) < target_samples:
-                                    padding_samples = target_samples - len(data)
-                                    silence = np.zeros((padding_samples, 1), dtype=data.dtype)
-                                    data = np.vstack((data, silence))
-                                elif len(data) > target_samples:
-                                    data = data[:target_samples]
-                                    
-                                # Save out strictly formatted 16kHz Audio
-                                sf.write(audio_path, data, 16000)
-                                print(f"🎤 [Audio Sync] Resampled to 16kHz & Padded exactly {duration:.3f}s to {target_duration:.3f}s")
-
-                            except Exception as e:
-                                print(f"Audio processing failed: {e}")
-                                total_words = sum(len(str(a).split()) for a in actions)
-                                seconds = max(total_words / (130 / 60.0), 2.5)  
-                                raw_frames = seconds * 25
-                                total_frames = int(math.ceil((raw_frames - 1) / 8) * 8 + 1)
-                                total_frames = max(33, min(total_frames, 257))
-                        else:
-                            total_words = sum(len(str(a).split()) for a in actions)
-                            seconds = max(total_words / (130 / 60.0), 2.5)  
-                            raw_frames = seconds * 25
-                            total_frames = int(math.ceil((raw_frames - 1) / 8) * 8 + 1)
-                            total_frames = max(33, min(total_frames, 257))
+                        # Calculate smooth duration lengths
+                        total_words = sum(len(str(a).split()) for a in actions)
+                        seconds = max(total_words / (130 / 60.0), 2.5)  
+                        raw_frames = seconds * 25
+                        total_frames = int(math.ceil((raw_frames - 1) / 8) * 8 + 1)
+                        total_frames = max(33, min(total_frames, 257))
 
                         timeline_data = {"segments": segments, "audioSegments": []}
-                        if has_audio:
-                            timeline_data["audioSegments"].append({"audio": audio_path, "start": 0})
                         
                         scene["_timeline_data_str"] = json.dumps(timeline_data)
-                        scene["_has_audio"] = has_audio
 
                         num_actions = len(actions)
                         keyframe_steps = [int(i * (total_frames - 1) / max(1, num_actions - 1)) for i in range(max(1, num_actions))]
 
                         static_env = f"{scene.get('subject', '')} {scene.get('style', '')} {scene.get('background', '')} {scene.get('lighting', '')}".strip()
-                        speech_transcript = scene.get("speech_transcript", "")
-                        audio_prompt = scene.get("audio_prompt", "") 
                         
                         local_prompts_list = []
                         for step_frame, action_text in zip(keyframe_steps, actions):
                             action_cam = f"{action_text} {scene.get('camera', '')}".strip()
                             fused_prompt = f"{action_cam}. Cinematic environment and styling: {static_env}"
-                            
-                            if audio_prompt: fused_prompt = f"{fused_prompt}. Sound/Audio FX: {audio_prompt}"
-                            if has_audio: fused_prompt = f"OHWXPERSON, {fused_prompt}. The person is talking, and says: \"{speech_transcript}\""
-                                
                             local_prompts_list.append(f"{step_frame}: {fused_prompt}")
                             
                         scene["_local_prompts_str"] = "\n".join(local_prompts_list)
@@ -456,7 +393,10 @@ NODE_CLASS_MAPPINGS = {
                         pass1_workflow["98"]["inputs"]["weight_dtype"] = "fp8_e4m3fn" 
                         
                     if "97" in pass1_workflow: pass1_workflow["97"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
-                    if "102" in pass1_workflow: pass1_workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
+                    
+                    # Remove Audio VAE node entirely if the JSON accidentally left it in
+                    if "102" in pass1_workflow: del pass1_workflow["102"]
+                    
                     if "101" in pass1_workflow: 
                         pass1_workflow["101"]["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
                         pass1_workflow["101"]["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
@@ -479,16 +419,15 @@ NODE_CLASS_MAPPINGS = {
 
                     for idx, scene in enumerate(batch_scenes):
                         scene_107 = json.loads(json.dumps(tpl_107))
+                        
+                        # 🛡️ HARDCODED LORA STACK: Transition LoRA added globally with 0.85 strength
                         lora_stack = [
                             ("LTX_2.3_Crisp_Enhance_Style_LoRa.safetensors", 0.5),
                             ("LTX_2.3_Soft_Enhance_Style_LoRa.safetensors", 0.5),
                             ("VBVR-official-comfyui.safetensors", 0.7),
-                            ("LTX-2.3_Cinematic_hardcut.safetensors", 0.6)
+                            ("LTX-2.3_Cinematic_hardcut.safetensors", 0.6),
+                            ("ltx2.3_transition.safetensors", 0.85)  # <--- Transition LoRA injected here
                         ]
-                        
-                        if scene["_has_audio"]:
-                            lora_stack.append(("LTX_2.3_22b_AV_LoRA_talking_head.safetensors", 1.0))
-                            lora_stack.append(("LTX_2.3_RL_OmniNFT_LoRa.safetensors", 0.8))
                             
                         cam_string = scene.get("camera", "")
                         if cam_string:
@@ -523,6 +462,11 @@ NODE_CLASS_MAPPINGS = {
                         scene_46["inputs"]["custom_width"] = custom_w
                         scene_46["inputs"]["custom_height"] = custom_h
                         scene_46["inputs"]["frame_rate"] = 25 
+                        
+                        # Strip audio vae mapping if it exists in the original json
+                        if "audio_vae" in scene_46["inputs"]:
+                            del scene_46["inputs"]["audio_vae"]
+                            
                         pass1_workflow[f"46_{idx}"] = scene_46
 
                         scene_94_5 = json.loads(json.dumps(tpl_94_5))
@@ -536,10 +480,13 @@ NODE_CLASS_MAPPINGS = {
                         scene_300["inputs"]["positive"] = [f"94:5_{idx}", 0]
                         scene_300["inputs"]["negative"] = [f"94:5_{idx}", 1] 
                         scene_300["inputs"]["video_latent"] = [f"46_{idx}", 2]
-                        scene_300["inputs"]["audio_latent"] = [f"46_{idx}", 3] 
                         scene_300["inputs"]["guide_data"] = [f"46_{idx}", 4]
                         scene_300["inputs"]["frame_rate"] = [f"46_{idx}", 5]
                         scene_300["inputs"]["scene_id"] = str(idx)
+                        
+                        # Defensively remove audio_latent in case n8n pipeline sends it
+                        if "audio_latent" in scene_300["inputs"]: del scene_300["inputs"]["audio_latent"]
+
                         pass1_workflow[f"300_{idx}"] = scene_300
 
                     print(f"🚀 Queuing Math Encoding Pass for {len(batch_scenes)} Scenes simultaneously...")
@@ -559,8 +506,10 @@ NODE_CLASS_MAPPINGS = {
                         os.makedirs(out_dir)
 
                         if "103" in pass2_workflow: pass2_workflow["103"]["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
-                        if "102" in pass2_workflow: pass2_workflow["102"]["inputs"]["vae_name"] = "LTX23_audio_vae_bf16.safetensors"
                         if "94:105" in pass2_workflow: pass2_workflow["94:105"]["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+
+                        # Strip Audio nodes from Subgraph 2 completely 
+                        if "102" in pass2_workflow: del pass2_workflow["102"]
 
                         if "400" in pass2_workflow: pass2_workflow["400"]["inputs"]["scene_id"] = str(idx)
 
@@ -582,15 +531,10 @@ NODE_CLASS_MAPPINGS = {
                         if "109" in pass2_workflow:
                             pass2_workflow["109"]["inputs"]["frame_rate"] = 25
                             if "pingpong" in pass2_workflow["109"]["inputs"]: pass2_workflow["109"]["inputs"]["pingpong"] = False
-
-                        if scene["_has_audio"]:
-                            load_audio_id = f"9998_load_audio_{idx}"
-                            pass2_workflow[load_audio_id] = {
-                                "class_type": "LoadAudio",
-                                "inputs": { "audio": f"dynamic_guides/audio_{idx}.wav" }
-                            }
-                            if "109" in pass2_workflow:
-                                pass2_workflow["109"]["inputs"]["audio"] = [load_audio_id, 0]
+                            
+                            # Strip out audio from VHS combine
+                            if "audio" in pass2_workflow["109"]["inputs"]:
+                                del pass2_workflow["109"]["inputs"]["audio"]
 
                         if "109" in pass2_workflow and "images" in pass2_workflow["109"]["inputs"]:
                             original_image_source = pass2_workflow["109"]["inputs"]["images"]

@@ -444,8 +444,8 @@ except Exception: pass
 
             try:
                 async with aiohttp.ClientSession() as session:
-                    custom_w = int(body.get("custom_width", 1280)) 
-                    custom_h = int(body.get("custom_height", 704))
+                    custom_w = int(body.get("custom_width", 704)) 
+                    custom_h = int(body.get("custom_height", 1248))
 
                     # 🌟 ROBUST DOWNLOAD ASSET FUNCTION (Extracts Boto3 Key even for Private Buckets)
                     async def download_asset(url, target_path):

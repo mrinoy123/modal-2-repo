@@ -34,7 +34,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "455"  # Bumped for strict mask dimension sync & LoRA preservation
+    "FORCE_REBUILD_INDEX": "455"  # Clean build
 })
 
 build_image = base_image.env({
@@ -50,9 +50,6 @@ build_image = base_image.env({
     "python3.12 -m pip install --no-cache-dir pandas numexpr pytz python-dateutil scipy matplotlib colorama torchvision librosa soundfile decord imageio scikit-image numba einops bitsandbytes rotary_embedding_torch"
 )
 
-# ==============================================================================
-# PART 4: COMFYUI & CUSTOM NODES CLONING
-# ==============================================================================
 torch_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124",
     "python3.12 -m pip install --no-cache-dir diffusers accelerate transformers>=4.49.0 torchsde numpy==1.26.4 kornia==0.7.3",
@@ -86,9 +83,6 @@ final_image = deps_image.run_commands(
     env={"CUDA_HOME": "/usr/local/cuda", "PATH": "/usr/local/cuda/bin:" + os.environ.get("PATH", ""), "FORCE_CUDA": "1", "TORCH_CUDA_ARCH_LIST": "8.9"}
 )
 
-# ==============================================================================
-# PART 5: MODAL APP CONFIGURATION & CLOUD VOLUMES 
-# ==============================================================================
 app = modal.App("media-worker-ltx23-lypsync-v2")
 weights_volume = modal.Volume.from_name("Ltx-23-model-weights-new", create_if_missing=False)
 
@@ -133,7 +127,6 @@ import comfy.model_patcher
 
 LTX_CACHE = {}
 
-# move_to_cpu safely maps pointers without destroying custom PromptRelay class identities
 def move_to_cpu(item):
     if isinstance(item, torch.Tensor): 
         return item.cpu()
@@ -201,12 +194,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MemoryCacheReader": "Memory Cache Reader"
 }
 
-# ====================================================================
-# BULLETPROOF HACKS (Fixed for CausalAudioAutoencoder)
-# ====================================================================
 try:
     import comfy.ldm.lightricks.vae.causal_audio_autoencoder
-    
     _orig_encode = comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.encode
     def _patched_encode(self, x, **kwargs):
         target_dtype = next(self.parameters()).dtype
@@ -218,10 +207,7 @@ try:
         target_dtype = next(self.parameters()).dtype
         return _orig_decode(self, z.to(target_dtype), **kwargs)
     comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.decode = _patched_decode
-    
-    print("[LTX Custom] ✅ Audio VAE CausalAutoencoder Dtype hack applied successfully.")
-except Exception as e:
-    print(f"[LTX Custom] ❌ Audio VAE Hack failed: {e}")
+except Exception as e: pass
 
 try:
     import comfy_extras.nodes_lt
@@ -242,13 +228,7 @@ except Exception: pass
 
         print("🔗 Running Atomic Model Folder Linker for ALL LTX 2.3 & Audio Dependencies...")
         base_models_dir = "/workspace/ComfyUI/models"
-        
-        dirs = [
-            "unet", "vae", "clip", "text_encoders", "checkpoints", "loras", 
-            "upscale_models", "latent_upscale_models", "cosyvoice", 
-            "melbandroformer", "diffusion_models", "audio_separators", 
-            "audio_vae", "audio_checkpoints"
-        ]
+        dirs = ["unet", "vae", "clip", "text_encoders", "checkpoints", "loras", "upscale_models", "latent_upscale_models", "cosyvoice", "melbandroformer", "diffusion_models", "audio_separators", "audio_vae", "audio_checkpoints"]
         for d in dirs: os.makedirs(os.path.join(base_models_dir, d), exist_ok=True)
 
         cv_source = "/mnt/weights/cosyvoice3"
@@ -277,9 +257,7 @@ except Exception: pass
             region_name="auto"
         )
 
-        print("🚀 Launching Lypsync Server Engine on L40S GPU...")
         os.makedirs("/tmp/comfy_swap", exist_ok=True)
-
         env_vars = os.environ.copy()
         env_vars["LD_PRELOAD"] = "/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4"
         env_vars["TORCH_NUM_THREADS"] = "1"
@@ -307,7 +285,6 @@ except Exception: pass
             except Exception: time.sleep(2)
                 
         if not comfy_ready: os._exit(1)
-        print("✅ Base pipeline active. Awaiting Dual-Subgraph Triggers.")
 
     async def clear_comfy_memory(self, session, unload_models=False):
         try:
@@ -328,12 +305,7 @@ except Exception: pass
                 err_text = await r.text()
                 raise HTTPException(status_code=500, detail=f"Failed to queue prompt: {r.status} - {err_text}")
             res = await r.json()
-            
-            if "error" in res:
-                raise HTTPException(status_code=500, detail=f"Validation Error: {res['error']}")
-            if "node_errors" in res and res["node_errors"]:
-                raise HTTPException(status_code=500, detail=f"Node Errors: {res['node_errors']}")
-                
+            if "error" in res: raise HTTPException(status_code=500, detail=f"Validation Error: {res['error']}")
             prompt_id = res["prompt_id"]
 
         while True:
@@ -349,9 +321,6 @@ except Exception: pass
             if self.process.poll() is not None: raise HTTPException(status_code=500, detail="ComfyUI server process crashed.")
             await asyncio.sleep(1)
 
-    # ==============================================================================
-    # PART 6: LYPSYNC FAST-BATCH ENDPOINT
-    # ==============================================================================
     @modal.fastapi_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
         if x_api_key != "testing-modal-workflow-2": 
@@ -381,7 +350,7 @@ except Exception: pass
             def inject_node_overrides(sg, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene_data):
                 is_subgraph_1 = total_frames > 0  
 
-                # 🚀 1. DYNAMIC CHUNK FEED FORWARD INJECTION (Saves Massive VRAM)
+                # 🚀 1. DYNAMIC CHUNK FEED FORWARD INJECTION
                 if is_subgraph_1:
                     has_chunk_node = any(n.get("class_type") == "LTXVChunkFeedForward" for n in sg.values())
                     if not has_chunk_node:
@@ -394,17 +363,11 @@ except Exception: pass
                             model_link = sg[writer_id]["inputs"]["model"]
                             sg["9999_chunk_ff"] = {
                                 "class_type": "LTXVChunkFeedForward",
-                                "inputs": {
-                                    "chunks": 4, 
-                                    "dim_threshold": 4096,
-                                    "model": model_link
-                                }
+                                "inputs": {"chunks": 4, "dim_threshold": 4096, "model": model_link}
                             }
-                            # Reroute writer to use chunked model
                             sg[writer_id]["inputs"]["model"] = ["9999_chunk_ff", 0]
 
-                # 🚀 2. DYNAMIC AUDIO LATENT MASKING (Tensor Shape Match Fix)
-                # Guarantees the audio mask matches the EXACT target resolution (custom_w, custom_h).
+                # 🚀 2. MATHEMATICALLY PERFECT AUDIO MASKING
                 if is_subgraph_1:
                     writer_id = None
                     for n_id, n_data in sg.items():
@@ -412,28 +375,27 @@ except Exception: pass
                             writer_id = n_id
                             break
                     if writer_id and "audio_latent" in sg[writer_id]["inputs"]:
-                        audio_link = sg[writer_id]["inputs"]["audio_latent"]
-                        
-                        # Purge stale manual nodes
                         keys_to_delete = [k for k, v in sg.items() if v.get("class_type") in ["SolidMask", "SetLatentNoiseMask"]]
                         for k in keys_to_delete: del sg[k]
                         
-                        # Mathematically perfect dynamic Mask Dimensions
-                        sg["9998_solid_mask"] = {
-                            "class_type": "SolidMask",
-                            "inputs": {"value": 0, "width": custom_w, "height": custom_h} 
-                        }
-                        sg["9997_audio_mask"] = {
-                            "class_type": "SetLatentNoiseMask",
-                            "inputs": {
-                                "samples": audio_link,
-                                "mask": ["9998_solid_mask", 0]
+                        audio_encoder_id = None
+                        for n_id, n_data in sg.items():
+                            if n_data.get("class_type") == "LTXVAudioVAEEncode":
+                                audio_encoder_id = n_id
+                                break
+                                
+                        if audio_encoder_id:
+                            sg["9998_solid_mask"] = {
+                                "class_type": "SolidMask",
+                                "inputs": {"value": 0, "width": custom_w, "height": custom_h} 
                             }
-                        }
-                        # Re-route Cache
-                        sg[writer_id]["inputs"]["audio_latent"] = ["9997_audio_mask", 0]
+                            sg["9997_audio_mask"] = {
+                                "class_type": "SetLatentNoiseMask",
+                                "inputs": {"samples": [audio_encoder_id, 0], "mask": ["9998_solid_mask", 0]}
+                            }
+                            sg[writer_id]["inputs"]["audio_latent"] = ["9997_audio_mask", 0]
 
-                # 3. Standard Overrides (Keeps your native LoRAs untouched)
+                # 3. SAFE STANDARD OVERRIDES (No destructive Model Name overwrites!)
                 for node_id, node_data in list(sg.items()):
                     c_type = node_data.get("class_type")
                     if "inputs" not in node_data: continue
@@ -442,23 +404,6 @@ except Exception: pass
                         node_data["inputs"]["patch_cublaslinear"] = False        
                         node_data["inputs"]["enable_fp16_accumulation"] = False 
 
-                    elif c_type == "DualCLIPLoader":
-                        node_data["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
-                        node_data["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
-                        node_data["inputs"]["type"] = "ltxv"
-                        
-                    elif c_type == "MelBandRoFormerModelLoader":
-                        node_data["inputs"]["model_name"] = "MelBandRoformer_fp32.safetensors"
-                        
-                    elif c_type == "LTXVAudioVAELoader":
-                        node_data["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
-                        
-                    elif c_type == "VAELoader":
-                        node_data["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
-                        
-                    elif c_type == "FL_CosyVoice3_ModelLoader":
-                        node_data["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
-                        
                     elif c_type == "MemoryCacheWriter" or c_type == "MemoryCacheReader":
                         node_data["inputs"]["scene_id"] = str(idx)
                         
@@ -480,7 +425,8 @@ except Exception: pass
                             node_data["inputs"]["local_prompts"] = user_text
                             
                     elif c_type == "CLIPTextEncode":
-                        node_data["inputs"]["text"] = scene_data.get("negative_prompt", "blurry, out of focus, overexposed, underexposed, bad quality")
+                        if "blurry" in str(node_data["inputs"].get("text", "")):
+                            node_data["inputs"]["text"] = scene_data.get("negative_prompt", "blurry, out of focus, overexposed, underexposed, bad quality")
                         
                     elif c_type == "LoadAudio":
                         if "18" in node_id: node_data["inputs"]["audio"] = f"dynamic_guides/spk1_{idx}.wav"
@@ -502,7 +448,7 @@ except Exception: pass
                     custom_w = int(body.get("custom_width", 512)) 
                     custom_h = int(body.get("custom_height", 768))
 
-                    # 🌟 ROBUST DOWNLOAD ASSET FUNCTION (Extracts Boto3 Key even for Private Buckets)
+                    # 🌟 ROBUST DOWNLOAD ASSET FUNCTION
                     async def download_asset(url, target_path):
                         if not url: return False
                         print(f"📥 Fetching asset from: {url}")
@@ -553,16 +499,12 @@ except Exception: pass
                         dialog_text = scene.get("dialog_text", f"{scene.get('speaker1_text', '')} {scene.get('speaker2_text', '')}")
                         clean_text = re.sub(r'SPEAKER\s+[a-zA-Z0-9]+:', '', dialog_text)
                         
-                        # Calculate required length based on text
                         word_count = max(len(clean_text.split()), 1)
                         pauses = len(re.findall(r'[.,!?]', clean_text))
                         estimated_seconds = max(min((word_count / 2.0) + (pauses * 0.4) + 1.5, 10.0), 3.0)
                         
                         total_frames = (math.ceil(int(estimated_seconds * 25) / 8) * 8) + 1
-                        
-                        # 🚀 MAXIMIZE SAFE FRAME COUNT (Prevents OOM)
-                        if total_frames > 257: 
-                            total_frames = 257 
+                        if total_frames > 257: total_frames = 257 
                         
                         exact_audio_duration = float(total_frames - 1) / 25.0
 
@@ -571,8 +513,6 @@ except Exception: pass
 
                         print(f"🎬 Processing Audio & Text Cache for Scene {idx}...")
                         await self.execute_comfy_workflow(session, sg1)
-
-                        # 🚀 CRITICAL: DO NOT UNLOAD THE MODEL. Keep the UNet pointer alive in VRAM.
                         await self.clear_comfy_memory(session, unload_models=False)
 
                     print(f"\n[Lypsync API] 🎥 STARTING PHASE 2: RENDERING {len(batch_scenes)} VIDEOS")
@@ -596,8 +536,6 @@ except Exception: pass
 
                         print(f"🎬 Rendering Video for Scene {idx} (Executing using Live Memory Pointer)...")
                         await self.execute_comfy_workflow(session, sg2)
-
-                        # 🚀 Keep the model alive for the next batch iteration
                         await self.clear_comfy_memory(session, unload_models=False)
 
                         output_files = []

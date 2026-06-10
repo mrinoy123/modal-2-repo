@@ -392,7 +392,7 @@ except Exception: pass
                     if "inputs" not in node_data: continue
                     
                     if c_type == "DiffusionModelLoaderKJ":
-                        node_data["inputs"]["model_name"] = "ltx-2.3-22b-dev-fp8.safetensors"
+                        node_data["inputs"]["model_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
                         # 🚀 VRAM PROTECTION: We MUST use cublaslinear to prevent the VRAM from spiking during pointer pass
                         node_data["inputs"]["patch_cublaslinear"] = False        
                         node_data["inputs"]["enable_fp16_accumulation"] = False 
@@ -410,10 +410,9 @@ except Exception: pass
                     elif c_type == "FL_CosyVoice3_ModelLoader":
                         node_data["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
                     elif c_type == "DenoLTXMultiLoraLoader":
-                        node_data["inputs"]["lora_1"] = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
-                        node_data["inputs"]["lora_2"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
-                        node_data["inputs"]["lora_3"] = "VBVR-official-comfyui.safetensors"
-                        node_data["inputs"]["lora_4"] = "LTX_2.3_RL_OmniNFT_LoRa.safetensors"
+                        node_data["inputs"]["lora_1"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
+                        node_data["inputs"]["lora_2"] = "VBVR-official-comfyui.safetensors"
+                        node_data["inputs"]["lora_3"] = "LTX_2.3_RL_OmniNFT_LoRa.safetensors"
                         for i in range(1, 9):
                             k = f"lora_{i}"
                             if k in node_data["inputs"] and node_data["inputs"][k] in ["", "None", None]:

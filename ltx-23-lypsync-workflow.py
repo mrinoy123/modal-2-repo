@@ -34,7 +34,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "455"  # Bumped for Chunk Feed Forward & Audio Mask injection updates
+    "FORCE_REBUILD_INDEX": "455"  # Bumped for strict mask dimension sync & LoRA preservation
 })
 
 build_image = base_image.env({
@@ -382,7 +382,6 @@ except Exception: pass
                 is_subgraph_1 = total_frames > 0  
 
                 # 🚀 1. DYNAMIC CHUNK FEED FORWARD INJECTION (Saves Massive VRAM)
-                # Ensure the graph has a Chunk FFN to prevent Attention OOMs.
                 if is_subgraph_1:
                     has_chunk_node = any(n.get("class_type") == "LTXVChunkFeedForward" for n in sg.values())
                     if not has_chunk_node:
@@ -404,8 +403,8 @@ except Exception: pass
                             # Reroute writer to use chunked model
                             sg[writer_id]["inputs"]["model"] = ["9999_chunk_ff", 0]
 
-                # 🚀 2. DYNAMIC AUDIO LATENT MASKING (Prevents Static Noise Output)
-                # Injects the solid 0-mask directly before writing to the cache
+                # 🚀 2. DYNAMIC AUDIO LATENT MASKING (Tensor Shape Match Fix)
+                # Guarantees the audio mask matches the EXACT target resolution (custom_w, custom_h).
                 if is_subgraph_1:
                     writer_id = None
                     for n_id, n_data in sg.items():
@@ -414,12 +413,16 @@ except Exception: pass
                             break
                     if writer_id and "audio_latent" in sg[writer_id]["inputs"]:
                         audio_link = sg[writer_id]["inputs"]["audio_latent"]
-                        # Create Mask
+                        
+                        # Purge stale manual nodes
+                        keys_to_delete = [k for k, v in sg.items() if v.get("class_type") in ["SolidMask", "SetLatentNoiseMask"]]
+                        for k in keys_to_delete: del sg[k]
+                        
+                        # Mathematically perfect dynamic Mask Dimensions
                         sg["9998_solid_mask"] = {
                             "class_type": "SolidMask",
-                            "inputs": {"value": 0, "width": 512, "height": 512}
+                            "inputs": {"value": 0, "width": custom_w, "height": custom_h} 
                         }
-                        # Apply Mask
                         sg["9997_audio_mask"] = {
                             "class_type": "SetLatentNoiseMask",
                             "inputs": {
@@ -427,16 +430,15 @@ except Exception: pass
                                 "mask": ["9998_solid_mask", 0]
                             }
                         }
-                        # Reroute Cache Writer to Masked Latent
+                        # Re-route Cache
                         sg[writer_id]["inputs"]["audio_latent"] = ["9997_audio_mask", 0]
 
-                # 3. Standard Overrides
+                # 3. Standard Overrides (Keeps your native LoRAs untouched)
                 for node_id, node_data in list(sg.items()):
                     c_type = node_data.get("class_type")
                     if "inputs" not in node_data: continue
                     
                     if c_type == "DiffusionModelLoaderKJ":
-                        node_data["inputs"]["model_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
                         node_data["inputs"]["patch_cublaslinear"] = False        
                         node_data["inputs"]["enable_fp16_accumulation"] = False 
 
@@ -444,58 +446,59 @@ except Exception: pass
                         node_data["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
                         node_data["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"
                         node_data["inputs"]["type"] = "ltxv"
+                        
                     elif c_type == "MelBandRoFormerModelLoader":
                         node_data["inputs"]["model_name"] = "MelBandRoformer_fp32.safetensors"
+                        
                     elif c_type == "LTXVAudioVAELoader":
                         node_data["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
+                        
                     elif c_type == "VAELoader":
                         node_data["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
+                        
                     elif c_type == "FL_CosyVoice3_ModelLoader":
                         node_data["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
-                    elif c_type == "LTXVChunkFeedForward":
-                        node_data["inputs"]["chunks"] = 4
-                        node_data["inputs"]["dim_threshold"] = 4096
-                    elif c_type == "DenoLTXMultiLoraLoader":
-                        node_data["inputs"]["lora_1"] = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
-                        node_data["inputs"]["lora_2"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
-                        node_data["inputs"]["lora_3"] = "VBVR-official-comfyui.safetensors"
-                        node_data["inputs"]["lora_4"] = "LTX2.3rl-lora-zghhui-OmniNFT.safetensors"
-                        for i in range(5, 9):
-                            k = f"lora_{i}"
-                            if k in node_data["inputs"] and node_data["inputs"][k] in ["", "None", None]:
-                                node_data["inputs"][k] = "__none__"
+                        
                     elif c_type == "MemoryCacheWriter" or c_type == "MemoryCacheReader":
                         node_data["inputs"]["scene_id"] = str(idx)
+                        
                     elif c_type == "EmptyLTXVLatentVideo":
                         node_data["inputs"]["width"] = custom_w
                         node_data["inputs"]["height"] = custom_h
                         node_data["inputs"]["length"] = total_frames
+                        
                     elif c_type == "TrimAudioDuration":
                         node_data["inputs"]["duration"] = exact_audio_duration
                         node_data["inputs"]["start_index"] = 0
+                        
                     elif c_type == "PromptRelayEncode":
                         user_text = scene_data.get("dialog_text", "")
                         if "Shot 1" not in user_text:
-                            formatted_prompt = f"[Scene] Cinematic visual.\n|\nShot 1 (Medium Shot, {exact_audio_duration}s): Character is speaking.\nCharacter: {user_text}"
+                            formatted_prompt = f"[Scene] Cinematic visual.\n[Characters]\nSpeaker: Character speaking.\n|\nShot 1 (Medium Shot, {exact_audio_duration}s): Character is speaking.\nSpeaker: {user_text}\nAction: Speaking."
                             node_data["inputs"]["local_prompts"] = formatted_prompt
                         else:
                             node_data["inputs"]["local_prompts"] = user_text
+                            
                     elif c_type == "CLIPTextEncode":
                         node_data["inputs"]["text"] = scene_data.get("negative_prompt", "blurry, out of focus, overexposed, underexposed, bad quality")
+                        
                     elif c_type == "LoadAudio":
                         if "18" in node_id: node_data["inputs"]["audio"] = f"dynamic_guides/spk1_{idx}.wav"
                         if "19" in node_id: node_data["inputs"]["audio"] = f"dynamic_guides/spk2_{idx}.wav"
+                        
                     elif c_type == "LoadImage":
                         node_data["inputs"]["image"] = f"dynamic_guides/char1_{idx}.png"
+                        
                     elif c_type == "SamplerCustom":
                         node_data["inputs"]["noise_seed"] = scene_data.get("seed", int(time.time() * 1000) % 1000000)
+                        
                     elif c_type == "VHS_VideoCombine":
                         node_data["inputs"]["save_output"] = True
+                        
                 return sg
 
             try:
                 async with aiohttp.ClientSession() as session:
-                    # ✅ ENFORCE SAFE DEFAULT RESOLUTION (Prevents OOM)
                     custom_w = int(body.get("custom_width", 512)) 
                     custom_h = int(body.get("custom_height", 768))
 
@@ -558,7 +561,6 @@ except Exception: pass
                         total_frames = (math.ceil(int(estimated_seconds * 25) / 8) * 8) + 1
                         
                         # 🚀 MAXIMIZE SAFE FRAME COUNT (Prevents OOM)
-                        # With 4 chunks, an L40S 48GB can safely handle 257 frames (10.24 seconds) at 512x768.
                         if total_frames > 257: 
                             total_frames = 257 
                         

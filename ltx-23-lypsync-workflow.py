@@ -34,7 +34,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "455"  # Bumped for Memory Cache purity updates
+    "FORCE_REBUILD_INDEX": "455"  # Bumped for Chunk Feed Forward & Audio Mask injection updates
 })
 
 build_image = base_image.env({
@@ -133,10 +133,19 @@ import comfy.model_patcher
 
 LTX_CACHE = {}
 
-# ✅ FIX 1: We completely removed move_to_cpu. 
-# PromptRelay uses custom object subclasses. Casting them to dicts/lists strips their identity 
-# causing the UNet to read empty conditions -> resulting in pure static noise!
-# Storing exact RAM pointers prevents data destruction.
+# move_to_cpu safely maps pointers without destroying custom PromptRelay class identities
+def move_to_cpu(item):
+    if isinstance(item, torch.Tensor): 
+        return item.cpu()
+    if isinstance(item, dict): 
+        new_dict = type(item)()
+        for k, v in item.items(): new_dict[k] = move_to_cpu(v)
+        return new_dict
+    if isinstance(item, list): 
+        return type(item)(move_to_cpu(v) for v in item)
+    if isinstance(item, tuple): 
+        return type(item)(move_to_cpu(v) for v in item)
+    return item
 
 class MemoryCacheWriter:
     @classmethod
@@ -157,8 +166,6 @@ class MemoryCacheWriter:
 
     def write_cache(self, model, positive, negative, video_latent, audio_latent, scene_id="0"):
         global LTX_CACHE
-        
-        # Store exact memory pointers natively (preserves all PromptRelay Temporal structures)
         LTX_CACHE[str(scene_id)] = {
             "model": model,
             "positive": positive,
@@ -372,7 +379,58 @@ except Exception: pass
             generated_outputs = []
 
             def inject_node_overrides(sg, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene_data):
-                # We iterate through the JSON nodes and inject dynamic values safely
+                is_subgraph_1 = total_frames > 0  
+
+                # 🚀 1. DYNAMIC CHUNK FEED FORWARD INJECTION (Saves Massive VRAM)
+                # Ensure the graph has a Chunk FFN to prevent Attention OOMs.
+                if is_subgraph_1:
+                    has_chunk_node = any(n.get("class_type") == "LTXVChunkFeedForward" for n in sg.values())
+                    if not has_chunk_node:
+                        writer_id = None
+                        for n_id, n_data in sg.items():
+                            if n_data.get("class_type") == "MemoryCacheWriter":
+                                writer_id = n_id
+                                break
+                        if writer_id and "model" in sg[writer_id]["inputs"]:
+                            model_link = sg[writer_id]["inputs"]["model"]
+                            sg["9999_chunk_ff"] = {
+                                "class_type": "LTXVChunkFeedForward",
+                                "inputs": {
+                                    "chunks": 4, 
+                                    "dim_threshold": 4096,
+                                    "model": model_link
+                                }
+                            }
+                            # Reroute writer to use chunked model
+                            sg[writer_id]["inputs"]["model"] = ["9999_chunk_ff", 0]
+
+                # 🚀 2. DYNAMIC AUDIO LATENT MASKING (Prevents Static Noise Output)
+                # Injects the solid 0-mask directly before writing to the cache
+                if is_subgraph_1:
+                    writer_id = None
+                    for n_id, n_data in sg.items():
+                        if n_data.get("class_type") == "MemoryCacheWriter":
+                            writer_id = n_id
+                            break
+                    if writer_id and "audio_latent" in sg[writer_id]["inputs"]:
+                        audio_link = sg[writer_id]["inputs"]["audio_latent"]
+                        # Create Mask
+                        sg["9998_solid_mask"] = {
+                            "class_type": "SolidMask",
+                            "inputs": {"value": 0, "width": 512, "height": 512}
+                        }
+                        # Apply Mask
+                        sg["9997_audio_mask"] = {
+                            "class_type": "SetLatentNoiseMask",
+                            "inputs": {
+                                "samples": audio_link,
+                                "mask": ["9998_solid_mask", 0]
+                            }
+                        }
+                        # Reroute Cache Writer to Masked Latent
+                        sg[writer_id]["inputs"]["audio_latent"] = ["9997_audio_mask", 0]
+
+                # 3. Standard Overrides
                 for node_id, node_data in list(sg.items()):
                     c_type = node_data.get("class_type")
                     if "inputs" not in node_data: continue
@@ -394,8 +452,10 @@ except Exception: pass
                         node_data["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                     elif c_type == "FL_CosyVoice3_ModelLoader":
                         node_data["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
+                    elif c_type == "LTXVChunkFeedForward":
+                        node_data["inputs"]["chunks"] = 4
+                        node_data["inputs"]["dim_threshold"] = 4096
                     elif c_type == "DenoLTXMultiLoraLoader":
-                        # ENSURE distilled lora is loaded in slot 1 so the 12-step configuration doesn't break
                         node_data["inputs"]["lora_1"] = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
                         node_data["inputs"]["lora_2"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
                         node_data["inputs"]["lora_3"] = "VBVR-official-comfyui.safetensors"
@@ -414,11 +474,8 @@ except Exception: pass
                         node_data["inputs"]["duration"] = exact_audio_duration
                         node_data["inputs"]["start_index"] = 0
                     elif c_type == "PromptRelayEncode":
-                        # ✅ FIX 2: If we pass naked text here, PromptRelay parsing completely fails, returning zero-conditioning.
-                        # We must wrap user text in the syntax PromptRelay actually expects.
                         user_text = scene_data.get("dialog_text", "")
                         if "Shot 1" not in user_text:
-                            # Automatically inject the strict parsing structure required by the node
                             formatted_prompt = f"[Scene] Cinematic visual.\n|\nShot 1 (Medium Shot, {exact_audio_duration}s): Character is speaking.\nCharacter: {user_text}"
                             node_data["inputs"]["local_prompts"] = formatted_prompt
                         else:
@@ -438,8 +495,9 @@ except Exception: pass
 
             try:
                 async with aiohttp.ClientSession() as session:
-                    custom_w = int(body.get("custom_width", 704)) 
-                    custom_h = int(body.get("custom_height", 1248))
+                    # ✅ ENFORCE SAFE DEFAULT RESOLUTION (Prevents OOM)
+                    custom_w = int(body.get("custom_width", 512)) 
+                    custom_h = int(body.get("custom_height", 768))
 
                     # 🌟 ROBUST DOWNLOAD ASSET FUNCTION (Extracts Boto3 Key even for Private Buckets)
                     async def download_asset(url, target_path):
@@ -491,12 +549,20 @@ except Exception: pass
 
                         dialog_text = scene.get("dialog_text", f"{scene.get('speaker1_text', '')} {scene.get('speaker2_text', '')}")
                         clean_text = re.sub(r'SPEAKER\s+[a-zA-Z0-9]+:', '', dialog_text)
+                        
+                        # Calculate required length based on text
                         word_count = max(len(clean_text.split()), 1)
                         pauses = len(re.findall(r'[.,!?]', clean_text))
-                        estimated_seconds = max(min((word_count / 2.0) + (pauses * 0.4) + 1.5, 20.0), 3.0)
+                        estimated_seconds = max(min((word_count / 2.0) + (pauses * 0.4) + 1.5, 10.0), 3.0)
                         
                         total_frames = (math.ceil(int(estimated_seconds * 25) / 8) * 8) + 1
-                        exact_audio_duration = float(total_frames) / 25.0
+                        
+                        # 🚀 MAXIMIZE SAFE FRAME COUNT (Prevents OOM)
+                        # With 4 chunks, an L40S 48GB can safely handle 257 frames (10.24 seconds) at 512x768.
+                        if total_frames > 257: 
+                            total_frames = 257 
+                        
+                        exact_audio_duration = float(total_frames - 1) / 25.0
 
                         sg1 = json.loads(json.dumps(subgraph_1))
                         sg1 = inject_node_overrides(sg1, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene)

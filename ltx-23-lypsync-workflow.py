@@ -412,7 +412,7 @@ except Exception: pass
                     elif c_type == "DenoLTXMultiLoraLoader":
                         node_data["inputs"]["lora_1"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
                         node_data["inputs"]["lora_2"] = "VBVR-official-comfyui.safetensors"
-                        node_data["inputs"]["lora_3"] = "LTX_2.3_RL_OmniNFT_LoRa.safetensors"
+                        node_data["inputs"]["lora_3"] = "LTX2.3rl-lora-zghhui-OmniNFT.safetensors"
                         for i in range(1, 9):
                             k = f"lora_{i}"
                             if k in node_data["inputs"] and node_data["inputs"][k] in ["", "None", None]:

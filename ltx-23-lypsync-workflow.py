@@ -395,7 +395,7 @@ except Exception: pass
                         node_data["inputs"]["model_name"] = "ltx-2.3-22b-dev-fp8.safetensors"
                         # 🚀 VRAM PROTECTION: We MUST use cublaslinear to prevent the VRAM from spiking during pointer pass
                         node_data["inputs"]["patch_cublaslinear"] = True        
-                        node_data["inputs"]["enable_fp16_accumulation"] = True  
+                        node_data["inputs"]["enable_fp16_accumulation"] = False 
 
                     elif c_type == "DualCLIPLoader":
                         node_data["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"

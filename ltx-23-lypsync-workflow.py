@@ -129,12 +129,20 @@ import torchvision.transforms.functional as TF
 import nodes
 import comfy.utils
 import comfy.samplers
+import comfy.model_patcher
 
 LTX_CACHE = {}
 
 def move_to_cpu(item):
     if isinstance(item, torch.Tensor): return item.cpu()
-    if isinstance(item, dict): return {k: move_to_cpu(v) for k, v in item.items()}
+    if isinstance(item, dict):
+        new_dict = {}
+        for k, v in item.items():
+            # 🛡️ Drop ModelPatcher to prevent massive 23GB Memory Leaks across Subgraphs
+            if "ModelPatcher" in str(type(v)): continue
+            if "Module" in str(type(v)): continue
+            new_dict[k] = move_to_cpu(v)
+        return new_dict
     if isinstance(item, list): return [move_to_cpu(v) for v in item]
     if isinstance(item, tuple): return tuple(move_to_cpu(v) for v in item)
     return item
@@ -181,13 +189,31 @@ class MemoryCacheReader:
         print(f"[LTX Cache] 📂 Loaded Scene {scene_id} from RAM.")
         return (None, data["positive"], data["negative"], data["video_latent"], data["audio_latent"])
 
+class DummyModelLoader:
+    @classmethod
+    def INPUT_TYPES(s): return {"required": {}}
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "load_dummy"
+    CATEGORY = "LTXBatch"
+
+    def load_dummy(self):
+        class EmptyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.latent_format = None
+        patcher = comfy.model_patcher.ModelPatcher(EmptyModel(), load_device=torch.device("cpu"), offload_device=torch.device("cpu"))
+        print("[LTX Custom] 🚀 Intercepted! Loaded DUMMY UNet to save ~23GB VRAM in Subgraph 1!")
+        return (patcher,)
+
 NODE_CLASS_MAPPINGS = {
     "MemoryCacheWriter": MemoryCacheWriter,
-    "MemoryCacheReader": MemoryCacheReader
+    "MemoryCacheReader": MemoryCacheReader,
+    "DummyModelLoader": DummyModelLoader
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MemoryCacheWriter": "Memory Cache Writer",
-    "MemoryCacheReader": "Memory Cache Reader"
+    "MemoryCacheReader": "Memory Cache Reader",
+    "DummyModelLoader": "Dummy Model Loader"
 }
 
 # ====================================================================
@@ -368,12 +394,24 @@ except Exception: pass
             generated_outputs = []
 
             def inject_node_overrides(sg, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene_data):
+                # 👈 Detect Phase based on total_frames. Subgraph 1 has actual lengths, Subgraph 2 passes 0.
+                is_subgraph_1 = total_frames > 0  
+                
                 for node_id, node_data in list(sg.items()):
                     c_type = node_data.get("class_type")
                     if "inputs" not in node_data: continue
                     
                     if c_type == "DiffusionModelLoaderKJ":
-                        node_data["inputs"]["model_name"] = "ltx-2.3-22b-dev-fp8.safetensors"
+                        if is_subgraph_1:
+                            # 🚀 COMPLETELY REPLACE NODE TO AVOID LOADING UNET in SUBGRAPH 1!
+                            node_data["class_type"] = "DummyModelLoader"
+                            node_data["inputs"] = {}
+                        else:
+                            # 🎥 Phase 2 - Load real model & Prevent NAG Batch OOM
+                            node_data["inputs"]["model_name"] = "ltx-2.3-22b-dev-fp8.safetensors"
+                            node_data["inputs"]["patch_cublaslinear"] = True        # Reduces linear memory spikes
+                            node_data["inputs"]["enable_fp16_accumulation"] = True  # Prevents attention fp32 blowout
+
                     elif c_type == "DualCLIPLoader":
                         node_data["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
                         node_data["inputs"]["clip_name2"] = "ltx-2.3_text_projection_bf16.safetensors"

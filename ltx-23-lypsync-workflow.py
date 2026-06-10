@@ -404,7 +404,7 @@ except Exception: pass
                     if c_type == "DiffusionModelLoaderKJ":
                         node_data["inputs"]["model_name"] = "ltx-2.3-22b-dev-fp8.safetensors"
                         node_data["inputs"]["patch_cublaslinear"] = True        # Prevents linear memory spikes
-                        node_data["inputs"]["enable_fp16_accumulation"] = True  # Prevents attention fp32 blowout
+                        node_data["inputs"]["enable_fp16_accumulation"] = False # Prevents attention fp32 blowout
 
                     elif c_type == "DualCLIPLoader":
                         node_data["inputs"]["clip_name1"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"

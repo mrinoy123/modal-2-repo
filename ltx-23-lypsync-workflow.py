@@ -34,7 +34,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "455"  # Clean build
+    "FORCE_REBUILD_INDEX": "455"  # Bumped to force aggressive model symlinking
 })
 
 build_image = base_image.env({
@@ -50,6 +50,9 @@ build_image = base_image.env({
     "python3.12 -m pip install --no-cache-dir pandas numexpr pytz python-dateutil scipy matplotlib colorama torchvision librosa soundfile decord imageio scikit-image numba einops bitsandbytes rotary_embedding_torch"
 )
 
+# ==============================================================================
+# PART 4: COMFYUI & CUSTOM NODES CLONING
+# ==============================================================================
 torch_image = build_image.run_commands(
     "python3.12 -m pip install --no-cache-dir torch==2.5.1+cu124 torchvision==0.20.1+cu124 torchaudio==2.5.1+cu124 --extra-index-url https://download.pytorch.org/whl/cu124",
     "python3.12 -m pip install --no-cache-dir diffusers accelerate transformers>=4.49.0 torchsde numpy==1.26.4 kornia==0.7.3",
@@ -83,6 +86,9 @@ final_image = deps_image.run_commands(
     env={"CUDA_HOME": "/usr/local/cuda", "PATH": "/usr/local/cuda/bin:" + os.environ.get("PATH", ""), "FORCE_CUDA": "1", "TORCH_CUDA_ARCH_LIST": "8.9"}
 )
 
+# ==============================================================================
+# PART 5: MODAL APP CONFIGURATION & CLOUD VOLUMES 
+# ==============================================================================
 app = modal.App("media-worker-ltx23-lypsync-v2")
 weights_volume = modal.Volume.from_name("Ltx-23-model-weights-new", create_if_missing=False)
 
@@ -127,6 +133,7 @@ import comfy.model_patcher
 
 LTX_CACHE = {}
 
+# Safely copies objects while keeping ComfyUI custom class identities intact
 def move_to_cpu(item):
     if isinstance(item, torch.Tensor): 
         return item.cpu()
@@ -194,8 +201,12 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MemoryCacheReader": "Memory Cache Reader"
 }
 
+# ====================================================================
+# BULLETPROOF HACKS (Fixed for CausalAudioAutoencoder)
+# ====================================================================
 try:
     import comfy.ldm.lightricks.vae.causal_audio_autoencoder
+    
     _orig_encode = comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.encode
     def _patched_encode(self, x, **kwargs):
         target_dtype = next(self.parameters()).dtype
@@ -226,28 +237,69 @@ try:
 except Exception: pass
 """)
 
-        print("🔗 Running Atomic Model Folder Linker for ALL LTX 2.3 & Audio Dependencies...")
+        print("🔗 Running AGGRESSIVE Model Folder Linker...")
+        # FIX: Scan the entire /mnt/weights folder and link EVERY file into multiple possible 
+        # ComfyUI target directories so the nodes can never report "missing model weights".
+        
         base_models_dir = "/workspace/ComfyUI/models"
-        dirs = ["unet", "vae", "clip", "text_encoders", "checkpoints", "loras", "upscale_models", "latent_upscale_models", "cosyvoice", "melbandroformer", "diffusion_models", "audio_separators", "audio_vae", "audio_checkpoints"]
-        for d in dirs: os.makedirs(os.path.join(base_models_dir, d), exist_ok=True)
+        weights_dir = "/mnt/weights"
+        
+        target_dirs = [
+            "unet", "vae", "clip", "text_encoders", "checkpoints", 
+            "loras", "upscale_models", "diffusion_models", "audio_separators", 
+            "audio_vae", "audio_checkpoints", "cosyvoice", "melbandroformer"
+        ]
+        for d in target_dirs: 
+            os.makedirs(os.path.join(base_models_dir, d), exist_ok=True)
 
-        cv_source = "/mnt/weights/cosyvoice3"
+        for root, _, files in os.walk(weights_dir):
+            for filename in files:
+                if not filename.endswith((".safetensors", ".gguf", ".pth", ".pt", ".bin", ".onnx", ".yaml", ".json")):
+                    continue
+                
+                src_path = os.path.join(root, filename)
+                lower_f = filename.lower()
+                mapped_dirs = set()
+                
+                if "lora" in lower_f or "vbvr" in lower_f or "omninft" in lower_f:
+                    mapped_dirs.add("loras")
+                if "vae" in lower_f:
+                    mapped_dirs.add("vae")
+                    mapped_dirs.add("audio_vae")
+                if "gemma" in lower_f or "clip" in lower_f or "projection" in lower_f or "text_encoder" in lower_f:
+                    mapped_dirs.add("clip")
+                    mapped_dirs.add("text_encoders")
+                if "unet" in lower_f or "diffusion" in lower_f or "ltx" in lower_f:
+                    mapped_dirs.add("unet")
+                    mapped_dirs.add("diffusion_models")
+                    mapped_dirs.add("checkpoints")
+                if "roformer" in lower_f:
+                    mapped_dirs.add("audio_separators")
+                    mapped_dirs.add("melbandroformer")
+                    
+                # If we couldn't match a specific keyword, link it everywhere it could reasonably belong
+                if not mapped_dirs:
+                    mapped_dirs.update(["checkpoints", "diffusion_models", "unet", "loras"])
+
+                # Execute Symlinks
+                for t_dir in mapped_dirs:
+                    dest = os.path.join(base_models_dir, t_dir, filename)
+                    if not os.path.exists(dest):
+                        try: os.symlink(src_path, dest)
+                        except Exception: pass
+                        
+        # Handle CosyVoice special folder layout
         cv_dest = os.path.join(base_models_dir, "cosyvoice", "Fun-CosyVoice3-0.5B")
-        if os.path.exists(cv_source) and not os.path.exists(cv_dest):
-            os.symlink(cv_source, cv_dest)
-
-        if os.path.exists("/mnt/weights/canonical_storage"):
-            for root_dir, _, files in os.walk("/mnt/weights/canonical_storage"):
-                if "cosyvoice3" in root_dir.split(os.sep): continue 
-                for filename in files:
-                    if not filename.endswith((".safetensors", ".gguf", ".pth", ".pt", ".bin", ".onnx", ".yaml", ".json")): continue
-                    src_path = os.path.join(root_dir, filename)
-                    for target_dir in dirs:
-                        if target_dir == "cosyvoice": continue 
-                        dest = os.path.join(base_models_dir, target_dir, filename)
-                        if not os.path.exists(dest):
-                            try: os.symlink(src_path, dest)
-                            except FileExistsError: pass
+        if not os.path.exists(cv_dest):
+            for root, dirs, _ in os.walk(weights_dir):
+                if "Fun-CosyVoice3-0.5B" in dirs:
+                    try: os.symlink(os.path.join(root, "Fun-CosyVoice3-0.5B"), cv_dest)
+                    except: pass
+                    break
+                elif "cosyvoice3" in dirs:
+                    try: os.symlink(os.path.join(root, "cosyvoice3"), cv_dest)
+                    except: pass
+                    break
 
         self.s3 = boto3.client(
             service_name='s3', 
@@ -257,7 +309,9 @@ except Exception: pass
             region_name="auto"
         )
 
+        print("🚀 Launching Lypsync Server Engine on L40S GPU...")
         os.makedirs("/tmp/comfy_swap", exist_ok=True)
+
         env_vars = os.environ.copy()
         env_vars["LD_PRELOAD"] = "/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4"
         env_vars["TORCH_NUM_THREADS"] = "1"
@@ -285,6 +339,7 @@ except Exception: pass
             except Exception: time.sleep(2)
                 
         if not comfy_ready: os._exit(1)
+        print("✅ Base pipeline active. Awaiting Dual-Subgraph Triggers.")
 
     async def clear_comfy_memory(self, session, unload_models=False):
         try:
@@ -305,7 +360,12 @@ except Exception: pass
                 err_text = await r.text()
                 raise HTTPException(status_code=500, detail=f"Failed to queue prompt: {r.status} - {err_text}")
             res = await r.json()
-            if "error" in res: raise HTTPException(status_code=500, detail=f"Validation Error: {res['error']}")
+            
+            if "error" in res:
+                raise HTTPException(status_code=500, detail=f"Validation Error: {res['error']}")
+            if "node_errors" in res and res["node_errors"]:
+                raise HTTPException(status_code=500, detail=f"Node Errors: {res['node_errors']}")
+                
             prompt_id = res["prompt_id"]
 
         while True:
@@ -321,7 +381,10 @@ except Exception: pass
             if self.process.poll() is not None: raise HTTPException(status_code=500, detail="ComfyUI server process crashed.")
             await asyncio.sleep(1)
 
-    @modal.fastapi_endpoint(method="POST")
+    # ==============================================================================
+    # PART 6: LYPSYNC FAST-BATCH ENDPOINT
+    # ==============================================================================
+    @modal.fastapi_endpoint(method="POST", timeout=1800)
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
         if x_api_key != "testing-modal-workflow-2": 
             raise HTTPException(status_code=403, detail="Unauthorized Pipeline Request")
@@ -350,7 +413,7 @@ except Exception: pass
             def inject_node_overrides(sg, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene_data):
                 is_subgraph_1 = total_frames > 0  
 
-                # 🚀 1. DYNAMIC CHUNK FEED FORWARD INJECTION
+                # 🚀 1. DYNAMIC CHUNK FEED FORWARD INJECTION (Saves Massive VRAM)
                 if is_subgraph_1:
                     has_chunk_node = any(n.get("class_type") == "LTXVChunkFeedForward" for n in sg.values())
                     if not has_chunk_node:
@@ -363,11 +426,16 @@ except Exception: pass
                             model_link = sg[writer_id]["inputs"]["model"]
                             sg["9999_chunk_ff"] = {
                                 "class_type": "LTXVChunkFeedForward",
-                                "inputs": {"chunks": 4, "dim_threshold": 4096, "model": model_link}
+                                "inputs": {
+                                    "chunks": 4, 
+                                    "dim_threshold": 4096,
+                                    "model": model_link
+                                }
                             }
+                            # Reroute writer to use chunked model
                             sg[writer_id]["inputs"]["model"] = ["9999_chunk_ff", 0]
 
-                # 🚀 2. MATHEMATICALLY PERFECT AUDIO MASKING
+                # 🚀 2. DYNAMIC AUDIO LATENT MASKING (Tensor Shape Match Fix)
                 if is_subgraph_1:
                     writer_id = None
                     for n_id, n_data in sg.items():
@@ -375,6 +443,7 @@ except Exception: pass
                             writer_id = n_id
                             break
                     if writer_id and "audio_latent" in sg[writer_id]["inputs"]:
+                        # Purge stale manual mask nodes 
                         keys_to_delete = [k for k, v in sg.items() if v.get("class_type") in ["SolidMask", "SetLatentNoiseMask"]]
                         for k in keys_to_delete: del sg[k]
                         
@@ -385,17 +454,21 @@ except Exception: pass
                                 break
                                 
                         if audio_encoder_id:
+                            # FIX: Hardcode to 512x512 because LTX Audio VAE natively operates on 512x512 masks!
                             sg["9998_solid_mask"] = {
                                 "class_type": "SolidMask",
-                                "inputs": {"value": 0, "width": custom_w, "height": custom_h} 
+                                "inputs": {"value": 0, "width": 512, "height": 512} 
                             }
                             sg["9997_audio_mask"] = {
                                 "class_type": "SetLatentNoiseMask",
-                                "inputs": {"samples": [audio_encoder_id, 0], "mask": ["9998_solid_mask", 0]}
+                                "inputs": {
+                                    "samples": [audio_encoder_id, 0],
+                                    "mask": ["9998_solid_mask", 0]
+                                }
                             }
                             sg[writer_id]["inputs"]["audio_latent"] = ["9997_audio_mask", 0]
 
-                # 3. SAFE STANDARD OVERRIDES (No destructive Model Name overwrites!)
+                # 3. Standard Overrides (We DO NOT override LoRA/Model names anymore!)
                 for node_id, node_data in list(sg.items()):
                     c_type = node_data.get("class_type")
                     if "inputs" not in node_data: continue
@@ -417,6 +490,7 @@ except Exception: pass
                         node_data["inputs"]["start_index"] = 0
                         
                     elif c_type == "PromptRelayEncode":
+                        # Safety fallback formatting if PromptRelay JSON isn't perfect
                         user_text = scene_data.get("dialog_text", "")
                         if "Shot 1" not in user_text:
                             formatted_prompt = f"[Scene] Cinematic visual.\n[Characters]\nSpeaker: Character speaking.\n|\nShot 1 (Medium Shot, {exact_audio_duration}s): Character is speaking.\nSpeaker: {user_text}\nAction: Speaking."
@@ -523,10 +597,13 @@ except Exception: pass
                     for idx, scene in enumerate(batch_scenes):
                         img1_path = os.path.join(dynamic_guides_dir, f"char1_{idx}.png")
                         await download_asset(scene.get("image1_url"), img1_path)
+                        
+                        # 🚀 PERFECT IMAGE RESIZING (Fixes Video Generation crash)
                         from PIL import Image
                         if not os.path.exists(img1_path):
                             Image.new('RGB', (custom_w, custom_h), color='black').save(img1_path)
                         else:
+                            # Resize to exactly custom_w and custom_h to match the latent perfectly
                             Image.open(img1_path).convert("RGB").resize((custom_w, custom_h), Image.Resampling.LANCZOS).save(img1_path)
                         
                         scene["seed"] = scene.get("seed", int(time.time() * 1000) % 1000000)

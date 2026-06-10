@@ -16,11 +16,11 @@ import base64
 import math
 import re
 import warnings
+from urllib.parse import urlparse
 from fastapi import Request, Response, HTTPException, Header
 from fastapi.responses import StreamingResponse
 from typing import Optional
 
-# Suppress harmless Librosa/Numba hashing warnings in logs
 warnings.filterwarnings("ignore", category=UserWarning, module="numba")
 
 # ==============================================================================
@@ -34,7 +34,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "445"  # ⚠️ Bumped to aggressively apply the new Audio VAE Dtype Fixes
+    "FORCE_REBUILD_INDEX": "445"  # ⚠️ Bumped to apply correct Audio VAE Fixes
 })
 
 build_image = base_image.env({
@@ -130,9 +130,6 @@ import nodes
 import comfy.utils
 import comfy.samplers
 
-# ====================================================================
-# GLOBAL MEMORY CACHE ARCHITECTURE WITH VRAM PROTECTION
-# ====================================================================
 LTX_CACHE = {}
 
 def move_to_cpu(item):
@@ -194,35 +191,27 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 }
 
 # ====================================================================
-# BULLETPROOF HACKS
+# BULLETPROOF HACKS (Fixed for CausalAudioAutoencoder)
 # ====================================================================
-
-# 1. AUDIO VAE DTYPE FIX (Fixes the BFloat16/Float32 Crash)
 try:
-    import comfy.ldm.lightricks.vae.audio_vae
+    import comfy.ldm.lightricks.vae.causal_audio_autoencoder
     
-    _orig_audio_vae_encode = comfy.ldm.lightricks.vae.audio_vae.AudioVAE.encode
-    def _patched_audio_vae_encode(self, audio):
-        # The mel_filter outputs float32, but our VAE is loaded in bfloat16. We MUST cast it.
-        mel_spec = self.mel_filter(audio)
-        target_dtype = next(self.autoencoder.parameters()).dtype
-        return self.autoencoder.encode(mel_spec.to(target_dtype))
-    comfy.ldm.lightricks.vae.audio_vae.AudioVAE.encode = _patched_audio_vae_encode
+    _orig_encode = comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.encode
+    def _patched_encode(self, x, **kwargs):
+        target_dtype = next(self.parameters()).dtype
+        return _orig_encode(self, x.to(target_dtype), **kwargs)
+    comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.encode = _patched_encode
 
-    _orig_audio_vae_decode = comfy.ldm.lightricks.vae.audio_vae.AudioVAE.decode
-    def _patched_audio_vae_decode(self, latents):
-        target_dtype = next(self.autoencoder.parameters()).dtype
-        latents = latents.to(target_dtype)
-        mel_spec = self.autoencoder.decode(latents)
-        # Vocoder expects float32 to synthesize actual audio waves
-        return self.vocoder(mel_spec.float())
-    comfy.ldm.lightricks.vae.audio_vae.AudioVAE.decode = _patched_audio_vae_decode
+    _orig_decode = comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.decode
+    def _patched_decode(self, z, **kwargs):
+        target_dtype = next(self.parameters()).dtype
+        return _orig_decode(self, z.to(target_dtype), **kwargs)
+    comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.decode = _patched_decode
     
-    print("[LTX Custom] ✅ Audio VAE Float32/BFloat16 Cast Hack applied successfully.")
+    print("[LTX Custom] ✅ Audio VAE CausalAutoencoder Dtype hack applied successfully.")
 except Exception as e:
     print(f"[LTX Custom] ❌ Audio VAE Hack failed: {e}")
 
-# 2. NESTED TENSOR UN-NESTER (For Upscaling / Schedulers)
 try:
     import comfy_extras.nodes_lt
     class SafeLTXVSeparateAVLatent(comfy_extras.nodes_lt.LTXVSeparateAVLatent):
@@ -237,7 +226,6 @@ try:
                 return (vid_out, aud_out)
             return super().execute(av_latent)
     NODE_CLASS_MAPPINGS["LTXVSeparateAVLatent"] = SafeLTXVSeparateAVLatent
-    print("[LTX Custom] ✅ Nested Tensor safety overrides applied.")
 except Exception: pass
 """)
 
@@ -436,23 +424,41 @@ except Exception: pass
                     custom_w = int(body.get("custom_width", 1280)) 
                     custom_h = int(body.get("custom_height", 704))
 
+                    # 🌟 ROBUST DOWNLOAD ASSET FUNCTION (Extracts Boto3 Key even for Private Buckets)
                     async def download_asset(url, target_path):
                         if not url: return False
-                        if "pub-4d91f4d3d0366568a54ffa32ffcb7bf4.r2.dev" in url:
-                            key = url.split(".dev/")[-1]
-                            if key.startswith("video-asset-files-storage-workflow/"):
-                                key = key.replace("video-asset-files-storage-workflow/", "", 1)
+                        print(f"📥 Fetching asset from: {url}")
+                        
+                        if "r2.dev" in url or "cloudflarestorage" in url:
+                            parsed = urlparse(url)
+                            # Strip leading slash to get the raw key
+                            key = parsed.path.lstrip('/')
+                            bucket_name = "video-asset-files-storage-workflow"
+                            
+                            # If the path accidentally includes the bucket name, remove it
+                            if key.startswith(bucket_name + "/"):
+                                key = key.replace(bucket_name + "/", "", 1)
+                                
+                            print(f"   [Auth] Using Boto3 for private bucket: {bucket_name} | Key: {key}")
                             try:
-                                await asyncio.get_event_loop().run_in_executor(None, self.s3.download_file, "video-asset-files-storage-workflow", key, target_path)
+                                await asyncio.get_event_loop().run_in_executor(None, self.s3.download_file, bucket_name, key, target_path)
+                                print(f"   ✅ Success (Boto3)")
                                 return True
-                            except Exception: return False
-                        else:
-                            try:
-                                async with session.get(url, timeout=60) as r:
-                                    if r.status == 200:
-                                        with open(target_path, "wb") as f: f.write(await r.read())
-                                        return True
-                            except Exception: pass
+                            except Exception as e:
+                                print(f"   ❌ Boto3 failed for {key}: {e}")
+                                # Fall through to HTTP GET attempt if boto fails
+                                
+                        print(f"   [HTTP] Attempting standard GET request...")
+                        try:
+                            async with session.get(url, timeout=60) as r:
+                                if r.status == 200:
+                                    with open(target_path, "wb") as f: f.write(await r.read())
+                                    print(f"   ✅ Success (HTTP)")
+                                    return True
+                                else:
+                                    print(f"   ❌ HTTP GET Failed. Status: {r.status}")
+                        except Exception as e:
+                            print(f"   ❌ HTTP GET Exception: {e}")
                         return False
 
                     print(f"\n[Lypsync API] 🎙️ STARTING PHASE 1: ENCODING {len(batch_scenes)} SCENES")

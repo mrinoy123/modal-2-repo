@@ -34,7 +34,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "505"  # Updated for Director Workflow
+    "FORCE_REBUILD_INDEX": "506"  # Updated for Director Workflow
 })
 
 build_image = base_image.env({
@@ -344,7 +344,7 @@ except Exception: pass
             await asyncio.sleep(1)
 
     # ==============================================================================
-    # PART 6: LYPSYNC FAST-BATCH ENDPOINT (DIRECTOR WORKFLOW OVERRIDES)
+    # PART 6: LYPSYNC FAST-BATCH ENDPOINT (DYNAMIC 1 & 2 CHARACTER SUPPORT)
     # ==============================================================================
     @modal.fastapi_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
@@ -372,9 +372,10 @@ except Exception: pass
             ram_task = asyncio.create_task(self._ram_squeezer())
             generated_outputs = []
 
-            # 🔥 NEW INJECTION LOGIC FOR LTX DIRECTOR WORKFLOW NODES
+            # 🔥 NEW INJECTION LOGIC DYNAMICALLY ROUTES 1 OR 2 IMAGES/CHARACTERS
             def inject_node_overrides(sg, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene_data):
                 audio_node_counter = 0
+                image_node_counter = 0
 
                 for node_id, node_data in list(sg.items()):
                     c_type = node_data.get("class_type")
@@ -383,9 +384,8 @@ except Exception: pass
                     if c_type == "DiffusionModelLoaderKJ":
                         node_data["inputs"]["model_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
                     elif c_type == "DenoLTXMultiLoraLoader":
-                        # Maps your LoRAs appropriately as per video
-                        node_data["inputs"]["lora_1"] = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors" # Base Speed LoRA
-                        node_data["inputs"]["lora_2"] = "LTX_2.3_ID_LoRA_TalkVid_3K.safetensors" # Face/ID/Talk LoRA
+                        node_data["inputs"]["lora_1"] = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors" 
+                        node_data["inputs"]["lora_2"] = "LTX_2.3_ID_LoRA_TalkVid_3K.safetensors" 
                         for i in range(3, 9):
                             k = f"lora_{i}"
                             if k in node_data["inputs"]: node_data["inputs"][k] = "__none__"
@@ -404,30 +404,56 @@ except Exception: pass
                         node_data["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
                     elif c_type in ["MemoryCacheWriter", "MemoryCacheReader"]:
                         node_data["inputs"]["scene_id"] = str(idx)
+                        
                     elif c_type == "LTXDirector":
                         node_data["inputs"]["custom_width"] = custom_w
                         node_data["inputs"]["custom_height"] = custom_h
-                        if total_frames > 0:  # Only update timings on subgraph 1
+                        if total_frames > 0:  
                             node_data["inputs"]["duration_frames"] = total_frames
                             node_data["inputs"]["duration_seconds"] = exact_audio_duration
                             
-                            # Build the specific director format for Lip-Sync
+                            # 🔥 DYNAMIC 1 vs 2 CHARACTER PROMPT BUILDER
                             user_text = scene_data.get("dialog_text", "")
-                            if "Shot 1" not in user_text and user_text:
-                                formatted_prompt = f"[Scene] Cinematic talking portrait.\n|\nShot 1 (Medium Shot, {exact_audio_duration:.2f}s):\nCharacter: {user_text}"
+                            has_char_2 = bool(scene_data.get("image2_url"))
+                            
+                            if "Shot 1" not in user_text: 
+                                if has_char_2:
+                                    # Formats for 2 character conversation - splitting the time equally
+                                    half_time = exact_audio_duration / 2.0
+                                    spk1_txt = scene_data.get("speaker1_text", "I have told you everything I know.")
+                                    spk2_txt = scene_data.get("speaker2_text", "You are holding back.")
+                                    formatted_prompt = (
+                                        f"[Characters]\nCharA: Person one.\nCharB: Person two.\n|\n"
+                                        f"Shot 1 (Medium Shot, {half_time:.2f}s):\nCharA: {spk1_txt}\n|\n"
+                                        f"Shot 2 (Medium Shot, {half_time:.2f}s):\nCharB: {spk2_txt}"
+                                    )
+                                else:
+                                    # Formats for single character monologue
+                                    formatted_prompt = f"[Scene] Cinematic talking portrait.\n|\nShot 1 (Medium Shot, {exact_audio_duration:.2f}s):\nCharacter: {user_text}"
                                 node_data["inputs"]["global_prompt"] = formatted_prompt
-                            elif user_text:
+                            else:
+                                # Uses exactly what you pass if it's pre-formatted
                                 node_data["inputs"]["global_prompt"] = user_text
+                                
                     elif c_type == "FL_CosyVoice3_Dialog":
                         node_data["inputs"]["dialog_text"] = scene_data.get("dialog_text", "SPEAKER A: Hello.")
                         node_data["inputs"]["seed"] = scene_data.get("seed", int(time.time() * 1000) % 1000000)
+                        
                     elif c_type == "LoadAudio":
-                        # Sequentially assign audio files to the load audio nodes
                         audio_node_counter += 1
-                        if audio_node_counter == 1: node_data["inputs"]["audio"] = f"dynamic_guides/spk1_{idx}.wav"
-                        else: node_data["inputs"]["audio"] = f"dynamic_guides/spk2_{idx}.wav"
+                        if audio_node_counter == 1: 
+                            node_data["inputs"]["audio"] = f"dynamic_guides/spk1_{idx}.wav"
+                        else: 
+                            node_data["inputs"]["audio"] = f"dynamic_guides/spk2_{idx}.wav"
+                            
                     elif c_type == "LoadImage":
-                        node_data["inputs"]["image"] = f"dynamic_guides/char1_{idx}.png"
+                        # Sequentially pairs images: Char 1 -> First Node, Char 2 -> Second Node
+                        image_node_counter += 1
+                        if image_node_counter == 1: 
+                            node_data["inputs"]["image"] = f"dynamic_guides/char1_{idx}.png"
+                        else: 
+                            node_data["inputs"]["image"] = f"dynamic_guides/char2_{idx}.png"
+                            
                     elif c_type == "RandomNoise":
                         node_data["inputs"]["noise_seed"] = scene_data.get("seed", int(time.time() * 1000) % 1000000)
                     elif c_type == "VHS_VideoCombine":
@@ -436,7 +462,6 @@ except Exception: pass
 
             try:
                 async with aiohttp.ClientSession() as session:
-                    # 🚀 ENFORCE LTX PRECISE ASPECT RATIO ( Divisible Blocks of 32 )
                     custom_w = 448 
                     custom_h = 768
 
@@ -475,12 +500,10 @@ except Exception: pass
                         dialog_text = scene.get("dialog_text", f"{scene.get('speaker1_text', '')} {scene.get('speaker2_text', '')}")
                         clean_text = re.sub(r'SPEAKER\s+[a-zA-Z0-9]+:', '', dialog_text)
                         
-                        # Dynamically calculate exact timeline frame constraints for Director
                         word_count = max(len(clean_text.split()), 1)
                         pauses = len(re.findall(r'[.,!?]', clean_text))
                         estimated_seconds = max((word_count / 2.5) + (pauses * 0.4) + 1.0, 2.0)
                         
-                        # 8N + 1 Frame logic required for LTX 2.3
                         total_frames = (math.ceil(int(estimated_seconds * 25) / 8) * 8) + 1
                         if total_frames > 257: total_frames = 257 
                             
@@ -492,7 +515,6 @@ except Exception: pass
                         print(f"🎬 Processing Audio & Text Cache for Scene {idx} (Frames: {total_frames}, Seconds: {exact_audio_duration:.2f})...")
                         await self.execute_comfy_workflow(session, sg1)
 
-                        # DO NOT UNLOAD THE MODEL
                         await self.clear_comfy_memory(session, unload_models=False)
 
                     print("\n🧹 Phase 1 Batch Complete. Clearing Address Spaces...")
@@ -504,13 +526,25 @@ except Exception: pass
                     os.makedirs(out_dir)
 
                     for idx, scene in enumerate(batch_scenes):
+                        # 🔥 DOWNLOAD BOTH IMAGES DYNAMICALLY
                         img1_path = os.path.join(dynamic_guides_dir, f"char1_{idx}.png")
+                        img2_path = os.path.join(dynamic_guides_dir, f"char2_{idx}.png")
+                        
                         await download_asset(scene.get("image1_url"), img1_path)
+                        await download_asset(scene.get("image2_url"), img2_path) # Fails silently if not provided
+                        
                         from PIL import Image
+                        # Standardize Image 1 (Character A)
                         if not os.path.exists(img1_path):
                             Image.new('RGB', (custom_w, custom_h), color='black').save(img1_path)
                         else:
                             Image.open(img1_path).convert("RGB").resize((custom_w, custom_h), Image.Resampling.LANCZOS).save(img1_path)
+                            
+                        # Standardize Image 2 (Character B) -> Creates a blank fail-safe image if left empty by n8n
+                        if os.path.exists(img2_path):
+                            Image.open(img2_path).convert("RGB").resize((custom_w, custom_h), Image.Resampling.LANCZOS).save(img2_path)
+                        else:
+                            Image.new('RGB', (custom_w, custom_h), color='black').save(img2_path)
                         
                         scene["seed"] = scene.get("seed", int(time.time() * 1000) % 1000000)
 

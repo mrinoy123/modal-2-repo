@@ -34,7 +34,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "461"  # Updated for dynamic frame calculation & 9:16 aspect ratio
+    "FORCE_REBUILD_INDEX": "462"  # Updated for dynamic frame calculation & 9:16 aspect ratio
 })
 
 build_image = base_image.env({

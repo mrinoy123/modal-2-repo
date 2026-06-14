@@ -34,7 +34,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "506"  # Cache bump for latest script logic
+    "FORCE_REBUILD_INDEX": "506"  # Cache bump for LTXDirector syntax fix
 })
 
 build_image = base_image.env({
@@ -231,6 +231,7 @@ except Exception: pass
         print("🔗 Running Atomic Model Folder Linker for ALL LTX 2.3 & Audio Dependencies...")
         base_models_dir = "/workspace/ComfyUI/models"
         
+        # Ensure upscale_models and latent_upscale_models are properly mapped
         dirs = [
             "unet", "vae", "clip", "text_encoders", "checkpoints", "loras", 
             "upscale_models", "latent_upscale_models", "cosyvoice", 
@@ -247,12 +248,13 @@ except Exception: pass
                     if not filename.endswith((".safetensors", ".gguf", ".pth", ".pt", ".bin", ".onnx", ".yaml", ".json")): continue
                     src_path = os.path.join(root_dir, filename)
                     
+                    # Direct mapping logic for Upscalers / Checkpoints / Lora
                     if "spatial-upscaler" in filename.lower():
                         dest = os.path.join(base_models_dir, "latent_upscale_models", filename)
                     elif "lora" in filename.lower() or "talking_head" in filename.lower():
                         dest = os.path.join(base_models_dir, "loras", filename)
                     else:
-                        dest = os.path.join(base_models_dir, "checkpoints", filename)
+                        dest = os.path.join(base_models_dir, "checkpoints", filename) # fallback
                         
                     for target_dir in dirs:
                         if target_dir == "cosyvoice": continue 
@@ -370,6 +372,7 @@ except Exception: pass
             ram_task = asyncio.create_task(self._ram_squeezer())
             generated_outputs = []
 
+            # 🔥 NEW INJECTION LOGIC DYNAMICALLY ROUTES 1 OR 2 IMAGES/CHARACTERS
             def inject_node_overrides(sg, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene_data):
                 audio_node_counter = 0
                 image_node_counter = 0
@@ -413,6 +416,7 @@ except Exception: pass
                             has_char_2 = bool(scene_data.get("image2_url"))
                             
                             # 🔥 FIX: 1-Person vs 2-Person Prompt Logic
+                            # We MUST provide the Shot formatting so the Director Timeline parser knows where to map the prompt!
                             if "Shot 1" not in user_text: 
                                 if has_char_2:
                                     # 2 Character (Splits time precisely to avoid gaps)
@@ -427,8 +431,9 @@ except Exception: pass
                                     )
                                     node_data["inputs"]["global_prompt"] = formatted_prompt
                                 else:
-                                    # 🔥 For 1 character: Just pass plain text! Bypasses the strict timeline parser!
-                                    node_data["inputs"]["global_prompt"] = user_text
+                                    # 🔥 1 Character: Requires 'Shot 1' wrapper to satisfy the Strict Parser!
+                                    formatted_prompt = f"[Scene] Cinematic visual.\n|\nShot 1 (Medium Shot, {exact_audio_duration:.2f}s):\nCharacter: {user_text}"
+                                    node_data["inputs"]["global_prompt"] = formatted_prompt
                             else:
                                 node_data["inputs"]["global_prompt"] = user_text
                                 
@@ -499,7 +504,8 @@ except Exception: pass
                         total_frames = (math.ceil(int(estimated_seconds * 25) / 8) * 8) + 1
                         if total_frames > 257: total_frames = 257 
                             
-                        exact_audio_duration = float(total_frames - 1) / 25.0
+                        # 🔥 Rounded exact_audio_duration to fix microscopic float mismatch error
+                        exact_audio_duration = round(float(total_frames - 1) / 25.0, 2)
 
                         sg1 = json.loads(json.dumps(subgraph_1))
                         sg1 = inject_node_overrides(sg1, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene)

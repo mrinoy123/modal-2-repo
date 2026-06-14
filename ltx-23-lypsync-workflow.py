@@ -34,7 +34,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "506"  # Cache bump for LTXDirector timeline gap fix
+    "FORCE_REBUILD_INDEX": "506"  # Cache bump for Dynamic API Key Scanner
 })
 
 build_image = base_image.env({
@@ -344,7 +344,7 @@ except Exception: pass
             await asyncio.sleep(1)
 
     # ==============================================================================
-    # PART 6: LYPSYNC FAST-BATCH ENDPOINT (DYNAMIC 1 & 2 CHARACTER SUPPORT)
+    # PART 6: LYPSYNC FAST-BATCH ENDPOINT (DYNAMIC KEY SCANNER INTEGRATED)
     # ==============================================================================
     @modal.fastapi_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
@@ -372,90 +372,112 @@ except Exception: pass
             ram_task = asyncio.create_task(self._ram_squeezer())
             generated_outputs = []
 
-            # 🔥 NEW INJECTION LOGIC DYNAMICALLY ROUTES 1 OR 2 IMAGES/CHARACTERS
+            # 🔥 DYNAMIC INJECTION LOGIC THAT SCANS FOR CORRECT JSON KEYS
             def inject_node_overrides(sg, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene_data):
                 audio_node_counter = 0
                 image_node_counter = 0
 
                 for node_id, node_data in list(sg.items()):
-                    c_type = node_data.get("class_type")
-                    if "inputs" not in node_data: continue
+                    c_type = node_data.get("class_type", "")
+                    inputs = node_data.get("inputs", {})
                     
                     if c_type == "DiffusionModelLoaderKJ":
-                        node_data["inputs"]["model_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
+                        inputs["model_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
                     elif c_type == "DenoLTXMultiLoraLoader":
-                        node_data["inputs"]["lora_1"] = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors" 
-                        node_data["inputs"]["lora_2"] = "LTX_2.3_ID_LoRA_TalkVid_3K.safetensors" 
+                        inputs["lora_1"] = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors" 
+                        inputs["lora_2"] = "LTX_2.3_ID_LoRA_TalkVid_3K.safetensors" 
                         for i in range(3, 9):
                             k = f"lora_{i}"
-                            if k in node_data["inputs"]: node_data["inputs"][k] = "__none__"
+                            if k in inputs: inputs[k] = "__none__"
                     elif c_type == "LTXAVTextEncoderLoader":
-                        node_data["inputs"]["text_encoder"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
-                        node_data["inputs"]["ckpt_name"] = "ltx-2.3_text_projection_bf16.safetensors"
+                        inputs["text_encoder"] = "gemma-3-12b-it-heretic-v2_fp8_e4m3fn.safetensors"
+                        inputs["ckpt_name"] = "ltx-2.3_text_projection_bf16.safetensors"
                     elif c_type == "MelBandRoFormerModelLoader":
-                        node_data["inputs"]["model_name"] = "MelBandRoformer_fp32.safetensors"
+                        inputs["model_name"] = "MelBandRoformer_fp32.safetensors"
                     elif c_type == "LTXVAudioVAELoader":
-                        node_data["inputs"]["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
+                        inputs["ckpt_name"] = "LTX23_audio_vae_bf16.safetensors"
                     elif c_type == "VAELoader":
-                        node_data["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
+                        inputs["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                     elif c_type == "LowVRAMLatentUpscaleModelLoader":
-                        node_data["inputs"]["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+                        inputs["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
                     elif c_type == "FL_CosyVoice3_ModelLoader":
-                        node_data["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
+                        inputs["model_version"] = "Fun-CosyVoice3-0.5B"
                     elif c_type in ["MemoryCacheWriter", "MemoryCacheReader"]:
-                        node_data["inputs"]["scene_id"] = str(idx)
+                        inputs["scene_id"] = str(idx)
                         
-                    elif c_type == "LTXDirector":
-                        node_data["inputs"]["custom_width"] = custom_w
-                        node_data["inputs"]["custom_height"] = custom_h
+                    # 🚀 DIRECTOR / RELAY OVERRIDE (SCANNING ALL POSSIBLE PROMPT KEYS)
+                    elif c_type in ["LTXDirector", "PromptRelayEncode"] or any(k in inputs for k in ["local_prompts", "global_prompts", "global_prompt"]):
+                        
+                        # Apply Width/Height Dynamically
+                        if "custom_width" in inputs: inputs["custom_width"] = custom_w
+                        elif "width" in inputs: inputs["width"] = custom_w
+                        
+                        if "custom_height" in inputs: inputs["custom_height"] = custom_h
+                        elif "height" in inputs: inputs["height"] = custom_h
+                        
+                        # Apply Durations Dynamically
                         if total_frames > 0:  
-                            node_data["inputs"]["duration_frames"] = total_frames
-                            node_data["inputs"]["duration_seconds"] = exact_audio_duration
+                            if "duration_frames" in inputs: inputs["duration_frames"] = total_frames
+                            if "length" in inputs: inputs["length"] = total_frames
+                            if "duration_seconds" in inputs: inputs["duration_seconds"] = exact_audio_duration
                             
-                            user_text = scene_data.get("dialog_text", "")
-                            has_char_2 = bool(scene_data.get("image2_url"))
-                            
-                            # 🔥 FIX: Timeline Gap Crash Prevention
-                            # We inject a 5.0-second buffer into the text shots to guarantee 
-                            # the prompt timeline ALWAYS exceeds the actual canvas duration.
-                            if "Shot 1" not in user_text: 
-                                if has_char_2:
-                                    half_time_1 = float(exact_audio_duration) / 2.0
-                                    half_time_2 = (float(exact_audio_duration) - half_time_1) + 5.0
-                                    
-                                    spk1_txt = scene_data.get("speaker1_text", "I have told you everything I know.")
-                                    spk2_txt = scene_data.get("speaker2_text", "You are holding back.")
-                                    formatted_prompt = (
-                                        f"[Characters]\nCharA: Person one.\nCharB: Person two.\n|\n"
-                                        f"Shot 1 (Medium Shot, {half_time_1:.3f}s):\nCharA: {spk1_txt}\n|\n"
-                                        f"Shot 2 (Medium Shot, {half_time_2:.3f}s):\nCharB: {spk2_txt}"
-                                    )
-                                    node_data["inputs"]["global_prompt"] = formatted_prompt
+                        user_text = scene_data.get("dialog_text", "").strip()
+                        has_char_2 = bool(scene_data.get("image2_url"))
+                        
+                        # Format the Prompt with Timeline Protections
+                        if "Shot 1" not in user_text: 
+                            buffered_duration = float(exact_audio_duration) + 5.0
+                            if has_char_2:
+                                half_time_1 = float(exact_audio_duration) / 2.0
+                                half_time_2 = (float(exact_audio_duration) - half_time_1) + 5.0
+                                spk1_txt = scene_data.get("speaker1_text", "Speaking.")
+                                spk2_txt = scene_data.get("speaker2_text", "Responding.")
+                                
+                                if "[Scene]" in user_text:
+                                    formatted_prompt = f"{user_text}\n|\nShot 1 (Medium Shot, {half_time_1:.3f}s):\nSpeaker A: {spk1_txt}\n|\nShot 2 (Medium Shot, {half_time_2:.3f}s):\nSpeaker B: {spk2_txt}"
                                 else:
-                                    buffered_duration = float(exact_audio_duration) + 5.0
-                                    formatted_prompt = f"[Scene] Cinematic visual.\n|\nShot 1 (Medium Shot, {buffered_duration:.3f}s):\nCharacter: {user_text}"
-                                    node_data["inputs"]["global_prompt"] = formatted_prompt
+                                    formatted_prompt = f"[Scene] Cinematic visual.\n[Characters]\nSpeaker A: Char 1.\nSpeaker B: Char 2.\n|\nShot 1 (Medium Shot, {half_time_1:.3f}s):\nSpeaker A: {spk1_txt}\n|\nShot 2 (Medium Shot, {half_time_2:.3f}s):\nSpeaker B: {spk2_txt}"
                             else:
-                                node_data["inputs"]["global_prompt"] = user_text
+                                if "[Scene]" in user_text:
+                                    formatted_prompt = f"{user_text}\n|\nShot 1 (Medium Shot, {buffered_duration:.3f}s):\nSpeaker: Character speaks naturally."
+                                else:
+                                    formatted_prompt = f"[Scene] Cinematic visual.\n[Characters]\nSpeaker: A person.\n|\nShot 1 (Medium Shot, {buffered_duration:.3f}s):\nSpeaker: {user_text}"
+                        else:
+                            formatted_prompt = user_text
+                            
+                        # 🔥 THE FIX: Inject into Whichever Key Exists
+                        if "local_prompts" in inputs: inputs["local_prompts"] = formatted_prompt
+                        elif "global_prompts" in inputs: inputs["global_prompts"] = formatted_prompt
+                        elif "global_prompt" in inputs: inputs["global_prompt"] = formatted_prompt
+                        elif "text" in inputs: inputs["text"] = formatted_prompt
                                 
                     elif c_type == "FL_CosyVoice3_Dialog":
-                        node_data["inputs"]["dialog_text"] = scene_data.get("dialog_text", "SPEAKER A: Hello.")
-                        node_data["inputs"]["seed"] = scene_data.get("seed", int(time.time() * 1000) % 1000000)
+                        inputs["dialog_text"] = scene_data.get("dialog_text", "SPEAKER A: Hello.")
+                        inputs["seed"] = scene_data.get("seed", int(time.time() * 1000) % 1000000)
                         
+                    # 🚀 AUDIO OVERRIDE (SCANNING ALL POSSIBLE AUDIO KEYS)
                     elif c_type == "LoadAudio":
                         audio_node_counter += 1
-                        if audio_node_counter == 1: node_data["inputs"]["audio"] = f"dynamic_guides/spk1_{idx}.wav"
-                        else: node_data["inputs"]["audio"] = f"dynamic_guides/spk2_{idx}.wav"
+                        target_aud = f"dynamic_guides/spk1_{idx}.wav" if audio_node_counter == 1 else f"dynamic_guides/spk2_{idx}.wav"
+                        
+                        if "audio_path" in inputs: inputs["audio_path"] = target_aud
+                        elif "audio" in inputs: inputs["audio"] = target_aud
+                        else: inputs["audio"] = target_aud  # Fallback
                             
+                    # 🚀 IMAGE OVERRIDE (SCANNING ALL POSSIBLE IMAGE KEYS)
                     elif c_type == "LoadImage":
                         image_node_counter += 1
-                        if image_node_counter == 1: node_data["inputs"]["image"] = f"dynamic_guides/char1_{idx}.png"
-                        else: node_data["inputs"]["image"] = f"dynamic_guides/char2_{idx}.png"
+                        target_img = f"dynamic_guides/char1_{idx}.png" if image_node_counter == 1 else f"dynamic_guides/char2_{idx}.png"
+                        
+                        if "image_path" in inputs: inputs["image_path"] = target_img
+                        elif "image" in inputs: inputs["image"] = target_img
+                        elif "image_url" in inputs: inputs["image_url"] = target_img
+                        else: inputs["image"] = target_img # Fallback
                             
                     elif c_type == "RandomNoise":
-                        node_data["inputs"]["noise_seed"] = scene_data.get("seed", int(time.time() * 1000) % 1000000)
+                        inputs["noise_seed"] = scene_data.get("seed", int(time.time() * 1000) % 1000000)
                     elif c_type == "VHS_VideoCombine":
-                        node_data["inputs"]["save_output"] = True
+                        inputs["save_output"] = True
                 return sg
 
             try:
@@ -505,7 +527,6 @@ except Exception: pass
                         total_frames = (math.ceil(int(estimated_seconds * 25) / 8) * 8) + 1
                         if total_frames > 257: total_frames = 257 
                             
-                        # 🔥 FIX: Restored raw floating-point calculation without truncation rounding
                         exact_audio_duration = float(total_frames - 1) / 25.0
 
                         sg1 = json.loads(json.dumps(subgraph_1))

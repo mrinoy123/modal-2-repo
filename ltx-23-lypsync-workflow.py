@@ -34,7 +34,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "506"  # Updated for Director Workflow
+    "FORCE_REBUILD_INDEX": "506"  # Updated to clear cache for the FLOAT type fix
 })
 
 build_image = base_image.env({
@@ -157,7 +157,7 @@ class MemoryCacheWriter:
             "video_latent": ("LATENT",),
             "audio_latent": ("LATENT",),
             "guide_data": ("GUIDE_DATA",),
-            "frame_rate": ("INT",)
+            "frame_rate": ("FLOAT",) # 🔥 FIX: Changed from INT to FLOAT
         }, "optional": {
             "scene_id": ("STRING", {"default": "0"})
         }}
@@ -184,7 +184,8 @@ class MemoryCacheReader:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {}, "optional": {"scene_id": ("STRING", {"default": "0"})}}
-    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "LATENT", "GUIDE_DATA", "INT")
+    # 🔥 FIX: Changed the last return type from "INT" to "FLOAT"
+    RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "LATENT", "GUIDE_DATA", "FLOAT")
     RETURN_NAMES = ("model", "positive", "negative", "video_latent", "audio_latent", "guide_data", "frame_rate")
     FUNCTION = "read_cache"
     CATEGORY = "LTXBatch"

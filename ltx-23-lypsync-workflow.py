@@ -34,7 +34,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "506"  # Updated to clear cache for the FLOAT type fix
+    "FORCE_REBUILD_INDEX": "506"  # Cache bump for latest script logic
 })
 
 build_image = base_image.env({
@@ -157,7 +157,7 @@ class MemoryCacheWriter:
             "video_latent": ("LATENT",),
             "audio_latent": ("LATENT",),
             "guide_data": ("GUIDE_DATA",),
-            "frame_rate": ("FLOAT",) # 🔥 FIX: Changed from INT to FLOAT
+            "frame_rate": ("FLOAT",)
         }, "optional": {
             "scene_id": ("STRING", {"default": "0"})
         }}
@@ -184,7 +184,6 @@ class MemoryCacheReader:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {}, "optional": {"scene_id": ("STRING", {"default": "0"})}}
-    # 🔥 FIX: Changed the last return type from "INT" to "FLOAT"
     RETURN_TYPES = ("MODEL", "CONDITIONING", "CONDITIONING", "LATENT", "LATENT", "GUIDE_DATA", "FLOAT")
     RETURN_NAMES = ("model", "positive", "negative", "video_latent", "audio_latent", "guide_data", "frame_rate")
     FUNCTION = "read_cache"
@@ -232,7 +231,6 @@ except Exception: pass
         print("🔗 Running Atomic Model Folder Linker for ALL LTX 2.3 & Audio Dependencies...")
         base_models_dir = "/workspace/ComfyUI/models"
         
-        # Ensure upscale_models and latent_upscale_models are properly mapped
         dirs = [
             "unet", "vae", "clip", "text_encoders", "checkpoints", "loras", 
             "upscale_models", "latent_upscale_models", "cosyvoice", 
@@ -249,13 +247,12 @@ except Exception: pass
                     if not filename.endswith((".safetensors", ".gguf", ".pth", ".pt", ".bin", ".onnx", ".yaml", ".json")): continue
                     src_path = os.path.join(root_dir, filename)
                     
-                    # Direct mapping logic for Upscalers / Checkpoints / Lora
                     if "spatial-upscaler" in filename.lower():
                         dest = os.path.join(base_models_dir, "latent_upscale_models", filename)
                     elif "lora" in filename.lower() or "talking_head" in filename.lower():
                         dest = os.path.join(base_models_dir, "loras", filename)
                     else:
-                        dest = os.path.join(base_models_dir, "checkpoints", filename) # fallback
+                        dest = os.path.join(base_models_dir, "checkpoints", filename)
                         
                     for target_dir in dirs:
                         if target_dir == "cosyvoice": continue 
@@ -373,7 +370,6 @@ except Exception: pass
             ram_task = asyncio.create_task(self._ram_squeezer())
             generated_outputs = []
 
-            # 🔥 NEW INJECTION LOGIC DYNAMICALLY ROUTES 1 OR 2 IMAGES/CHARACTERS
             def inject_node_overrides(sg, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene_data):
                 audio_node_counter = 0
                 image_node_counter = 0
@@ -413,27 +409,27 @@ except Exception: pass
                             node_data["inputs"]["duration_frames"] = total_frames
                             node_data["inputs"]["duration_seconds"] = exact_audio_duration
                             
-                            # 🔥 DYNAMIC 1 vs 2 CHARACTER PROMPT BUILDER
                             user_text = scene_data.get("dialog_text", "")
                             has_char_2 = bool(scene_data.get("image2_url"))
                             
+                            # 🔥 FIX: 1-Person vs 2-Person Prompt Logic
                             if "Shot 1" not in user_text: 
                                 if has_char_2:
-                                    # Formats for 2 character conversation - splitting the time equally
-                                    half_time = exact_audio_duration / 2.0
+                                    # 2 Character (Splits time precisely to avoid gaps)
+                                    half_time_1 = round(exact_audio_duration / 2.0, 2)
+                                    half_time_2 = round(exact_audio_duration - half_time_1, 2)
                                     spk1_txt = scene_data.get("speaker1_text", "I have told you everything I know.")
                                     spk2_txt = scene_data.get("speaker2_text", "You are holding back.")
                                     formatted_prompt = (
                                         f"[Characters]\nCharA: Person one.\nCharB: Person two.\n|\n"
-                                        f"Shot 1 (Medium Shot, {half_time:.2f}s):\nCharA: {spk1_txt}\n|\n"
-                                        f"Shot 2 (Medium Shot, {half_time:.2f}s):\nCharB: {spk2_txt}"
+                                        f"Shot 1 (Medium Shot, {half_time_1:.2f}s):\nCharA: {spk1_txt}\n|\n"
+                                        f"Shot 2 (Medium Shot, {half_time_2:.2f}s):\nCharB: {spk2_txt}"
                                     )
+                                    node_data["inputs"]["global_prompt"] = formatted_prompt
                                 else:
-                                    # Formats for single character monologue
-                                    formatted_prompt = f"[Scene] Cinematic talking portrait.\n|\nShot 1 (Medium Shot, {exact_audio_duration:.2f}s):\nCharacter: {user_text}"
-                                node_data["inputs"]["global_prompt"] = formatted_prompt
+                                    # 🔥 For 1 character: Just pass plain text! Bypasses the strict timeline parser!
+                                    node_data["inputs"]["global_prompt"] = user_text
                             else:
-                                # Uses exactly what you pass if it's pre-formatted
                                 node_data["inputs"]["global_prompt"] = user_text
                                 
                     elif c_type == "FL_CosyVoice3_Dialog":
@@ -442,18 +438,13 @@ except Exception: pass
                         
                     elif c_type == "LoadAudio":
                         audio_node_counter += 1
-                        if audio_node_counter == 1: 
-                            node_data["inputs"]["audio"] = f"dynamic_guides/spk1_{idx}.wav"
-                        else: 
-                            node_data["inputs"]["audio"] = f"dynamic_guides/spk2_{idx}.wav"
+                        if audio_node_counter == 1: node_data["inputs"]["audio"] = f"dynamic_guides/spk1_{idx}.wav"
+                        else: node_data["inputs"]["audio"] = f"dynamic_guides/spk2_{idx}.wav"
                             
                     elif c_type == "LoadImage":
-                        # Sequentially pairs images: Char 1 -> First Node, Char 2 -> Second Node
                         image_node_counter += 1
-                        if image_node_counter == 1: 
-                            node_data["inputs"]["image"] = f"dynamic_guides/char1_{idx}.png"
-                        else: 
-                            node_data["inputs"]["image"] = f"dynamic_guides/char2_{idx}.png"
+                        if image_node_counter == 1: node_data["inputs"]["image"] = f"dynamic_guides/char1_{idx}.png"
+                        else: node_data["inputs"]["image"] = f"dynamic_guides/char2_{idx}.png"
                             
                     elif c_type == "RandomNoise":
                         node_data["inputs"]["noise_seed"] = scene_data.get("seed", int(time.time() * 1000) % 1000000)

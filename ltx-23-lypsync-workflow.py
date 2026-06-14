@@ -65,10 +65,7 @@ clone_image = torch_image.run_commands(
     "git clone --depth 1 https://github.com/Lightricks/ComfyUI-LTXVideo.git /workspace/ComfyUI/custom_nodes/ComfyUI-LTXVideo",
     "git clone --depth 1 https://github.com/WhatDreamsCost/WhatDreamsCost-ComfyUI.git /workspace/ComfyUI/custom_nodes/WhatDreamsCost-ComfyUI",
     "git clone --depth 1 https://github.com/kijai/ComfyUI-KJNodes.git /workspace/ComfyUI/custom_nodes/ComfyUI-KJNodes",
-    
-    # FIX IS HERE: Added the destination path!
     "git clone --depth 1 https://github.com/yolain/ComfyUI-Easy-Use.git /workspace/ComfyUI/custom_nodes/ComfyUI-Easy-Use",
-    
     "git clone --depth 1 https://github.com/Deno2026/comfyui-deno-custom-nodes.git /workspace/ComfyUI/custom_nodes/comfyui-deno-custom-nodes",
     "git clone --depth 1 https://github.com/kijai/ComfyUI-MelBandRoFormer.git /workspace/ComfyUI/custom_nodes/ComfyUI-MelBandRoFormer",
     "git clone --depth 1 https://github.com/filliptm/ComfyUI_FL-CosyVoice3.git /workspace/ComfyUI/custom_nodes/ComfyUI_FL-CosyVoice3",
@@ -295,7 +292,8 @@ except Exception: pass
         env_vars = os.environ.copy()
         env_vars["LD_PRELOAD"] = "/usr/lib/x86_64-linux-gnu/libtcmalloc.so.4"
         env_vars["TORCH_NUM_THREADS"] = "1"
-        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8,max_split_size_mb:64"
+        # FIX 1: Removed max_split_size_mb:64 to allow VAE to decode 257 frames without OOMing
+        env_vars["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,garbage_collection_threshold:0.8"
         env_vars["CUDA_MODULE_LOADING"] = "LAZY" 
         
         self.process = subprocess.Popen([
@@ -393,32 +391,7 @@ except Exception: pass
             def inject_node_overrides(sg, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene_data):
                 is_subgraph_1 = total_frames > 0  
 
-                # 🚀 DYNAMIC AUDIO LATENT MASKING (Prevents Static Noise Output)
-                # Injects the solid 0-mask directly before writing to the cache
-                if is_subgraph_1:
-                    writer_id = None
-                    for n_id, n_data in sg.items():
-                        if n_data.get("class_type") == "MemoryCacheWriter":
-                            writer_id = n_id
-                            break
-                    if writer_id and "audio_latent" in sg[writer_id]["inputs"]:
-                        audio_link = sg[writer_id]["inputs"]["audio_latent"]
-                        # Create Mask
-                        sg["9998_solid_mask"] = {
-                            "class_type": "SolidMask",
-                            "inputs": {"value": 0, "width": custom_w, "height": custom_h}
-                        }
-                        # Apply Mask
-                        sg["9997_audio_mask"] = {
-                            "class_type": "SetLatentNoiseMask",
-                            "inputs": {
-                                "samples": audio_link,
-                                "mask": ["9998_solid_mask", 0]
-                            }
-                        }
-                        # Reroute Cache Writer to Masked Latent
-                        sg[writer_id]["inputs"]["audio_latent"] = ["9997_audio_mask", 0]
-
+                # FIX 2: Entire dynamic audio latent masking logic deleted from here.
                 # Standard Overrides
                 for node_id, node_data in list(sg.items()):
                     c_type = node_data.get("class_type")

@@ -34,7 +34,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "506"  # Cache bump for Dynamic API Key Scanner
+    "FORCE_REBUILD_INDEX": "506"  # Cache bump for updated pointer mechanics
 })
 
 build_image = base_image.env({
@@ -120,31 +120,26 @@ class LTX23DirectorLypsyncEngine:
     def start_comfy(self):
         import boto3
         
-        print("🎨 Building Strictly Pointer-Pass Memory Nodes...")
+        print("🎨 Building Strictly CPU-Bound Pointer-Pass Memory Nodes...")
         os.makedirs("/workspace/ComfyUI/custom_nodes/LTXCustomPipeline", exist_ok=True)
         custom_nodes_path = "/workspace/ComfyUI/custom_nodes/LTXCustomPipeline/__init__.py"
         with open(custom_nodes_path, "w") as f:
             f.write("""
 import torch
-import torchvision.transforms.functional as TF
 import nodes
-import comfy.utils
-import comfy.samplers
-import comfy.model_patcher
 
 LTX_CACHE = {}
 
-def move_to_cuda(item):
+# Recursively moves all underlying ComfyUI tensors cleanly to CPU
+def move_to_device(item, device="cpu"):
     if isinstance(item, torch.Tensor): 
-        return item.to("cuda").contiguous()
-    if isinstance(item, dict): 
-        new_dict = type(item)()
-        for k, v in item.items(): new_dict[k] = move_to_cuda(v)
-        return new_dict
-    if isinstance(item, list): 
-        return type(item)(move_to_cuda(v) for v in item)
-    if isinstance(item, tuple): 
-        return type(item)(move_to_cuda(v) for v in item)
+        return item.to(device)
+    elif isinstance(item, dict): 
+        return {k: move_to_device(v, device) for k, v in item.items()}
+    elif isinstance(item, list): 
+        return [move_to_device(v, device) for v in item]
+    elif isinstance(item, tuple): 
+        return tuple(move_to_device(v, device) for v in item)
     return item
 
 class MemoryCacheWriter:
@@ -168,16 +163,17 @@ class MemoryCacheWriter:
 
     def write_cache(self, model, positive, negative, video_latent, audio_latent, guide_data, frame_rate, scene_id="0"):
         global LTX_CACHE
+        # Caching natively as CPU objects prevents ComfyUI wrapper_CUDA_cat device mismatches!
         LTX_CACHE[str(scene_id)] = {
             "model": model,
-            "positive": positive,
-            "negative": negative,
-            "video_latent": video_latent,
-            "audio_latent": audio_latent,
-            "guide_data": guide_data,
+            "positive": move_to_device(positive, "cpu"),
+            "negative": move_to_device(negative, "cpu"),
+            "video_latent": move_to_device(video_latent, "cpu"),
+            "audio_latent": move_to_device(audio_latent, "cpu"),
+            "guide_data": move_to_device(guide_data, "cpu"),
             "frame_rate": frame_rate
         }
-        print(f"[LTX Cache] 💾 Saved Scene {scene_id} pointers securely.")
+        print(f"[LTX Cache] 💾 Saved Scene {scene_id} pointers securely on CPU.")
         return ()
 
 class MemoryCacheReader:
@@ -193,13 +189,13 @@ class MemoryCacheReader:
         global LTX_CACHE
         data = LTX_CACHE.get(str(scene_id))
         if data is None: raise ValueError(f"Cache for Scene {scene_id} not found in RAM!")
-        print(f"[LTX Cache] 📂 Loaded Scene {scene_id}.")
+        print(f"[LTX Cache] 📂 Loaded Scene {scene_id} from CPU storage.")
         return (
             data["model"], 
-            move_to_cuda(data["positive"]), 
-            move_to_cuda(data["negative"]), 
-            move_to_cuda(data["video_latent"]), 
-            move_to_cuda(data["audio_latent"]),
+            data["positive"], 
+            data["negative"], 
+            data["video_latent"], 
+            data["audio_latent"],
             data["guide_data"],
             data["frame_rate"]
         )
@@ -231,7 +227,6 @@ except Exception: pass
         print("🔗 Running Atomic Model Folder Linker for ALL LTX 2.3 & Audio Dependencies...")
         base_models_dir = "/workspace/ComfyUI/models"
         
-        # Ensure upscale_models and latent_upscale_models are properly mapped
         dirs = [
             "unet", "vae", "clip", "text_encoders", "checkpoints", "loras", 
             "upscale_models", "latent_upscale_models", "cosyvoice", 
@@ -240,7 +235,6 @@ except Exception: pass
         ]
         for d in dirs: os.makedirs(os.path.join(base_models_dir, d), exist_ok=True)
 
-        # Mapping canonical storage to ComfyUI hierarchy
         if os.path.exists("/mnt/weights/canonical_storage"):
             for root_dir, _, files in os.walk("/mnt/weights/canonical_storage"):
                 if "cosyvoice3" in root_dir.split(os.sep): continue 
@@ -248,13 +242,12 @@ except Exception: pass
                     if not filename.endswith((".safetensors", ".gguf", ".pth", ".pt", ".bin", ".onnx", ".yaml", ".json")): continue
                     src_path = os.path.join(root_dir, filename)
                     
-                    # Direct mapping logic for Upscalers / Checkpoints / Lora
                     if "spatial-upscaler" in filename.lower():
                         dest = os.path.join(base_models_dir, "latent_upscale_models", filename)
                     elif "lora" in filename.lower() or "talking_head" in filename.lower():
                         dest = os.path.join(base_models_dir, "loras", filename)
                     else:
-                        dest = os.path.join(base_models_dir, "checkpoints", filename) # fallback
+                        dest = os.path.join(base_models_dir, "checkpoints", filename) 
                         
                     for target_dir in dirs:
                         if target_dir == "cosyvoice": continue 
@@ -344,7 +337,7 @@ except Exception: pass
             await asyncio.sleep(1)
 
     # ==============================================================================
-    # PART 6: LYPSYNC FAST-BATCH ENDPOINT (DYNAMIC KEY SCANNER INTEGRATED)
+    # PART 6: LYPSYNC FAST-BATCH ENDPOINT
     # ==============================================================================
     @modal.fastapi_endpoint(method="POST")
     async def generate(self, request: Request, x_api_key: Optional[str] = Header(None)):
@@ -372,7 +365,6 @@ except Exception: pass
             ram_task = asyncio.create_task(self._ram_squeezer())
             generated_outputs = []
 
-            # 🔥 DYNAMIC INJECTION LOGIC THAT SCANS FOR CORRECT JSON KEYS
             def inject_node_overrides(sg, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene_data):
                 audio_node_counter = 0
                 image_node_counter = 0
@@ -405,17 +397,13 @@ except Exception: pass
                     elif c_type in ["MemoryCacheWriter", "MemoryCacheReader"]:
                         inputs["scene_id"] = str(idx)
                         
-                    # 🚀 DIRECTOR / RELAY OVERRIDE (SCANNING ALL POSSIBLE PROMPT KEYS)
                     elif c_type in ["LTXDirector", "PromptRelayEncode"] or any(k in inputs for k in ["local_prompts", "global_prompts", "global_prompt"]):
-                        
-                        # Apply Width/Height Dynamically
                         if "custom_width" in inputs: inputs["custom_width"] = custom_w
                         elif "width" in inputs: inputs["width"] = custom_w
                         
                         if "custom_height" in inputs: inputs["custom_height"] = custom_h
                         elif "height" in inputs: inputs["height"] = custom_h
                         
-                        # Apply Durations Dynamically
                         if total_frames > 0:  
                             if "duration_frames" in inputs: inputs["duration_frames"] = total_frames
                             if "length" in inputs: inputs["length"] = total_frames
@@ -424,7 +412,6 @@ except Exception: pass
                         user_text = scene_data.get("dialog_text", "").strip()
                         has_char_2 = bool(scene_data.get("image2_url"))
                         
-                        # Format the Prompt with Timeline Protections
                         if "Shot 1" not in user_text: 
                             buffered_duration = float(exact_audio_duration) + 5.0
                             if has_char_2:
@@ -445,7 +432,6 @@ except Exception: pass
                         else:
                             formatted_prompt = user_text
                             
-                        # 🔥 THE FIX: Inject into Whichever Key Exists
                         if "local_prompts" in inputs: inputs["local_prompts"] = formatted_prompt
                         elif "global_prompts" in inputs: inputs["global_prompts"] = formatted_prompt
                         elif "global_prompt" in inputs: inputs["global_prompt"] = formatted_prompt
@@ -455,16 +441,14 @@ except Exception: pass
                         inputs["dialog_text"] = scene_data.get("dialog_text", "SPEAKER A: Hello.")
                         inputs["seed"] = scene_data.get("seed", int(time.time() * 1000) % 1000000)
                         
-                    # 🚀 AUDIO OVERRIDE (SCANNING ALL POSSIBLE AUDIO KEYS)
                     elif c_type == "LoadAudio":
                         audio_node_counter += 1
                         target_aud = f"dynamic_guides/spk1_{idx}.wav" if audio_node_counter == 1 else f"dynamic_guides/spk2_{idx}.wav"
                         
                         if "audio_path" in inputs: inputs["audio_path"] = target_aud
                         elif "audio" in inputs: inputs["audio"] = target_aud
-                        else: inputs["audio"] = target_aud  # Fallback
+                        else: inputs["audio"] = target_aud
                             
-                    # 🚀 IMAGE OVERRIDE (SCANNING ALL POSSIBLE IMAGE KEYS)
                     elif c_type == "LoadImage":
                         image_node_counter += 1
                         target_img = f"dynamic_guides/char1_{idx}.png" if image_node_counter == 1 else f"dynamic_guides/char2_{idx}.png"
@@ -472,7 +456,7 @@ except Exception: pass
                         if "image_path" in inputs: inputs["image_path"] = target_img
                         elif "image" in inputs: inputs["image"] = target_img
                         elif "image_url" in inputs: inputs["image_url"] = target_img
-                        else: inputs["image"] = target_img # Fallback
+                        else: inputs["image"] = target_img
                             
                     elif c_type == "RandomNoise":
                         inputs["noise_seed"] = scene_data.get("seed", int(time.time() * 1000) % 1000000)
@@ -509,13 +493,33 @@ except Exception: pass
                     for idx, scene in enumerate(batch_scenes):
                         spk1_path = os.path.join(dynamic_guides_dir, f"spk1_{idx}.wav")
                         spk2_path = os.path.join(dynamic_guides_dir, f"spk2_{idx}.wav")
+                        img1_path = os.path.join(dynamic_guides_dir, f"char1_{idx}.png")
+                        img2_path = os.path.join(dynamic_guides_dir, f"char2_{idx}.png")
+
                         await download_asset(scene.get("speaker1_audio_url"), spk1_path)
                         await download_asset(scene.get("speaker2_audio_url"), spk2_path)
+                        
+                        # Moving Image Downloading out of Phase 2 logic purely into Phase 1 to ensure standard availability
+                        await download_asset(scene.get("image1_url"), img1_path)
+                        await download_asset(scene.get("image2_url"), img2_path)
                         
                         import soundfile as sf
                         import numpy as np 
                         for aud_p in [spk1_path, spk2_path]:
                             if not os.path.exists(aud_p): sf.write(aud_p, np.zeros(16000, dtype=np.float32), 16000)
+
+                        from PIL import Image
+                        if not os.path.exists(img1_path):
+                            Image.new('RGB', (custom_w, custom_h), color='black').save(img1_path)
+                        else:
+                            try: Image.open(img1_path).convert("RGB").resize((custom_w, custom_h), Image.Resampling.LANCZOS).save(img1_path)
+                            except Exception: Image.new('RGB', (custom_w, custom_h), color='black').save(img1_path)
+                            
+                        if os.path.exists(img2_path):
+                            try: Image.open(img2_path).convert("RGB").resize((custom_w, custom_h), Image.Resampling.LANCZOS).save(img2_path)
+                            except Exception: Image.new('RGB', (custom_w, custom_h), color='black').save(img2_path)
+                        else:
+                            Image.new('RGB', (custom_w, custom_h), color='black').save(img2_path)
 
                         dialog_text = scene.get("dialog_text", f"{scene.get('speaker1_text', '')} {scene.get('speaker2_text', '')}")
                         clean_text = re.sub(r'SPEAKER\s+[a-zA-Z0-9]+:', '', dialog_text)
@@ -534,7 +538,6 @@ except Exception: pass
 
                         print(f"🎬 Processing Audio & Text Cache for Scene {idx} (Frames: {total_frames}, Seconds: {exact_audio_duration:.3f})...")
                         await self.execute_comfy_workflow(session, sg1)
-
                         await self.clear_comfy_memory(session, unload_models=False)
 
                     print("\n🧹 Phase 1 Batch Complete. Clearing Address Spaces...")
@@ -546,26 +549,6 @@ except Exception: pass
                     os.makedirs(out_dir)
 
                     for idx, scene in enumerate(batch_scenes):
-                        # 🔥 DOWNLOAD BOTH IMAGES DYNAMICALLY
-                        img1_path = os.path.join(dynamic_guides_dir, f"char1_{idx}.png")
-                        img2_path = os.path.join(dynamic_guides_dir, f"char2_{idx}.png")
-                        
-                        await download_asset(scene.get("image1_url"), img1_path)
-                        await download_asset(scene.get("image2_url"), img2_path) # Fails silently if not provided
-                        
-                        from PIL import Image
-                        # Standardize Image 1 (Character A)
-                        if not os.path.exists(img1_path):
-                            Image.new('RGB', (custom_w, custom_h), color='black').save(img1_path)
-                        else:
-                            Image.open(img1_path).convert("RGB").resize((custom_w, custom_h), Image.Resampling.LANCZOS).save(img1_path)
-                            
-                        # Standardize Image 2 (Character B) -> Creates a blank fail-safe image if left empty by n8n
-                        if os.path.exists(img2_path):
-                            Image.open(img2_path).convert("RGB").resize((custom_w, custom_h), Image.Resampling.LANCZOS).save(img2_path)
-                        else:
-                            Image.new('RGB', (custom_w, custom_h), color='black').save(img2_path)
-                        
                         scene["seed"] = scene.get("seed", int(time.time() * 1000) % 1000000)
 
                         sg2 = json.loads(json.dumps(subgraph_2))

@@ -34,7 +34,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "506"  # Cache bump for LTXDirector syntax fix
+    "FORCE_REBUILD_INDEX": "506"  # Cache bump for LTXDirector timeline gap fix
 })
 
 build_image = base_image.env({
@@ -415,24 +415,25 @@ except Exception: pass
                             user_text = scene_data.get("dialog_text", "")
                             has_char_2 = bool(scene_data.get("image2_url"))
                             
-                            # 🔥 FIX: 1-Person vs 2-Person Prompt Logic
-                            # We MUST provide the Shot formatting so the Director Timeline parser knows where to map the prompt!
+                            # 🔥 FIX: Timeline Gap Crash Prevention
+                            # We inject a 5.0-second buffer into the text shots to guarantee 
+                            # the prompt timeline ALWAYS exceeds the actual canvas duration.
                             if "Shot 1" not in user_text: 
                                 if has_char_2:
-                                    # 2 Character (Splits time precisely to avoid gaps)
-                                    half_time_1 = round(exact_audio_duration / 2.0, 2)
-                                    half_time_2 = round(exact_audio_duration - half_time_1, 2)
+                                    half_time_1 = float(exact_audio_duration) / 2.0
+                                    half_time_2 = (float(exact_audio_duration) - half_time_1) + 5.0
+                                    
                                     spk1_txt = scene_data.get("speaker1_text", "I have told you everything I know.")
                                     spk2_txt = scene_data.get("speaker2_text", "You are holding back.")
                                     formatted_prompt = (
                                         f"[Characters]\nCharA: Person one.\nCharB: Person two.\n|\n"
-                                        f"Shot 1 (Medium Shot, {half_time_1:.2f}s):\nCharA: {spk1_txt}\n|\n"
-                                        f"Shot 2 (Medium Shot, {half_time_2:.2f}s):\nCharB: {spk2_txt}"
+                                        f"Shot 1 (Medium Shot, {half_time_1:.3f}s):\nCharA: {spk1_txt}\n|\n"
+                                        f"Shot 2 (Medium Shot, {half_time_2:.3f}s):\nCharB: {spk2_txt}"
                                     )
                                     node_data["inputs"]["global_prompt"] = formatted_prompt
                                 else:
-                                    # 🔥 1 Character: Requires 'Shot 1' wrapper to satisfy the Strict Parser!
-                                    formatted_prompt = f"[Scene] Cinematic visual.\n|\nShot 1 (Medium Shot, {exact_audio_duration:.2f}s):\nCharacter: {user_text}"
+                                    buffered_duration = float(exact_audio_duration) + 5.0
+                                    formatted_prompt = f"[Scene] Cinematic visual.\n|\nShot 1 (Medium Shot, {buffered_duration:.3f}s):\nCharacter: {user_text}"
                                     node_data["inputs"]["global_prompt"] = formatted_prompt
                             else:
                                 node_data["inputs"]["global_prompt"] = user_text
@@ -504,13 +505,13 @@ except Exception: pass
                         total_frames = (math.ceil(int(estimated_seconds * 25) / 8) * 8) + 1
                         if total_frames > 257: total_frames = 257 
                             
-                        # 🔥 Rounded exact_audio_duration to fix microscopic float mismatch error
-                        exact_audio_duration = round(float(total_frames - 1) / 25.0, 2)
+                        # 🔥 FIX: Restored raw floating-point calculation without truncation rounding
+                        exact_audio_duration = float(total_frames - 1) / 25.0
 
                         sg1 = json.loads(json.dumps(subgraph_1))
                         sg1 = inject_node_overrides(sg1, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene)
 
-                        print(f"🎬 Processing Audio & Text Cache for Scene {idx} (Frames: {total_frames}, Seconds: {exact_audio_duration:.2f})...")
+                        print(f"🎬 Processing Audio & Text Cache for Scene {idx} (Frames: {total_frames}, Seconds: {exact_audio_duration:.3f})...")
                         await self.execute_comfy_workflow(session, sg1)
 
                         await self.clear_comfy_memory(session, unload_models=False)

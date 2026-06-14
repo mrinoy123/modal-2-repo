@@ -34,7 +34,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "455"  # Bumped for Chunk Feed Forward & Audio Mask injection updates
+    "FORCE_REBUILD_INDEX": "461"  # Updated for dynamic frame calculation & 9:16 aspect ratio
 })
 
 build_image = base_image.env({
@@ -133,18 +133,18 @@ import comfy.model_patcher
 
 LTX_CACHE = {}
 
-# move_to_cpu safely maps pointers without destroying custom PromptRelay class identities
-def move_to_cpu(item):
+# Recursively maps raw tensors and lists back to safe CUDA device contexts securely
+def move_to_cuda(item):
     if isinstance(item, torch.Tensor): 
-        return item.cpu()
+        return item.to("cuda").contiguous()
     if isinstance(item, dict): 
         new_dict = type(item)()
-        for k, v in item.items(): new_dict[k] = move_to_cpu(v)
+        for k, v in item.items(): new_dict[k] = move_to_cuda(v)
         return new_dict
     if isinstance(item, list): 
-        return type(item)(move_to_cpu(v) for v in item)
+        return type(item)(move_to_cuda(v) for v in item)
     if isinstance(item, tuple): 
-        return type(item)(move_to_cpu(v) for v in item)
+        return type(item)(move_to_cuda(v) for v in item)
     return item
 
 class MemoryCacheWriter:
@@ -189,8 +189,16 @@ class MemoryCacheReader:
         global LTX_CACHE
         data = LTX_CACHE.get(str(scene_id))
         if data is None: raise ValueError(f"Cache for Scene {scene_id} not found in RAM!")
-        print(f"[LTX Cache] 📂 Loaded Scene {scene_id}. Routing Live Pointers to Sampler.")
-        return (data["model"], data["positive"], data["negative"], data["video_latent"], data["audio_latent"])
+        print(f"[LTX Cache] 📂 Loaded Scene {scene_id}. Re-aligning Device Contexts and Routing Contiguous Pointers.")
+        
+        # Explicitly enforce CUDA device assignment and data contiguity right before sampling
+        return (
+            data["model"], 
+            move_to_cuda(data["positive"]), 
+            move_to_cuda(data["negative"]), 
+            move_to_cuda(data["video_latent"]), 
+            move_to_cuda(data["audio_latent"])
+        )
 
 NODE_CLASS_MAPPINGS = {
     "MemoryCacheWriter": MemoryCacheWriter,
@@ -381,30 +389,7 @@ except Exception: pass
             def inject_node_overrides(sg, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene_data):
                 is_subgraph_1 = total_frames > 0  
 
-                # 🚀 1. DYNAMIC CHUNK FEED FORWARD INJECTION (Saves Massive VRAM)
-                # Ensure the graph has a Chunk FFN to prevent Attention OOMs.
-                if is_subgraph_1:
-                    has_chunk_node = any(n.get("class_type") == "LTXVChunkFeedForward" for n in sg.values())
-                    if not has_chunk_node:
-                        writer_id = None
-                        for n_id, n_data in sg.items():
-                            if n_data.get("class_type") == "MemoryCacheWriter":
-                                writer_id = n_id
-                                break
-                        if writer_id and "model" in sg[writer_id]["inputs"]:
-                            model_link = sg[writer_id]["inputs"]["model"]
-                            sg["9999_chunk_ff"] = {
-                                "class_type": "LTXVChunkFeedForward",
-                                "inputs": {
-                                    "chunks": 4, 
-                                    "dim_threshold": 4096,
-                                    "model": model_link
-                                }
-                            }
-                            # Reroute writer to use chunked model
-                            sg[writer_id]["inputs"]["model"] = ["9999_chunk_ff", 0]
-
-                # 🚀 2. DYNAMIC AUDIO LATENT MASKING (Prevents Static Noise Output)
+                # 🚀 DYNAMIC AUDIO LATENT MASKING (Prevents Static Noise Output)
                 # Injects the solid 0-mask directly before writing to the cache
                 if is_subgraph_1:
                     writer_id = None
@@ -417,7 +402,7 @@ except Exception: pass
                         # Create Mask
                         sg["9998_solid_mask"] = {
                             "class_type": "SolidMask",
-                            "inputs": {"value": 0, "width": 512, "height": 768}
+                            "inputs": {"value": 0, "width": custom_w, "height": custom_h}
                         }
                         # Apply Mask
                         sg["9997_audio_mask"] = {
@@ -430,14 +415,14 @@ except Exception: pass
                         # Reroute Cache Writer to Masked Latent
                         sg[writer_id]["inputs"]["audio_latent"] = ["9997_audio_mask", 0]
 
-                # 3. Standard Overrides
+                # Standard Overrides
                 for node_id, node_data in list(sg.items()):
                     c_type = node_data.get("class_type")
                     if "inputs" not in node_data: continue
                     
                     if c_type == "DiffusionModelLoaderKJ":
                         node_data["inputs"]["model_name"] = "ltx-2.3-22b-distilled-fp8.safetensors"
-                        node_data["inputs"]["patch_cublaslinear"] = False        
+                        node_data["inputs"]["patch_cublaslinear"] = False      
                         node_data["inputs"]["enable_fp16_accumulation"] = False 
 
                     elif c_type == "DualCLIPLoader":
@@ -452,9 +437,6 @@ except Exception: pass
                         node_data["inputs"]["vae_name"] = "LTX23_video_vae_bf16.safetensors"
                     elif c_type == "FL_CosyVoice3_ModelLoader":
                         node_data["inputs"]["model_version"] = "Fun-CosyVoice3-0.5B"
-                    elif c_type == "LTXVChunkFeedForward":
-                        node_data["inputs"]["chunks"] = 4
-                        node_data["inputs"]["dim_threshold"] = 4096
                     elif c_type == "DenoLTXMultiLoraLoader":
                         node_data["inputs"]["lora_1"] = "ltx-2.3-22b-distilled-lora-384-1.1.safetensors"
                         node_data["inputs"]["lora_2"] = "LTX2.3-IC-LORA-Dual-Character.safetensors"
@@ -495,9 +477,9 @@ except Exception: pass
 
             try:
                 async with aiohttp.ClientSession() as session:
-                    # ✅ ENFORCE SAFE DEFAULT RESOLUTION (Prevents OOM)
-                    custom_w = int(body.get("custom_width", 512)) 
-                    custom_h = int(body.get("custom_height", 768))
+                    # 🚀 ENFORCE THE OPTIMIZED 9:16 VERTICAL CANVAS AXIS ( clean divisible blocks of 32 )
+                    custom_w = 448 
+                    custom_h = 768
 
                     # 🌟 ROBUST DOWNLOAD ASSET FUNCTION (Extracts Boto3 Key even for Private Buckets)
                     async def download_asset(url, target_path):
@@ -550,28 +532,33 @@ except Exception: pass
                         dialog_text = scene.get("dialog_text", f"{scene.get('speaker1_text', '')} {scene.get('speaker2_text', '')}")
                         clean_text = re.sub(r'SPEAKER\s+[a-zA-Z0-9]+:', '', dialog_text)
                         
-                        # Calculate required length based on text
+                        # Dynamically calculate precise timing without hardcoded constraints
                         word_count = max(len(clean_text.split()), 1)
                         pauses = len(re.findall(r'[.,!?]', clean_text))
-                        estimated_seconds = max(min((word_count / 2.0) + (pauses * 0.4) + 1.5, 10.0), 3.0)
                         
+                        # Standard 2.5 words per second speech rate calculation
+                        estimated_seconds = max((word_count / 2.5) + (pauses * 0.4) + 1.0, 2.0)
+                        
+                        # Calculate temporal block depths cleanly matching LTX-Video 8-frame spacing
                         total_frames = (math.ceil(int(estimated_seconds * 25) / 8) * 8) + 1
                         
-                        # 🚀 MAXIMIZE SAFE FRAME COUNT (Prevents OOM)
-                        # With 4 chunks, an L40S 48GB can safely handle 257 frames (10.24 seconds) at 512x768.
                         if total_frames > 257: 
                             total_frames = 257 
-                        
+                            
                         exact_audio_duration = float(total_frames - 1) / 25.0
 
                         sg1 = json.loads(json.dumps(subgraph_1))
                         sg1 = inject_node_overrides(sg1, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene)
 
-                        print(f"🎬 Processing Audio & Text Cache for Scene {idx}...")
+                        print(f"🎬 Processing Audio & Text Cache for Scene {idx} (Frames: {total_frames}, Seconds: {exact_audio_duration:.2f})...")
                         await self.execute_comfy_workflow(session, sg1)
 
                         # 🚀 CRITICAL: DO NOT UNLOAD THE MODEL. Keep the UNet pointer alive in VRAM.
                         await self.clear_comfy_memory(session, unload_models=False)
+
+                    # 🚀 CRITICAL FLUSH BARRIER: Safely unloads audio loaders before tracking the main rendering matrix
+                    print("\n🧹 Phase 1 Batch Complete. Executing Hard VRAM Purge Barrier to clear address spaces...")
+                    await self.clear_comfy_memory(session, unload_models=True)
 
                     print(f"\n[Lypsync API] 🎥 STARTING PHASE 2: RENDERING {len(batch_scenes)} VIDEOS")
                     out_dir = "/workspace/ComfyUI/output"
@@ -585,6 +572,7 @@ except Exception: pass
                         if not os.path.exists(img1_path):
                             Image.new('RGB', (custom_w, custom_h), color='black').save(img1_path)
                         else:
+                            # Standardize disk assets cleanly to the 448x768 boundary grid
                             Image.open(img1_path).convert("RGB").resize((custom_w, custom_h), Image.Resampling.LANCZOS).save(img1_path)
                         
                         scene["seed"] = scene.get("seed", int(time.time() * 1000) % 1000000)

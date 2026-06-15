@@ -35,7 +35,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "506"  # Cache bump for Phase 0 Audio Pre-Pass Logic
+    "FORCE_REBUILD_INDEX": "511"  # Cache bump for CosyVoice Local Mapping & Voice Prompt Fix
 })
 
 build_image = base_image.env({
@@ -254,6 +254,21 @@ except Exception: pass
                             try: os.symlink(src_path, symlink_dest)
                             except FileExistsError: pass
 
+        # 🚨 FIX: Force Symlink the CosyVoice3 Folder to Prevent HuggingFace Downloads 🚨
+        cosy_src_1 = "/mnt/weights/cosyvoice3"
+        cosy_src_2 = "/mnt/weights/canonical_storage/cosyvoice3"
+        active_cosy_src = cosy_src_1 if os.path.exists(cosy_src_1) else (cosy_src_2 if os.path.exists(cosy_src_2) else None)
+        
+        if active_cosy_src:
+            dest_cosy = os.path.join(base_models_dir, "cosyvoice", "Fun-CosyVoice3-0.5B")
+            if not os.path.exists(dest_cosy):
+                try:
+                    os.makedirs(os.path.dirname(dest_cosy), exist_ok=True)
+                    os.symlink(active_cosy_src, dest_cosy)
+                    print(f"🔗 Mapped local CosyVoice3 models successfully from {active_cosy_src}")
+                except Exception as e:
+                    print(f"⚠️ Failed to link CosyVoice models: {e}")
+
         self.s3 = boto3.client(
             service_name='s3', 
             endpoint_url=f"https://{os.environ['R2_ACCOUNT_ID']}.r2.cloudflarestorage.com", 
@@ -365,7 +380,6 @@ except Exception: pass
 
             def inject_node_overrides(sg, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene_data):
                 audio_node_counter = 0
-                image_node_counter = 0
 
                 for node_id, node_data in list(sg.items()):
                     c_type = node_data.get("class_type", "")
@@ -392,48 +406,55 @@ except Exception: pass
                         inputs["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
                     elif c_type == "FL_CosyVoice3_ModelLoader":
                         inputs["model_version"] = "Fun-CosyVoice3-0.5B"
+                        inputs["download_source"] = "local" # 🚨 Force Local Loading
                     elif c_type in ["MemoryCacheWriter", "MemoryCacheReader"]:
                         inputs["scene_id"] = str(idx)
                         
-                    elif c_type in ["LTXDirector", "PromptRelayEncode"] or any(k in inputs for k in ["local_prompts", "global_prompts", "global_prompt"]):
-                        if "custom_width" in inputs: inputs["custom_width"] = custom_w
-                        elif "width" in inputs: inputs["width"] = custom_w
-                        
-                        if "custom_height" in inputs: inputs["custom_height"] = custom_h
-                        elif "height" in inputs: inputs["height"] = custom_h
-                        
+                    elif c_type == "LTXDirector":
+                        inputs["custom_width"] = custom_w
+                        inputs["custom_height"] = custom_h
                         if total_frames > 0:  
-                            if "duration_frames" in inputs: inputs["duration_frames"] = total_frames
-                            if "length" in inputs: inputs["length"] = total_frames
-                            if "duration_seconds" in inputs: inputs["duration_seconds"] = exact_audio_duration
+                            inputs["duration_frames"] = total_frames
+                            inputs["duration_seconds"] = exact_audio_duration
                             
-                        user_text = scene_data.get("dialog_text", "").strip()
+                        # INJECTING IMAGES DIRECTLY INTO LTX-DIRECTOR TIMELINE_DATA
                         has_char_2 = bool(scene_data.get("image2_url"))
+                        user_text = scene_data.get("dialog_text", "").strip()
                         
-                        # 🚨 THE MATHEMATICALLY PERFECT PROMPT ALIGNMENT 🚨
-                        if "Shot 1" not in user_text: 
-                            if has_char_2:
-                                half_time_1 = float(exact_audio_duration) / 2.0
-                                half_time_2 = float(exact_audio_duration) - half_time_1
-                                spk1_txt = scene_data.get("speaker1_text", "Speaking.")
-                                spk2_txt = scene_data.get("speaker2_text", "Responding.")
-                                
-                                if "[Scene]" in user_text:
-                                    formatted_prompt = f"{user_text}\n|\nShot 1 (Medium Shot, {half_time_1:.3f}s):\nSpeaker A: {spk1_txt}\n|\nShot 2 (Medium Shot, {half_time_2:.3f}s):\nSpeaker B: {spk2_txt}"
-                                else:
-                                    formatted_prompt = f"[Scene] Cinematic visual.\n[Characters]\nSpeaker A: Char 1.\nSpeaker B: Char 2.\n|\nShot 1 (Medium Shot, {half_time_1:.3f}s):\nSpeaker A: {spk1_txt}\n|\nShot 2 (Medium Shot, {half_time_2:.3f}s):\nSpeaker B: {spk2_txt}"
-                            else:
-                                if "[Scene]" in user_text:
-                                    formatted_prompt = f"{user_text}\n|\nShot 1 (Medium Shot, {exact_audio_duration:.3f}s):\nSpeaker: Character speaks naturally."
-                                else:
-                                    formatted_prompt = f"[Scene] Cinematic visual.\n[Characters]\nSpeaker: A person.\n|\nShot 1 (Medium Shot, {exact_audio_duration:.3f}s):\nSpeaker: {user_text}"
+                        segments = []
+                        if has_char_2:
+                            frames_1 = int(total_frames / 2)
+                            frames_2 = total_frames - frames_1
+                            segments.append({
+                                "id": "shot_1",
+                                "start": 0,
+                                "length": frames_1,
+                                "prompt": scene_data.get("speaker1_text", "Speaking."),
+                                "type": "image",
+                                "imageFile": f"dynamic_guides/char1_{idx}.png"
+                            })
+                            segments.append({
+                                "id": "shot_2",
+                                "start": frames_1,
+                                "length": frames_2,
+                                "prompt": scene_data.get("speaker2_text", "Responding."),
+                                "type": "image",
+                                "imageFile": f"dynamic_guides/char2_{idx}.png"
+                            })
+                            inputs["global_prompt"] = "[Scene] Cinematic visual.\n[Characters]\nSpeaker A: Char 1.\nSpeaker B: Char 2."
                         else:
-                            formatted_prompt = user_text
-                            
-                        if "local_prompts" in inputs: inputs["local_prompts"] = formatted_prompt
-                        elif "global_prompts" in inputs: inputs["global_prompts"] = formatted_prompt
-                        elif "global_prompt" in inputs: inputs["global_prompt"] = formatted_prompt
-                        elif "text" in inputs: inputs["text"] = formatted_prompt
+                            segments.append({
+                                "id": "shot_1",
+                                "start": 0,
+                                "length": total_frames,
+                                "prompt": user_text,
+                                "type": "image",
+                                "imageFile": f"dynamic_guides/char1_{idx}.png"
+                            })
+                            inputs["global_prompt"] = "[Scene] Cinematic visual.\n[Characters]\nSpeaker: A person."
+                        
+                        inputs["timeline_data"] = json.dumps({"segments": segments, "audioSegments": []})
+                        if "local_prompts" in inputs: inputs["local_prompts"] = ""
                                 
                     elif c_type == "FL_CosyVoice3_Dialog":
                         inputs["dialog_text"] = scene_data.get("dialog_text", "SPEAKER A: Hello.")
@@ -442,15 +463,12 @@ except Exception: pass
                     elif c_type == "LoadAudio":
                         audio_node_counter += 1
                         target_aud = f"dynamic_guides/spk1_{idx}.wav" if audio_node_counter == 1 else f"dynamic_guides/spk2_{idx}.wav"
-                        
                         if "audio_path" in inputs: inputs["audio_path"] = target_aud
                         elif "audio" in inputs: inputs["audio"] = target_aud
                         else: inputs["audio"] = target_aud
                             
                     elif c_type == "LoadImage":
-                        image_node_counter += 1
-                        target_img = f"dynamic_guides/char1_{idx}.png" if image_node_counter == 1 else f"dynamic_guides/char2_{idx}.png"
-                        
+                        target_img = f"dynamic_guides/char1_{idx}.png"
                         if "image_path" in inputs: inputs["image_path"] = target_img
                         elif "image" in inputs: inputs["image"] = target_img
                         elif "image_url" in inputs: inputs["image_url"] = target_img
@@ -461,7 +479,7 @@ except Exception: pass
                     elif c_type == "VHS_VideoCombine":
                         inputs["save_output"] = True
 
-                    # 🚨 SMART BYPASS FOR L40S VRAM LIMITS 🚨
+                    # SMART BYPASS FOR L40S VRAM LIMITS
                     elif c_type == "VAEDecode" and str(node_id) == "301":
                         if total_frames > 97 and "109" in sg:
                             print(f"[Dynamic Bypass] 🚨 Frame count ({total_frames}) exceeds L40S upscaler limits. Routing direct Base-Resolution decoding.", flush=True)
@@ -528,14 +546,17 @@ except Exception: pass
                             Image.new('RGB', (custom_w, custom_h), color='black').save(img2_path)
                             
                         # PHASE 0: Generate the Audio Independently First
-                        dialog_text = scene.get("dialog_text", f"{scene.get('speaker1_text', '')} {scene.get('speaker2_text', '')}")
+                        # 🚨 FIX: Extract ONLY the spoken dialogue for CosyVoice, ignoring the [Scene] tags
+                        audio_script = f"SPEAKER A: {scene.get('speaker1_text', '')}\nSPEAKER B: {scene.get('speaker2_text', '.')}".strip()
+                        
                         phase0_wf = {
-                          "4": { "class_type": "FL_CosyVoice3_ModelLoader", "inputs": { "model_version": "Fun-CosyVoice3-0.5B", "download_source": "HuggingFace", "device": "auto" } },
+                          "4": { "class_type": "FL_CosyVoice3_ModelLoader", "inputs": { "model_version": "Fun-CosyVoice3-0.5B", "download_source": "local", "device": "auto" } },
                           "20": { "class_type": "LoadAudio", "inputs": {"audio": f"dynamic_guides/spk1_{idx}.wav"} },
                           "21": { "class_type": "LoadAudio", "inputs": {"audio": f"dynamic_guides/spk2_{idx}.wav"} },
-                          "6": { "class_type": "FL_CosyVoice3_Dialog", "inputs": { "dialog_text": dialog_text, "speed": 1, "seed": scene.get("seed", 42), "model": ["4", 0], "speaker_A_Audio": ["20", 0], "speaker_B_Audio": ["21", 0] } },
+                          "6": { "class_type": "FL_CosyVoice3_Dialog", "inputs": { "dialog_text": audio_script, "speed": 1, "seed": scene.get("seed", 42), "model": ["4", 0], "speaker_A_Audio": ["20", 0], "speaker_B_Audio": ["21", 0] } },
                           "99": { "class_type": "SaveAudio", "inputs": { "audio": ["6", 0], "filename_prefix": f"raw_dialog_{idx}" } }
                         }
+                        
                         print(f"🎤 Running Isolated TTS pass for Scene {idx}...", flush=True)
                         await self.execute_comfy_workflow(session, phase0_wf)
                         
@@ -553,7 +574,7 @@ except Exception: pass
                         if total_frames > 257: total_frames = 257 
                         exact_audio_duration = float(total_frames - 1) / 25.0
                         
-                        # Pad/Trim Audio exactly to this exact duration to prevent tensor shape collapse
+                        # Pad/Trim Audio exactly to this duration to prevent tensor shape collapse
                         target_samples = int(exact_audio_duration * samplerate)
                         if len(data) > target_samples:
                             data = data[:target_samples]
@@ -576,7 +597,7 @@ except Exception: pass
                         
                         sg1 = json.loads(json.dumps(subgraph_1))
                         
-                        # 🚨 BYPASS COSYVOICE IN PHASE 1 TO USE THE PERFECT AUDIO 🚨
+                        # BYPASS COSYVOICE IN PHASE 1 TO USE THE PERFECT AUDIO
                         dialog_node_id = None
                         for nid, ndata in sg1.items():
                             if ndata.get("class_type") == "FL_CosyVoice3_Dialog":

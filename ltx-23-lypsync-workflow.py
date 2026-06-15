@@ -35,7 +35,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "511"  # Cache bump for CosyVoice Local Mapping & Voice Prompt Fix
+    "FORCE_REBUILD_INDEX": "512"  # Cache bump for strict local CosyVoice mapping
 })
 
 build_image = base_image.env({
@@ -222,7 +222,7 @@ try:
 except Exception: pass
 """)
 
-        print("🔗 Running Atomic Model Folder Linker for ALL LTX 2.3 & Audio Dependencies...")
+        print("🔗 Running Atomic Model Folder Linker for ALL LTX 2.3 Dependencies...")
         base_models_dir = "/workspace/ComfyUI/models"
         
         dirs = [
@@ -254,7 +254,8 @@ except Exception: pass
                             try: os.symlink(src_path, symlink_dest)
                             except FileExistsError: pass
 
-        # 🚨 FIX: Force Symlink the CosyVoice3 Folder to Prevent HuggingFace Downloads 🚨
+        # 🚨 FIX: Force Symlink the Entire CosyVoice3 Folder (Using the folder as the Model Version)
+        # The node searches for `/workspace/ComfyUI/models/cosyvoice/<model_version>/`
         cosy_src_1 = "/mnt/weights/cosyvoice3"
         cosy_src_2 = "/mnt/weights/canonical_storage/cosyvoice3"
         active_cosy_src = cosy_src_1 if os.path.exists(cosy_src_1) else (cosy_src_2 if os.path.exists(cosy_src_2) else None)
@@ -265,9 +266,9 @@ except Exception: pass
                 try:
                     os.makedirs(os.path.dirname(dest_cosy), exist_ok=True)
                     os.symlink(active_cosy_src, dest_cosy)
-                    print(f"🔗 Mapped local CosyVoice3 models successfully from {active_cosy_src}")
+                    print(f"🔗 Mapped local CosyVoice3 folder successfully from {active_cosy_src}")
                 except Exception as e:
-                    print(f"⚠️ Failed to link CosyVoice models: {e}")
+                    print(f"⚠️ Failed to link CosyVoice folder: {e}")
 
         self.s3 = boto3.client(
             service_name='s3', 
@@ -405,8 +406,9 @@ except Exception: pass
                     elif c_type == "LowVRAMLatentUpscaleModelLoader":
                         inputs["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
                     elif c_type == "FL_CosyVoice3_ModelLoader":
+                        # 🚨 THE FIX: Force the node to look for the symlinked folder name
                         inputs["model_version"] = "Fun-CosyVoice3-0.5B"
-                        inputs["download_source"] = "local" # 🚨 Force Local Loading
+                        inputs["download_source"] = "local" 
                     elif c_type in ["MemoryCacheWriter", "MemoryCacheReader"]:
                         inputs["scene_id"] = str(idx)
                         
@@ -546,7 +548,6 @@ except Exception: pass
                             Image.new('RGB', (custom_w, custom_h), color='black').save(img2_path)
                             
                         # PHASE 0: Generate the Audio Independently First
-                        # 🚨 FIX: Extract ONLY the spoken dialogue for CosyVoice, ignoring the [Scene] tags
                         audio_script = f"SPEAKER A: {scene.get('speaker1_text', '')}\nSPEAKER B: {scene.get('speaker2_text', '.')}".strip()
                         
                         phase0_wf = {

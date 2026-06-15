@@ -34,7 +34,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "506"  # Cache bump for updated pointer mechanics
+    "FORCE_REBUILD_INDEX": "506"  # Cache bump for Upscaler Bypass Logic
 })
 
 build_image = base_image.env({
@@ -173,7 +173,7 @@ class MemoryCacheWriter:
             "guide_data": move_to_device(guide_data, "cpu"),
             "frame_rate": frame_rate
         }
-        print(f"[LTX Cache] 💾 Saved Scene {scene_id} pointers securely on CPU.")
+        print(f"[LTX Cache] 💾 Saved Scene {scene_id} pointers securely on CPU.", flush=True)
         return ()
 
 class MemoryCacheReader:
@@ -189,7 +189,7 @@ class MemoryCacheReader:
         global LTX_CACHE
         data = LTX_CACHE.get(str(scene_id))
         if data is None: raise ValueError(f"Cache for Scene {scene_id} not found in RAM!")
-        print(f"[LTX Cache] 📂 Loaded Scene {scene_id} from CPU storage.")
+        print(f"[LTX Cache] 📂 Loaded Scene {scene_id} from CPU storage.", flush=True)
         return (
             data["model"], 
             data["positive"], 
@@ -462,6 +462,17 @@ except Exception: pass
                         inputs["noise_seed"] = scene_data.get("seed", int(time.time() * 1000) % 1000000)
                     elif c_type == "VHS_VideoCombine":
                         inputs["save_output"] = True
+
+                    # 🚨 SMART BYPASS FOR L40S VRAM LIMITS 🚨
+                    # L40S safely upscales ~97 frames. Anything more causes instant 80GB VRAM spikes.
+                    elif c_type == "VAEDecode" and str(node_id) == "301":
+                        if total_frames > 97 and "109" in sg:
+                            print(f"[Dynamic Bypass] 🚨 Frame count ({total_frames}) exceeds L40S upscaler limits. Routing direct Base-Resolution decoding.", flush=True)
+                            inputs["samples"] = ["109", 2]
+                    elif c_type == "LTXVAudioVAEDecode" and str(node_id) == "302":
+                        if total_frames > 97 and "108" in sg:
+                            inputs["samples"] = ["108", 1]
+
                 return sg
 
             try:
@@ -488,7 +499,7 @@ except Exception: pass
                         except Exception: pass
                         return False
 
-                    print(f"\n[Lypsync API] 🎙️ STARTING PHASE 1: DIRECTING & ENCODING {len(batch_scenes)} SCENES")
+                    print(f"\n[Lypsync API] 🎙️ STARTING PHASE 1: DIRECTING & ENCODING {len(batch_scenes)} SCENES", flush=True)
                     
                     for idx, scene in enumerate(batch_scenes):
                         spk1_path = os.path.join(dynamic_guides_dir, f"spk1_{idx}.wav")
@@ -498,8 +509,6 @@ except Exception: pass
 
                         await download_asset(scene.get("speaker1_audio_url"), spk1_path)
                         await download_asset(scene.get("speaker2_audio_url"), spk2_path)
-                        
-                        # Moving Image Downloading out of Phase 2 logic purely into Phase 1 to ensure standard availability
                         await download_asset(scene.get("image1_url"), img1_path)
                         await download_asset(scene.get("image2_url"), img2_path)
                         
@@ -536,14 +545,14 @@ except Exception: pass
                         sg1 = json.loads(json.dumps(subgraph_1))
                         sg1 = inject_node_overrides(sg1, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene)
 
-                        print(f"🎬 Processing Audio & Text Cache for Scene {idx} (Frames: {total_frames}, Seconds: {exact_audio_duration:.3f})...")
+                        print(f"🎬 Processing Audio & Text Cache for Scene {idx} (Frames: {total_frames}, Seconds: {exact_audio_duration:.3f})...", flush=True)
                         await self.execute_comfy_workflow(session, sg1)
                         await self.clear_comfy_memory(session, unload_models=False)
 
-                    print("\n🧹 Phase 1 Batch Complete. Clearing Address Spaces...")
+                    print("\n🧹 Phase 1 Batch Complete. Clearing Address Spaces...", flush=True)
                     await self.clear_comfy_memory(session, unload_models=True)
 
-                    print(f"\n[Lypsync API] 🎥 STARTING PHASE 2: BASE SAMPLING & UPSCALING {len(batch_scenes)} VIDEOS")
+                    print(f"\n[Lypsync API] 🎥 STARTING PHASE 2: BASE SAMPLING & UPSCALING {len(batch_scenes)} VIDEOS", flush=True)
                     out_dir = "/workspace/ComfyUI/output"
                     if os.path.exists(out_dir): shutil.rmtree(out_dir)
                     os.makedirs(out_dir)
@@ -551,10 +560,22 @@ except Exception: pass
                     for idx, scene in enumerate(batch_scenes):
                         scene["seed"] = scene.get("seed", int(time.time() * 1000) % 1000000)
 
-                        sg2 = json.loads(json.dumps(subgraph_2))
-                        sg2 = inject_node_overrides(sg2, idx, custom_w, custom_h, 0, 0, scene)
+                        # Recalculate duration & frames exclusively for Upscaler Bypass verification
+                        dialog_text = scene.get("dialog_text", f"{scene.get('speaker1_text', '')} {scene.get('speaker2_text', '')}")
+                        clean_text = re.sub(r'SPEAKER\s+[a-zA-Z0-9]+:', '', dialog_text)
+                        
+                        word_count = max(len(clean_text.split()), 1)
+                        pauses = len(re.findall(r'[.,!?]', clean_text))
+                        estimated_seconds = max((word_count / 2.5) + (pauses * 0.4) + 1.0, 2.0)
+                        
+                        total_frames = (math.ceil(int(estimated_seconds * 25) / 8) * 8) + 1
+                        if total_frames > 257: total_frames = 257 
+                        exact_audio_duration = float(total_frames - 1) / 25.0
 
-                        print(f"🎬 Rendering Video for Scene {idx} (Executing using Live Memory Pointer)...")
+                        sg2 = json.loads(json.dumps(subgraph_2))
+                        sg2 = inject_node_overrides(sg2, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene)
+
+                        print(f"🎬 Rendering Video for Scene {idx} (Executing using Live Memory Pointer)...", flush=True)
                         await self.execute_comfy_workflow(session, sg2)
                         await self.clear_comfy_memory(session, unload_models=False)
 
@@ -570,7 +591,7 @@ except Exception: pass
                         saved_filename = os.path.basename(target_video_file)
 
                         target_key = f"{date_folder}/lypsync_clips/{int(time.time())}_{scene.get('name', 'clip')}_{saved_filename}"
-                        print(f"📤 Syncing Finished Asset {idx} to R2...")
+                        print(f"📤 Syncing Finished Asset {idx} to R2...", flush=True)
                         await asyncio.get_event_loop().run_in_executor(None, self.s3.upload_file, target_video_file, "video-asset-files-storage-workflow", target_key)
                         
                         generated_outputs.append({
@@ -582,7 +603,7 @@ except Exception: pass
                         })
                         os.remove(target_video_file)
 
-                    print(f"\n[Lypsync API] 🎉 All Scenes Rendered. Pipeline Finished. Full Purge.")
+                    print(f"\n[Lypsync API] 🎉 All Scenes Rendered. Pipeline Finished. Full Purge.", flush=True)
                     await self.clear_comfy_memory(session, unload_models=True)
                     
                     return generated_outputs

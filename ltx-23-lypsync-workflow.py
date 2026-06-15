@@ -35,7 +35,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "512"  # Cache bump for strict local CosyVoice mapping
+    "FORCE_REBUILD_INDEX": "511"  # Cache bump for strict local CosyVoice mapping
 })
 
 build_image = base_image.env({

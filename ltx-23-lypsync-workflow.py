@@ -16,6 +16,7 @@ import base64
 import math
 import re
 import warnings
+import glob
 from urllib.parse import urlparse
 from fastapi import Request, Response, HTTPException, Header
 from fastapi.responses import StreamingResponse
@@ -34,7 +35,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "506"  # Cache bump for Upscaler Bypass Logic
+    "FORCE_REBUILD_INDEX": "506"  # Cache bump for Phase 0 Audio Pre-Pass Logic
 })
 
 build_image = base_image.env({
@@ -130,7 +131,6 @@ import nodes
 
 LTX_CACHE = {}
 
-# Recursively moves all underlying ComfyUI tensors cleanly to CPU
 def move_to_device(item, device="cpu"):
     if isinstance(item, torch.Tensor): 
         return item.to(device)
@@ -163,7 +163,6 @@ class MemoryCacheWriter:
 
     def write_cache(self, model, positive, negative, video_latent, audio_latent, guide_data, frame_rate, scene_id="0"):
         global LTX_CACHE
-        # Caching natively as CPU objects prevents ComfyUI wrapper_CUDA_cat device mismatches!
         LTX_CACHE[str(scene_id)] = {
             "model": model,
             "positive": move_to_device(positive, "cpu"),
@@ -209,7 +208,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MemoryCacheReader": "Memory Cache Reader"
 }
 
-# HACKS TO PREVENT CausalAudioAutoencoder DTYPE CRASHES 
 try:
     import comfy.ldm.lightricks.vae.causal_audio_autoencoder
     _orig_encode = comfy.ldm.lightricks.vae.causal_audio_autoencoder.CausalAudioAutoencoder.encode
@@ -412,11 +410,11 @@ except Exception: pass
                         user_text = scene_data.get("dialog_text", "").strip()
                         has_char_2 = bool(scene_data.get("image2_url"))
                         
+                        # 🚨 THE MATHEMATICALLY PERFECT PROMPT ALIGNMENT 🚨
                         if "Shot 1" not in user_text: 
-                            buffered_duration = float(exact_audio_duration) + 5.0
                             if has_char_2:
                                 half_time_1 = float(exact_audio_duration) / 2.0
-                                half_time_2 = (float(exact_audio_duration) - half_time_1) + 5.0
+                                half_time_2 = float(exact_audio_duration) - half_time_1
                                 spk1_txt = scene_data.get("speaker1_text", "Speaking.")
                                 spk2_txt = scene_data.get("speaker2_text", "Responding.")
                                 
@@ -426,9 +424,9 @@ except Exception: pass
                                     formatted_prompt = f"[Scene] Cinematic visual.\n[Characters]\nSpeaker A: Char 1.\nSpeaker B: Char 2.\n|\nShot 1 (Medium Shot, {half_time_1:.3f}s):\nSpeaker A: {spk1_txt}\n|\nShot 2 (Medium Shot, {half_time_2:.3f}s):\nSpeaker B: {spk2_txt}"
                             else:
                                 if "[Scene]" in user_text:
-                                    formatted_prompt = f"{user_text}\n|\nShot 1 (Medium Shot, {buffered_duration:.3f}s):\nSpeaker: Character speaks naturally."
+                                    formatted_prompt = f"{user_text}\n|\nShot 1 (Medium Shot, {exact_audio_duration:.3f}s):\nSpeaker: Character speaks naturally."
                                 else:
-                                    formatted_prompt = f"[Scene] Cinematic visual.\n[Characters]\nSpeaker: A person.\n|\nShot 1 (Medium Shot, {buffered_duration:.3f}s):\nSpeaker: {user_text}"
+                                    formatted_prompt = f"[Scene] Cinematic visual.\n[Characters]\nSpeaker: A person.\n|\nShot 1 (Medium Shot, {exact_audio_duration:.3f}s):\nSpeaker: {user_text}"
                         else:
                             formatted_prompt = user_text
                             
@@ -464,7 +462,6 @@ except Exception: pass
                         inputs["save_output"] = True
 
                     # 🚨 SMART BYPASS FOR L40S VRAM LIMITS 🚨
-                    # L40S safely upscales ~97 frames. Anything more causes instant 80GB VRAM spikes.
                     elif c_type == "VAEDecode" and str(node_id) == "301":
                         if total_frames > 97 and "109" in sg:
                             print(f"[Dynamic Bypass] 🚨 Frame count ({total_frames}) exceeds L40S upscaler limits. Routing direct Base-Resolution decoding.", flush=True)
@@ -499,7 +496,7 @@ except Exception: pass
                         except Exception: pass
                         return False
 
-                    print(f"\n[Lypsync API] 🎙️ STARTING PHASE 1: DIRECTING & ENCODING {len(batch_scenes)} SCENES", flush=True)
+                    print(f"\n[Lypsync API] 🎙️ STARTING PHASE 0: INDEPENDENT AUDIO GENERATION FOR {len(batch_scenes)} SCENES", flush=True)
                     
                     for idx, scene in enumerate(batch_scenes):
                         spk1_path = os.path.join(dynamic_guides_dir, f"spk1_{idx}.wav")
@@ -529,23 +526,72 @@ except Exception: pass
                             except Exception: Image.new('RGB', (custom_w, custom_h), color='black').save(img2_path)
                         else:
                             Image.new('RGB', (custom_w, custom_h), color='black').save(img2_path)
-
-                        dialog_text = scene.get("dialog_text", f"{scene.get('speaker1_text', '')} {scene.get('speaker2_text', '')}")
-                        clean_text = re.sub(r'SPEAKER\s+[a-zA-Z0-9]+:', '', dialog_text)
-                        
-                        word_count = max(len(clean_text.split()), 1)
-                        pauses = len(re.findall(r'[.,!?]', clean_text))
-                        estimated_seconds = max((word_count / 2.5) + (pauses * 0.4) + 1.0, 2.0)
-                        
-                        total_frames = (math.ceil(int(estimated_seconds * 25) / 8) * 8) + 1
-                        if total_frames > 257: total_frames = 257 
                             
-                        exact_audio_duration = float(total_frames - 1) / 25.0
+                        # PHASE 0: Generate the Audio Independently First
+                        dialog_text = scene.get("dialog_text", f"{scene.get('speaker1_text', '')} {scene.get('speaker2_text', '')}")
+                        phase0_wf = {
+                          "4": { "class_type": "FL_CosyVoice3_ModelLoader", "inputs": { "model_version": "Fun-CosyVoice3-0.5B", "download_source": "HuggingFace", "device": "auto" } },
+                          "20": { "class_type": "LoadAudio", "inputs": {"audio": f"dynamic_guides/spk1_{idx}.wav"} },
+                          "21": { "class_type": "LoadAudio", "inputs": {"audio": f"dynamic_guides/spk2_{idx}.wav"} },
+                          "6": { "class_type": "FL_CosyVoice3_Dialog", "inputs": { "dialog_text": dialog_text, "speed": 1, "seed": scene.get("seed", 42), "model": ["4", 0], "speaker_A_Audio": ["20", 0], "speaker_B_Audio": ["21", 0] } },
+                          "99": { "class_type": "SaveAudio", "inputs": { "audio": ["6", 0], "filename_prefix": f"raw_dialog_{idx}" } }
+                        }
+                        print(f"🎤 Running Isolated TTS pass for Scene {idx}...", flush=True)
+                        await self.execute_comfy_workflow(session, phase0_wf)
+                        
+                        # Find the generated audio
+                        output_files = glob.glob(f"/workspace/ComfyUI/output/raw_dialog_{idx}_*.*")
+                        if not output_files: raise Exception("Phase 0 failed to generate Audio.")
+                        output_files.sort(key=os.path.getmtime)
+                        raw_audio_path = output_files[-1]
 
+                        data, samplerate = sf.read(raw_audio_path)
+                        actual_audio_duration = len(data) / samplerate
+
+                        # Calculate exact mathematically valid frames
+                        total_frames = (math.ceil(int(actual_audio_duration * 25) / 8) * 8) + 1
+                        if total_frames > 257: total_frames = 257 
+                        exact_audio_duration = float(total_frames - 1) / 25.0
+                        
+                        # Pad/Trim Audio exactly to this exact duration to prevent tensor shape collapse
+                        target_samples = int(exact_audio_duration * samplerate)
+                        if len(data) > target_samples:
+                            data = data[:target_samples]
+                        elif len(data) < target_samples:
+                            pad_width = target_samples - len(data)
+                            if data.ndim == 1: data = np.pad(data, (0, pad_width), mode='constant')
+                            else: data = np.pad(data, ((0, pad_width), (0,0)), mode='constant')
+
+                        perfect_audio_path = os.path.join(dynamic_guides_dir, f"perfect_dialog_{idx}.wav")
+                        sf.write(perfect_audio_path, data, samplerate)
+                        
+                        # Save the perfect numbers back into the scene for Phase 1 & 2
+                        scene["exact_audio_duration"] = exact_audio_duration
+                        scene["total_frames"] = total_frames
+
+                    print("\n[Lypsync API] 🎬 STARTING PHASE 1: DIRECTING & ENCODING", flush=True)
+                    for idx, scene in enumerate(batch_scenes):
+                        exact_audio_duration = scene["exact_audio_duration"]
+                        total_frames = scene["total_frames"]
+                        
                         sg1 = json.loads(json.dumps(subgraph_1))
+                        
+                        # 🚨 BYPASS COSYVOICE IN PHASE 1 TO USE THE PERFECT AUDIO 🚨
+                        dialog_node_id = None
+                        for nid, ndata in sg1.items():
+                            if ndata.get("class_type") == "FL_CosyVoice3_Dialog":
+                                dialog_node_id = nid
+                                break
+                        if dialog_node_id:
+                            sg1["999"] = {"class_type": "LoadAudio", "inputs": {"audio": f"dynamic_guides/perfect_dialog_{idx}.wav"}}
+                            for nid, ndata in sg1.items():
+                                for k, v in ndata.get("inputs", {}).items():
+                                    if isinstance(v, list) and v[0] == dialog_node_id:
+                                        sg1[nid]["inputs"][k] = ["999", 0]
+
                         sg1 = inject_node_overrides(sg1, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene)
 
-                        print(f"🎬 Processing Audio & Text Cache for Scene {idx} (Frames: {total_frames}, Seconds: {exact_audio_duration:.3f})...", flush=True)
+                        print(f"🎬 Processing Encoded Caches for Scene {idx} (Locked to {total_frames} frames / {exact_audio_duration:.3f}s)...", flush=True)
                         await self.execute_comfy_workflow(session, sg1)
                         await self.clear_comfy_memory(session, unload_models=False)
 
@@ -559,23 +605,13 @@ except Exception: pass
 
                     for idx, scene in enumerate(batch_scenes):
                         scene["seed"] = scene.get("seed", int(time.time() * 1000) % 1000000)
-
-                        # Recalculate duration & frames exclusively for Upscaler Bypass verification
-                        dialog_text = scene.get("dialog_text", f"{scene.get('speaker1_text', '')} {scene.get('speaker2_text', '')}")
-                        clean_text = re.sub(r'SPEAKER\s+[a-zA-Z0-9]+:', '', dialog_text)
-                        
-                        word_count = max(len(clean_text.split()), 1)
-                        pauses = len(re.findall(r'[.,!?]', clean_text))
-                        estimated_seconds = max((word_count / 2.5) + (pauses * 0.4) + 1.0, 2.0)
-                        
-                        total_frames = (math.ceil(int(estimated_seconds * 25) / 8) * 8) + 1
-                        if total_frames > 257: total_frames = 257 
-                        exact_audio_duration = float(total_frames - 1) / 25.0
+                        exact_audio_duration = scene["exact_audio_duration"]
+                        total_frames = scene["total_frames"]
 
                         sg2 = json.loads(json.dumps(subgraph_2))
                         sg2 = inject_node_overrides(sg2, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene)
 
-                        print(f"🎬 Rendering Video for Scene {idx} (Executing using Live Memory Pointer)...", flush=True)
+                        print(f"🎬 Rendering Video for Scene {idx}...", flush=True)
                         await self.execute_comfy_workflow(session, sg2)
                         await self.clear_comfy_memory(session, unload_models=False)
 

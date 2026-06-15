@@ -35,7 +35,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "511"  # Cache bump for strict ComfyUI Enum Validation
+    "FORCE_REBUILD_INDEX": "511"  # Cache bump for Dynamic API Key Scanner Restore
 })
 
 build_image = base_image.env({
@@ -254,8 +254,6 @@ except Exception: pass
                             try: os.symlink(src_path, symlink_dest)
                             except FileExistsError: pass
 
-        # 🚨 FIX: Force Symlink the Entire CosyVoice3 Folder (Using the folder as the Model Version)
-        # The node searches for `/workspace/ComfyUI/models/cosyvoice/<model_version>/`
         cosy_src_1 = "/mnt/weights/cosyvoice3"
         cosy_src_2 = "/mnt/weights/canonical_storage/cosyvoice3"
         active_cosy_src = cosy_src_1 if os.path.exists(cosy_src_1) else (cosy_src_2 if os.path.exists(cosy_src_2) else None)
@@ -381,6 +379,7 @@ except Exception: pass
 
             def inject_node_overrides(sg, idx, custom_w, custom_h, exact_audio_duration, total_frames, scene_data):
                 audio_node_counter = 0
+                image_node_counter = 0
 
                 for node_id, node_data in list(sg.items()):
                     c_type = node_data.get("class_type", "")
@@ -406,57 +405,56 @@ except Exception: pass
                     elif c_type == "LowVRAMLatentUpscaleModelLoader":
                         inputs["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
                     elif c_type == "FL_CosyVoice3_ModelLoader":
-                        # We leave this as HuggingFace. The symlink will trick it into finding the files locally.
                         inputs["model_version"] = "Fun-CosyVoice3-0.5B"
                         inputs["download_source"] = "HuggingFace" 
                     elif c_type in ["MemoryCacheWriter", "MemoryCacheReader"]:
                         inputs["scene_id"] = str(idx)
                         
-                    elif c_type == "LTXDirector":
-                        inputs["custom_width"] = custom_w
-                        inputs["custom_height"] = custom_h
+                    # 🚀 RESTORED DYNAMIC PROMPT SCANNER (TEXT-BASED INJECTION)
+                    elif c_type in ["LTXDirector", "PromptRelayEncode"] or any(k in inputs for k in ["local_prompts", "global_prompts", "global_prompt", "text"]):
+                        
+                        if "custom_width" in inputs: inputs["custom_width"] = custom_w
+                        elif "width" in inputs: inputs["width"] = custom_w
+                        
+                        if "custom_height" in inputs: inputs["custom_height"] = custom_h
+                        elif "height" in inputs: inputs["height"] = custom_h
+                        
                         if total_frames > 0:  
-                            inputs["duration_frames"] = total_frames
-                            inputs["duration_seconds"] = exact_audio_duration
+                            if "duration_frames" in inputs: inputs["duration_frames"] = total_frames
+                            if "length" in inputs: inputs["length"] = total_frames
+                            if "duration_seconds" in inputs: inputs["duration_seconds"] = exact_audio_duration
                             
-                        # INJECTING IMAGES DIRECTLY INTO LTX-DIRECTOR TIMELINE_DATA
-                        has_char_2 = bool(scene_data.get("image2_url"))
                         user_text = scene_data.get("dialog_text", "").strip()
+                        has_char_2 = bool(scene_data.get("image2_url"))
                         
-                        segments = []
-                        if has_char_2:
-                            frames_1 = int(total_frames / 2)
-                            frames_2 = total_frames - frames_1
-                            segments.append({
-                                "id": "shot_1",
-                                "start": 0,
-                                "length": frames_1,
-                                "prompts": scene_data.get("speaker1_text", "Speaking."),
-                                "type": "image",
-                                "imageFile": f"dynamic_guides/char1_{idx}.png"
-                            })
-                            segments.append({
-                                "id": "shot_2",
-                                "start": frames_1,
-                                "length": frames_2,
-                                "prompts": scene_data.get("speaker2_text", "Responding."),
-                                "type": "image",
-                                "imageFile": f"dynamic_guides/char2_{idx}.png"
-                            })
-                            inputs["global_prompts"] = "[Scene] Cinematic visual.\n[Characters]\nSpeaker A: Char 1.\nSpeaker B: Char 2."
+                        if "Shot 1" not in user_text: 
+                            buffered_duration = float(exact_audio_duration) + 5.0
+                            if has_char_2:
+                                half_time_1 = float(exact_audio_duration) / 2.0
+                                half_time_2 = (float(exact_audio_duration) - half_time_1) + 5.0
+                                spk1_txt = scene_data.get("speaker1_text", "Speaking.")
+                                spk2_txt = scene_data.get("speaker2_text", "Responding.")
+                                
+                                if "[Scene]" in user_text:
+                                    formatted_prompt = f"{user_text}\n|\nShot 1 (Medium Shot, {half_time_1:.3f}s):\nSpeaker A: {spk1_txt}\n|\nShot 2 (Medium Shot, {half_time_2:.3f}s):\nSpeaker B: {spk2_txt}"
+                                else:
+                                    formatted_prompt = f"[Scene] Cinematic visual.\n[Characters]\nSpeaker A: Char 1.\nSpeaker B: Char 2.\n|\nShot 1 (Medium Shot, {half_time_1:.3f}s):\nSpeaker A: {spk1_txt}\n|\nShot 2 (Medium Shot, {half_time_2:.3f}s):\nSpeaker B: {spk2_txt}"
+                            else:
+                                if "[Scene]" in user_text:
+                                    formatted_prompt = f"{user_text}\n|\nShot 1 (Medium Shot, {buffered_duration:.3f}s):\nSpeaker: Character speaks naturally."
+                                else:
+                                    formatted_prompt = f"[Scene] Cinematic visual.\n[Characters]\nSpeaker: A person.\n|\nShot 1 (Medium Shot, {buffered_duration:.3f}s):\nSpeaker: {user_text}"
                         else:
-                            segments.append({
-                                "id": "shot_1",
-                                "start": 0,
-                                "length": total_frames,
-                                "prompts": user_text,
-                                "type": "image",
-                                "imageFile": f"dynamic_guides/char1_{idx}.png"
-                            })
-                            inputs["global_prompts"] = "[Scene] Cinematic visual.\n[Characters]\nSpeaker: A person."
+                            formatted_prompt = user_text
+                            
+                        if "local_prompts" in inputs: inputs["local_prompts"] = formatted_prompt
+                        elif "global_prompts" in inputs: inputs["global_prompts"] = formatted_prompt
+                        elif "global_prompt" in inputs: inputs["global_prompt"] = formatted_prompt
+                        elif "text" in inputs: inputs["text"] = formatted_prompt
                         
-                        inputs["timeline_data"] = json.dumps({"segments": segments, "audioSegments": []})
-                        if "local_prompts" in inputs: inputs["local_prompts"] = ""
+                        # Scrub the timeline_data override to prevent Director node conflict
+                        if "timeline_data" in inputs:
+                            inputs.pop("timeline_data", None)
                                 
                     elif c_type == "FL_CosyVoice3_Dialog":
                         inputs["dialog_text"] = scene_data.get("dialog_text", "SPEAKER A: Hello.")
@@ -470,7 +468,8 @@ except Exception: pass
                         else: inputs["audio"] = target_aud
                             
                     elif c_type == "LoadImage":
-                        target_img = f"dynamic_guides/char1_{idx}.png"
+                        image_node_counter += 1
+                        target_img = f"dynamic_guides/char1_{idx}.png" if image_node_counter == 1 else f"dynamic_guides/char2_{idx}.png"
                         if "image_path" in inputs: inputs["image_path"] = target_img
                         elif "image" in inputs: inputs["image"] = target_img
                         elif "image_url" in inputs: inputs["image_url"] = target_img
@@ -481,10 +480,8 @@ except Exception: pass
                     elif c_type == "VHS_VideoCombine":
                         inputs["save_output"] = True
 
-                    # SMART BYPASS FOR L40S VRAM LIMITS
                     elif c_type == "VAEDecode" and str(node_id) == "301":
                         if total_frames > 97 and "109" in sg:
-                            print(f"[Dynamic Bypass] 🚨 Frame count ({total_frames}) exceeds L40S upscaler limits. Routing direct Base-Resolution decoding.", flush=True)
                             inputs["samples"] = ["109", 2]
                     elif c_type == "LTXVAudioVAEDecode" and str(node_id) == "302":
                         if total_frames > 97 and "108" in sg:

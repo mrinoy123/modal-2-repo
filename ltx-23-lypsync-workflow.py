@@ -35,7 +35,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "511"  # Cache bump for Dynamic API Key Scanner Restore
+    "FORCE_REBUILD_INDEX": "511"  # Cache bump for Timeline Validation Override
 })
 
 build_image = base_image.env({
@@ -410,8 +410,8 @@ except Exception: pass
                     elif c_type in ["MemoryCacheWriter", "MemoryCacheReader"]:
                         inputs["scene_id"] = str(idx)
                         
-                    # 🚀 RESTORED DYNAMIC PROMPT SCANNER (TEXT-BASED INJECTION)
-                    elif c_type in ["LTXDirector", "PromptRelayEncode"] or any(k in inputs for k in ["local_prompts", "global_prompts", "global_prompt", "text"]):
+                    # 🚀 DIRECTOR OVERRIDE (WITH STRICT FALLBACK PROMPTS & TIMELINE JSON)
+                    elif c_type in ["LTXDirector", "PromptRelayEncode"] or any(k in inputs for k in ["local_prompts", "global_prompts", "global_prompt"]):
                         
                         if "custom_width" in inputs: inputs["custom_width"] = custom_w
                         elif "width" in inputs: inputs["width"] = custom_w
@@ -423,38 +423,45 @@ except Exception: pass
                             if "duration_frames" in inputs: inputs["duration_frames"] = total_frames
                             if "length" in inputs: inputs["length"] = total_frames
                             if "duration_seconds" in inputs: inputs["duration_seconds"] = exact_audio_duration
-                            
-                        user_text = scene_data.get("dialog_text", "").strip()
-                        has_char_2 = bool(scene_data.get("image2_url"))
+
+                        # 🔥 THE FIX: Strict Fallback Prompts. Empty strings crash the LTXDirector node natively.
+                        spk1 = scene_data.get("speaker1_text", "").strip()
+                        spk2 = scene_data.get("speaker2_text", "").strip()
+                        dialog = scene_data.get("dialog_text", "").strip()
                         
-                        if "Shot 1" not in user_text: 
-                            buffered_duration = float(exact_audio_duration) + 5.0
-                            if has_char_2:
-                                half_time_1 = float(exact_audio_duration) / 2.0
-                                half_time_2 = (float(exact_audio_duration) - half_time_1) + 5.0
-                                spk1_txt = scene_data.get("speaker1_text", "Speaking.")
-                                spk2_txt = scene_data.get("speaker2_text", "Responding.")
-                                
-                                if "[Scene]" in user_text:
-                                    formatted_prompt = f"{user_text}\n|\nShot 1 (Medium Shot, {half_time_1:.3f}s):\nSpeaker A: {spk1_txt}\n|\nShot 2 (Medium Shot, {half_time_2:.3f}s):\nSpeaker B: {spk2_txt}"
-                                else:
-                                    formatted_prompt = f"[Scene] Cinematic visual.\n[Characters]\nSpeaker A: Char 1.\nSpeaker B: Char 2.\n|\nShot 1 (Medium Shot, {half_time_1:.3f}s):\nSpeaker A: {spk1_txt}\n|\nShot 2 (Medium Shot, {half_time_2:.3f}s):\nSpeaker B: {spk2_txt}"
-                            else:
-                                if "[Scene]" in user_text:
-                                    formatted_prompt = f"{user_text}\n|\nShot 1 (Medium Shot, {buffered_duration:.3f}s):\nSpeaker: Character speaks naturally."
-                                else:
-                                    formatted_prompt = f"[Scene] Cinematic visual.\n[Characters]\nSpeaker: A person.\n|\nShot 1 (Medium Shot, {buffered_duration:.3f}s):\nSpeaker: {user_text}"
+                        spk1 = spk1 if spk1 else "Speaking naturally."
+                        spk2 = spk2 if spk2 else "Responding."
+                        dialog = dialog if dialog else spk1
+
+                        has_char_2 = bool(scene_data.get("image2_url"))
+                        segments = []
+
+                        if has_char_2:
+                            frames_1 = int(total_frames / 2)
+                            frames_2 = total_frames - frames_1
+                            segments.append({
+                                "id": "shot_1", "start": 0, "length": frames_1,
+                                "prompts": spk1, "type": "image", "imageFile": f"dynamic_guides/char1_{idx}.png"
+                            })
+                            segments.append({
+                                "id": "shot_2", "start": frames_1, "length": frames_2,
+                                "prompts": spk2, "type": "image", "imageFile": f"dynamic_guides/char2_{idx}.png"
+                            })
                         else:
-                            formatted_prompt = user_text
-                            
+                            segments.append({
+                                "id": "shot_1", "start": 0, "length": total_frames,
+                                "prompts": dialog, "type": "image", "imageFile": f"dynamic_guides/char1_{idx}.png"
+                            })
+
+                        # Force exact mathematical structure into timeline_data to pass ComfyUI Node validation
+                        inputs["timeline_data"] = json.dumps({"segments": segments, "audioSegments": []})
+                        
+                        # Set text fields just in case it falls back to text overrides
+                        formatted_prompt = f"[Scene] Cinematic visual.\n[Characters]\nSpeaker: {dialog}"
                         if "local_prompts" in inputs: inputs["local_prompts"] = formatted_prompt
                         elif "global_prompts" in inputs: inputs["global_prompts"] = formatted_prompt
                         elif "global_prompt" in inputs: inputs["global_prompt"] = formatted_prompt
                         elif "text" in inputs: inputs["text"] = formatted_prompt
-                        
-                        # Scrub the timeline_data override to prevent Director node conflict
-                        if "timeline_data" in inputs:
-                            inputs.pop("timeline_data", None)
                                 
                     elif c_type == "FL_CosyVoice3_Dialog":
                         inputs["dialog_text"] = scene_data.get("dialog_text", "SPEAKER A: Hello.")

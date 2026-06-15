@@ -35,7 +35,7 @@ base_image = modal.Image.from_registry(
     "build-essential", "ninja-build", "cmake", "clang", "llvm",
     "libgoogle-perftools-dev" 
 ).env({
-    "FORCE_REBUILD_INDEX": "511"  # Cache bump for strict local CosyVoice mapping
+    "FORCE_REBUILD_INDEX": "511"  # Cache bump for strict ComfyUI Enum Validation
 })
 
 build_image = base_image.env({
@@ -406,9 +406,9 @@ except Exception: pass
                     elif c_type == "LowVRAMLatentUpscaleModelLoader":
                         inputs["model_name"] = "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
                     elif c_type == "FL_CosyVoice3_ModelLoader":
-                        # 🚨 THE FIX: Force the node to look for the symlinked folder name
+                        # We leave this as HuggingFace. The symlink will trick it into finding the files locally.
                         inputs["model_version"] = "Fun-CosyVoice3-0.5B"
-                        inputs["download_source"] = "local" 
+                        inputs["download_source"] = "HuggingFace" 
                     elif c_type in ["MemoryCacheWriter", "MemoryCacheReader"]:
                         inputs["scene_id"] = str(idx)
                         
@@ -551,7 +551,7 @@ except Exception: pass
                         audio_script = f"SPEAKER A: {scene.get('speaker1_text', '')}\nSPEAKER B: {scene.get('speaker2_text', '.')}".strip()
                         
                         phase0_wf = {
-                          "4": { "class_type": "FL_CosyVoice3_ModelLoader", "inputs": { "model_version": "Fun-CosyVoice3-0.5B", "download_source": "local", "device": "auto" } },
+                          "4": { "class_type": "FL_CosyVoice3_ModelLoader", "inputs": { "model_version": "Fun-CosyVoice3-0.5B", "download_source": "HuggingFace", "device": "auto" } },
                           "20": { "class_type": "LoadAudio", "inputs": {"audio": f"dynamic_guides/spk1_{idx}.wav"} },
                           "21": { "class_type": "LoadAudio", "inputs": {"audio": f"dynamic_guides/spk2_{idx}.wav"} },
                           "6": { "class_type": "FL_CosyVoice3_Dialog", "inputs": { "dialog_text": audio_script, "speed": 1, "seed": scene.get("seed", 42), "model": ["4", 0], "speaker_A_Audio": ["20", 0], "speaker_B_Audio": ["21", 0] } },

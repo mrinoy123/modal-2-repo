@@ -431,7 +431,7 @@ except Exception: pass
                                 "id": "shot_1",
                                 "start": 0,
                                 "length": frames_1,
-                                "prompt": scene_data.get("speaker1_text", "Speaking."),
+                                "prompts": scene_data.get("speaker1_text", "Speaking."),
                                 "type": "image",
                                 "imageFile": f"dynamic_guides/char1_{idx}.png"
                             })
@@ -439,21 +439,21 @@ except Exception: pass
                                 "id": "shot_2",
                                 "start": frames_1,
                                 "length": frames_2,
-                                "prompt": scene_data.get("speaker2_text", "Responding."),
+                                "prompts": scene_data.get("speaker2_text", "Responding."),
                                 "type": "image",
                                 "imageFile": f"dynamic_guides/char2_{idx}.png"
                             })
-                            inputs["global_prompt"] = "[Scene] Cinematic visual.\n[Characters]\nSpeaker A: Char 1.\nSpeaker B: Char 2."
+                            inputs["global_prompts"] = "[Scene] Cinematic visual.\n[Characters]\nSpeaker A: Char 1.\nSpeaker B: Char 2."
                         else:
                             segments.append({
                                 "id": "shot_1",
                                 "start": 0,
                                 "length": total_frames,
-                                "prompt": user_text,
+                                "prompts": user_text,
                                 "type": "image",
                                 "imageFile": f"dynamic_guides/char1_{idx}.png"
                             })
-                            inputs["global_prompt"] = "[Scene] Cinematic visual.\n[Characters]\nSpeaker: A person."
+                            inputs["global_prompts"] = "[Scene] Cinematic visual.\n[Characters]\nSpeaker: A person."
                         
                         inputs["timeline_data"] = json.dumps({"segments": segments, "audioSegments": []})
                         if "local_prompts" in inputs: inputs["local_prompts"] = ""
